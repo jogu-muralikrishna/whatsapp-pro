@@ -1,0 +1,13 @@
+{
+  "name": "WhatsApp Pro",
+  "description": "Production-grade WhatsApp clone with real-time sync, scheduled messages, AI replies, and advanced privacy controls.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "real_time_sync",
+    "message_scheduling",
+    "ai_integration"
+  ]
+}
