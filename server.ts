@@ -20,13 +20,29 @@ import { Boom } from '@hapi/boom';
 import cron from 'node-cron';
 import { parseISO, isAfter } from 'date-fns';
 import { GoogleGenAI } from "@google/genai";
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, setDoc, getDoc, getDocs, collection } from 'firebase/firestore/lite';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
+const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 const logger = pino({ level: 'silent' });
 const PORT = 3000;
-const DATA_FILE = path.join(__dirname, 'pro_data.json');
+const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
+
+// Initialize Firebase configuration if it exists
+const firebaseConfigPath = path.join(process.cwd(), 'firebase-applet-config.json');
+let db: any = null;
+if (fs.existsSync(firebaseConfigPath)) {
+    try {
+        const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf-8'));
+        const firebaseApp = initializeApp(firebaseConfig);
+        db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+        console.log('Firebase initialized successfully for database: ' + firebaseConfig.firestoreDatabaseId);
+    } catch (e: any) {
+        console.error('Failed to initialize Firebase:', e.message);
+    }
+}
 
 // Initialize data storage with persistence
 let proData = {
@@ -88,6 +104,86 @@ function saveProData() {
     }
 }
 
+async function saveSettingsToFirebase() {
+    if (!db) return;
+    try {
+        const cleanSettings = JSON.parse(JSON.stringify(proData.settings));
+        await setDoc(doc(db, 'whatsapp_pro', 'settings'), cleanSettings);
+    } catch (e: any) {
+        console.error('Failed to save settings to Firebase:', e.message);
+    }
+}
+
+async function saveContactToFirebase(jid: string, contact: any) {
+    if (!db || !jid) return;
+    try {
+        const docId = jid.replace(/\//g, '_');
+        const cleanContact = JSON.parse(JSON.stringify(contact));
+        await setDoc(doc(db, 'whatsapp_pro_contacts', docId), cleanContact);
+    } catch (e: any) {
+        console.error(`Failed to save contact ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function saveChatToFirebase(jid: string, chat: any) {
+    if (!db || !jid) return;
+    try {
+        const docId = jid.replace(/\//g, '_');
+        const cleanChat = JSON.parse(JSON.stringify(chat));
+        await setDoc(doc(db, 'whatsapp_pro_chats', docId), cleanChat);
+    } catch (e: any) {
+        console.error(`Failed to save chat ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function saveMessageToFirebase(jid: string, msg: any) {
+    if (!db || !jid || !msg?.key?.id) return;
+    try {
+        const chatDocId = jid.replace(/\//g, '_');
+        const msgDocId = msg.key.id;
+        const cleanMsg = JSON.parse(JSON.stringify(msg));
+        await setDoc(doc(db, 'whatsapp_pro_chats', chatDocId, 'messages', msgDocId), cleanMsg);
+    } catch (e: any) {
+        console.error(`Failed to save message ${msg.key.id} in ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function loadProDataFromFirestore() {
+    if (!db) return;
+    try {
+        console.log('Loading Pro Data from Firebase Firestore...');
+        
+        // 1. Settings
+        const settingsDoc = await getDoc(doc(db, 'whatsapp_pro', 'settings'));
+        if (settingsDoc.exists()) {
+            proData.settings = { ...proData.settings, ...settingsDoc.data() };
+            console.log('Firebase: Settings sync loaded');
+        }
+
+        // 2. Contacts
+        const contactsSnapshot = await getDocs(collection(db, 'whatsapp_pro_contacts'));
+        contactsSnapshot.forEach((docSnapshot) => {
+            const contact = docSnapshot.data();
+            proData.contacts[contact.id || docSnapshot.id] = contact;
+        });
+        console.log(`Firebase: Loaded ${Object.keys(proData.contacts).length} contacts from database`);
+
+        // 3. Chats
+        const chatsSnapshot = await getDocs(collection(db, 'whatsapp_pro_chats'));
+        const chatsList: any[] = [];
+        chatsSnapshot.forEach((docSnapshot) => {
+            chatsList.push(docSnapshot.data());
+        });
+        if (chatsList.length > 0) {
+            proData.cachedChats = chatsList;
+            console.log(`Firebase: Loaded ${chatsList.length} cached chats from database`);
+        }
+        
+    } catch (error: any) {
+        console.error('Firebase Firestore error during load:', error);
+    }
+}
+
 async function startServer() {
     const app = express();
     const server = createServer(app);
@@ -109,6 +205,43 @@ async function startServer() {
     let qrCode: string | null = null;
     let connectionState: any = 'close';
     let realChats: any[] = proData.cachedChats || [];
+    let initTimeout: NodeJS.Timeout | null = null;
+    let isInitializing = false;
+
+    function cleanAuthDir(authDir: string) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                if (fs.existsSync(authDir)) {
+                    fs.rmSync(authDir, { recursive: true, force: true });
+                    log('SUCCESS', `Session storage sanitized (attempt ${attempt}/3)`);
+                    return true;
+                }
+                return true;
+            } catch (e: any) {
+                log('WARN', `Attempt ${attempt}/3 to sanitize session storage failed: ${e.message}`);
+                if (attempt < 3) {
+                    // Slight sync delay
+                    const start = Date.now();
+                    while (Date.now() - start < 200) {}
+                }
+            }
+        }
+        return false;
+    }
+
+    function scheduleInit(delay: number) {
+        if (initTimeout) {
+            clearTimeout(initTimeout);
+        }
+        initTimeout = setTimeout(async () => {
+            initTimeout = null;
+            await initWASocket();
+        }, delay);
+    }
+
+    // Load from Firestore pre-startup
+    await loadProDataFromFirestore();
+    realChats = proData.cachedChats || [];
 
     function broadcast(data: any) {
         wss.clients.forEach((client) => {
@@ -135,18 +268,43 @@ function normalizeJid(jid: string): string {
 }
 
 async function initWASocket() {
-        qrCode = null; // Reset QR state on start
-        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    if (isInitializing) {
+        log('WARN', 'initWASocket is already in progress, skipping concurrent duplicate call.');
+        return;
+    }
+    isInitializing = true;
+    qrCode = null; // Reset QR state on start
+    const authDir = path.join(process.cwd(), 'auth_info_baileys');
+    let state: any;
+    let saveCreds: any;
+
+    try {
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
         
-        if (sock) {
-            try { 
-                sock.ev.removeAllListeners('connection.update');
-                sock.ev.removeAllListeners('creds.update');
-                sock.ev.removeAllListeners('messages.upsert');
-                sock.end(undefined); 
-            } catch (e) {}
+        // Perform sanity check of loaded credentials object to intercept corrupted states
+        if (!state || !state.creds || typeof state.creds !== 'object') {
+            throw new Error('State credentials are corrupt or missing');
         }
-        
+    } catch (err: any) {
+        log('ERROR', `Authentication directory corrupted: ${err.message}. Cleaning and re-establishing clean state...`);
+        cleanAuthDir(authDir);
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+    }
+    
+    if (sock) {
+        try { 
+            sock.ev.removeAllListeners('connection.update');
+            sock.ev.removeAllListeners('creds.update');
+            sock.ev.removeAllListeners('messages.upsert');
+            sock.end(undefined); 
+        } catch (e) {}
+    }
+    
+    try {
         sock = makeWASocket({
             version: latestVersion || [2, 3000, 1015901307],
             logger,
@@ -166,15 +324,30 @@ async function initWASocket() {
                 return msgs.find(m => m.key.id === key.id)?.message || undefined;
             }
         });
+    } catch (socketError: any) {
+        log('ERROR', `Failed to construct WASocket: ${socketError.message}. Recovering via sanitization...`);
+        cleanAuthDir(authDir);
+        isInitializing = false;
+        scheduleInit(3000);
+        return;
+    }
 
-        sock.ev.on('creds.update', saveCreds);
+    isInitializing = false;
+    const socketInstance = sock;
+
+    sock.ev.on('creds.update', (...args: any[]) => {
+        if (socketInstance !== sock) return;
+        saveCreds(...args);
+    });
 
         sock.ev.on('QR_CODE', (qr: string) => {
+            if (socketInstance !== sock) return;
             qrCode = qr;
             broadcast({ type: 'QR_CODE', data: qr });
         });
 
         sock.ev.on('connection.update', (update: Partial<ConnectionState>) => {
+            if (socketInstance !== sock) return;
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
@@ -227,16 +400,11 @@ async function initWASocket() {
                         } catch (e) {}
                     }
 
-                    const authDir = path.join(__dirname, 'auth_info_baileys');
-                    setTimeout(async () => {
-                        try {
-                            if (fs.existsSync(authDir)) {
-                                fs.rmSync(authDir, { recursive: true, force: true });
-                                log('SUCCESS', 'Session storage sanitized for core recovery.');
-                            }
-                        } catch (e: any) {
-                            log('ERROR', `Sanitization failure: ${e.message}`);
-                        }
+                    const authDir = path.join(process.cwd(), 'auth_info_baileys');
+                    if (initTimeout) clearTimeout(initTimeout);
+                    initTimeout = setTimeout(async () => {
+                        initTimeout = null;
+                        cleanAuthDir(authDir);
                         // Fresh start
                         await initWASocket();
                     }, 5000); // Increased timeout for stability
@@ -244,7 +412,7 @@ async function initWASocket() {
                     log('WARN', message);
                     
                     // Reconnect for other reasons
-                    setTimeout(initWASocket, 2000);
+                    scheduleInit(2000);
                 }
             } else if (connection === 'open') {
                 log('SUCCESS', 'WhatsApp Pro Engine: CONNECTED and SYNCED');
@@ -256,6 +424,7 @@ async function initWASocket() {
         });
 
         sock.ev.on('messages.upsert', (m: any) => {
+            if (socketInstance !== sock) return;
             if (proData.settings.dndMode) return; // Silent Drop in DND
             broadcast({ type: 'MESSAGES_UPSERT', data: m });
             
@@ -266,31 +435,91 @@ async function initWASocket() {
                 // Normalize JID early
                 jid = normalizeJid(jid);
                 msg.key.remoteJid = jid; // Mutate for consistency
+                if (msg.key.participant) msg.key.participant = normalizeJid(msg.key.participant);
+                if (msg.participant) msg.participant = normalizeJid(msg.participant);
 
-        // Handle status updates
-        if (jid === 'status@broadcast') {
-            const status = {
-                id: msg.key.id,
-                key: msg.key,
-                participant: normalizeJid(msg.key.participant || msg.participant || ''),
-                message: msg.message,
-                timestamp: msg.messageTimestamp,
-                pushName: msg.pushName
-            };
-            
-            // Deduplicate status updates
-            const existingIndex = proData.statusUpdates.findIndex(s => s.id === status.id);
-            if (existingIndex !== -1) {
-                proData.statusUpdates[existingIndex] = status;
-            } else {
-                proData.statusUpdates.unshift(status);
-            }
-            
-            if (proData.statusUpdates.length > 200) proData.statusUpdates.pop();
-            saveProData();
-            broadcast({ type: 'STATUS_UPDATE', data: status });
-            return;
-        }
+                // Setup sender details in contacts if available
+                const senderJid = msg.key.fromMe ? 'Me' : normalizeJid(msg.key.participant || msg.participant || jid);
+                if (msg.pushName && senderJid && senderJid !== 'Me') {
+                    if (!proData.contacts[senderJid] || !proData.contacts[senderJid].name) {
+                        proData.contacts[senderJid] = {
+                            ...(proData.contacts[senderJid] || {}),
+                            id: senderJid,
+                            pushName: msg.pushName,
+                            name: msg.pushName
+                        };
+                        saveContactToFirebase(senderJid, proData.contacts[senderJid]);
+                    }
+                }
+
+                // Handle status updates
+                if (jid === 'status@broadcast') {
+                    const status = {
+                        id: msg.key.id,
+                        key: msg.key,
+                        participant: normalizeJid(msg.key.participant || msg.participant || ''),
+                        message: msg.message,
+                        timestamp: msg.messageTimestamp,
+                        pushName: msg.pushName
+                    };
+                    
+                    // Deduplicate status updates
+                    const existingIndex = proData.statusUpdates.findIndex(s => s.id === status.id);
+                    if (existingIndex !== -1) {
+                        proData.statusUpdates[existingIndex] = status;
+                    } else {
+                        proData.statusUpdates.unshift(status);
+                    }
+                    
+                    if (proData.statusUpdates.length > 200) proData.statusUpdates.pop();
+                    saveProData();
+                    broadcast({ type: 'STATUS_UPDATE', data: status });
+                    return;
+                }
+
+                // Check for protocolMessage (delete/revoke) at upsert-level
+                const protocolMsg = msg.message?.protocolMessage;
+                if (protocolMsg && (protocolMsg.type === 0 || protocolMsg.type === 'REVOKE')) {
+                    const targetId = protocolMsg.key?.id;
+                    log('INFO', `Intercepted deletion request from sender at upsert-level for message ID: ${targetId}`);
+                    if (proData.settings.antiDelete) {
+                        const targetJid = normalizeJid(protocolMsg.key?.remoteJid || jid);
+                        const history = proData.messageHistory[targetJid] || [];
+                        const targetMsg = history.find(item => item.key.id === targetId);
+                        if (targetMsg) {
+                            targetMsg.isRevoked = true;
+                            log('SUCCESS', `Anti-Delete preserved message ${targetId} and marked as isRevoked=true`);
+                            saveProData();
+                            saveMessageToFirebase(targetJid, targetMsg);
+
+                            // Helper function to extract text
+                            const extractTxt = (mObj: any): string => {
+                                if (!mObj || !mObj.message) return '';
+                                const cNode = mObj.message;
+                                return cNode.conversation || cNode.extendedTextMessage?.text || cNode.imageMessage?.caption || mObj.text || '';
+                            };
+
+                            // Add to recycle bin
+                            const deletedMsg = {
+                                id: targetId,
+                                sender: targetMsg.pushName || 'Sender',
+                                text: extractTxt(targetMsg) || 'Media Content/Document',
+                                timestamp: (targetMsg.messageTimestamp * 1000) || Date.now(),
+                                fromMe: !!targetMsg.key.fromMe,
+                                isRevoked: true,
+                                rawMessage: targetMsg.message,
+                                interceptedAt: new Date().toISOString()
+                            };
+                            if (!proData.recycleBin.messages.some((mItem: any) => mItem.id === targetId)) {
+                                proData.recycleBin.messages.unshift(deletedMsg);
+                                if (proData.recycleBin.messages.length > 50) proData.recycleBin.messages.pop();
+                            }
+                            saveProData();
+                            broadcast({ type: 'MESSAGE_REVOKED_ANTIDELETE', data: { jid: targetJid, msgId: targetId } });
+                            return; // Stop processing the protocol message itself
+                        }
+                    }
+                }
                 
                 if (!proData.messageHistory[jid]) proData.messageHistory[jid] = [];
                 
@@ -300,6 +529,9 @@ async function initWASocket() {
                     proData.messageHistory[jid].push(msg);
                     if (proData.messageHistory[jid].length > 1000) proData.messageHistory[jid].shift();
                 }
+
+                // Save individual message to Firebase
+                saveMessageToFirebase(jid, msg);
 
                 // Auto Reply Logic
                 if (proData.settings.autoReply && !msg.key.fromMe && !jid.endsWith('@g.us')) {
@@ -318,11 +550,13 @@ async function initWASocket() {
                     realChats[chatIndex].lastMessage = msg;
                     realChats[chatIndex].timestamp = msg.messageTimestamp;
                     broadcast({ type: 'CHATS_UPDATE', data: realChats[chatIndex] });
+                    saveChatToFirebase(jid, realChats[chatIndex]);
                 } else {
                     // Create chat if not exists
                     const newChat = { id: jid, timestamp: msg.messageTimestamp, lastMessage: msg };
                     realChats.push(newChat);
                     broadcast({ type: 'CHATS_UPDATE', data: newChat });
+                    saveChatToFirebase(jid, newChat);
                 }
                 
                 proData.cachedChats = realChats;
@@ -331,6 +565,7 @@ async function initWASocket() {
         });
 
         sock.ev.on('messages.update', (m: any) => {
+            if (socketInstance !== sock) return;
             m.forEach((update: any) => {
                 const { key, update: msgUpdate } = update;
                 if (msgUpdate.protocolMessage?.type === 0) {
@@ -366,24 +601,29 @@ async function initWASocket() {
         });
 
         sock.ev.on('contacts.upsert', (newContacts: any) => {
+            if (socketInstance !== sock) return;
             newContacts.forEach((c: any) => {
                 const jid = normalizeJid(c.id);
                 proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...c, id: jid };
+                saveContactToFirebase(jid, proData.contacts[jid]);
             });
             saveProData();
             broadcast({ type: 'CONTACTS_UPSERT', data: newContacts });
         });
 
         sock.ev.on('contacts.update', (updates: any) => {
+            if (socketInstance !== sock) return;
             updates.forEach((u: any) => {
                 const jid = normalizeJid(u.id);
                 proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...u, id: jid };
+                saveContactToFirebase(jid, proData.contacts[jid]);
             });
             saveProData();
             broadcast({ type: 'CONTACTS_UPSERT', data: updates }); // Re-use UPSERT listener in frontend
         });
 
         sock.ev.on('chats.upsert', (newChats: any) => {
+            if (socketInstance !== sock) return;
             newChats.forEach((chat: any) => {
                 chat.id = normalizeJid(chat.id);
                 const index = realChats.findIndex(c => c.id === chat.id);
@@ -392,6 +632,7 @@ async function initWASocket() {
                 } else {
                     realChats.push(chat);
                 }
+                saveChatToFirebase(chat.id, realChats[index !== -1 ? index : realChats.length - 1]);
             });
             proData.cachedChats = realChats;
             saveProData();
@@ -399,15 +640,18 @@ async function initWASocket() {
         });
 
         sock.ev.on('chats.update', (updates: any) => {
+            if (socketInstance !== sock) return;
             updates.forEach((update: any) => {
                 if (update.id) update.id = normalizeJid(update.id);
                 const index = realChats.findIndex(c => c.id === update.id);
                 if (index !== -1) {
                     realChats[index] = { ...realChats[index], ...update };
                     broadcast({ type: 'CHATS_UPDATE', data: realChats[index] });
+                    saveChatToFirebase(update.id, realChats[index]);
                 } else {
                     realChats.push(update);
                     broadcast({ type: 'CHATS_UPDATE', data: update });
+                    saveChatToFirebase(update.id, update);
                 }
             });
             proData.cachedChats = realChats;
@@ -415,11 +659,13 @@ async function initWASocket() {
         });
 
         sock.ev.on('presence.update', (m: any) => {
+            if (socketInstance !== sock) return;
             if (proData.settings.ghostMode) return;
             broadcast({ type: 'PRESENCE_UPDATE', data: m });
         });
 
         sock.ev.on('call', (m: any) => {
+            if (socketInstance !== sock) return;
             log('INFO', `Incoming Call: ${m[0].from}`);
             proData.callHistory.unshift(...m);
             if (proData.callHistory.length > 100) proData.callHistory.pop();
@@ -428,6 +674,7 @@ async function initWASocket() {
         });
 
         sock.ev.on('messaging-history.set', (history: any) => {
+            if (socketInstance !== sock) return;
             const { chats, contacts: syncContacts, messages } = history;
             log('INFO', `History Set: Received ${chats.length} chats, ${syncContacts.length} contacts, ${messages?.length || 0} messages`);
             
@@ -482,6 +729,7 @@ async function initWASocket() {
         });
 
         sock.ev.on('chats.set', ({ chats }: any) => {
+            if (socketInstance !== sock) return;
             log('INFO', `Chats Set: Received ${chats.length} chats`);
             realChats = chats;
             proData.cachedChats = realChats;
@@ -618,13 +866,14 @@ async function initWASocket() {
     app.post('/api/settings', (req, res) => {
         proData.settings = { ...proData.settings, ...req.body };
         saveProData();
+        saveSettingsToFirebase();
         res.json(proData.settings);
     });
 
     app.get('/api/refresh-qr', async (req, res) => {
         log('INFO', 'Manual QR Refresh Triggered');
         qrCode = null;
-        await initWASocket();
+        scheduleInit(0);
         res.json({ status: 'Refreshing engine...' });
     });
 
@@ -636,7 +885,14 @@ async function initWASocket() {
             const key = process.env.GEMINI_API_KEY;
             if (!key) throw new Error('GEMINI_API_KEY not configured');
 
-            const ai = new GoogleGenAI({ apiKey: key });
+            const ai = new GoogleGenAI({ 
+                apiKey: key,
+                httpOptions: {
+                    headers: {
+                        'User-Agent': 'aistudio-build'
+                    }
+                }
+            });
 
             const prompt = `Context: You are a professional WhatsApp Pro AI assistant. 
       The user received this message: "${text}"
@@ -644,7 +900,7 @@ async function initWASocket() {
       Format: Only return the suggestions separated by | and nothing else. No preamble.`;
 
             const response = await ai.models.generateContent({
-                model: "gemini-1.5-flash",
+                model: "gemini-3.5-flash",
                 contents: [{ role: 'user', parts: [{ text: prompt }] }],
             });
             
@@ -718,7 +974,8 @@ async function initWASocket() {
 
     app.post('/api/read-chat', async (req, res) => {
         const { jid, keys } = req.body;
-        if (!sock || !jid) return res.status(400).json({ error: 'Missing sock or jid' });
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid) return res.status(400).json({ error: 'Missing chat JID' });
         
         if (proData.settings.ghostMode || proData.settings.hideBlueTicks) {
             return res.json({ status: 'Privacy Shield Active: Read receipt supressed.' });
@@ -835,7 +1092,8 @@ async function initWASocket() {
 
     app.post('/api/send-message', async (req, res) => {
         const { jid, text, quoted } = req.body;
-        if (!sock || !jid || !text) return res.status(400).json({ error: 'Missing params' });
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid || !text) return res.status(400).json({ error: 'Missing target JID or message text' });
         
         const targetJid = normalizeJid(jid);
 
@@ -855,7 +1113,8 @@ async function initWASocket() {
 
     app.post('/api/react-message', async (req, res) => {
         const { jid, msgId, emoji, fromMe } = req.body;
-        if (!sock || !jid || !msgId || !emoji) return res.status(400).json({ error: 'Missing params' });
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid || !msgId || !emoji) return res.status(400).json({ error: 'Missing target JID, message ID, or emoji' });
         
         const targetJid = normalizeJid(jid);
 
@@ -876,7 +1135,8 @@ async function initWASocket() {
 
     app.post('/api/send-audio', async (req, res) => {
         const { jid, audio, duration, ptt } = req.body;
-        if (!sock || !jid || !audio) return res.status(400).json({ error: 'Missing params' });
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid || !audio) return res.status(400).json({ error: 'Missing target JID or audio payload' });
         
         const targetJid = normalizeJid(jid);
 
@@ -898,7 +1158,8 @@ async function initWASocket() {
 
     app.post('/api/forward-message', async (req, res) => {
         const { targetJid, msgId, fromJid } = req.body;
-        if (!sock || !targetJid || !msgId || !fromJid) return res.status(400).json({ error: 'Missing params' });
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!targetJid || !msgId || !fromJid) return res.status(400).json({ error: 'Missing parameters: targetJid, msgId, or fromJid are required' });
 
         const normalizedTarget = normalizeJid(targetJid);
         const normalizedFrom = normalizeJid(fromJid);
@@ -931,7 +1192,8 @@ async function initWASocket() {
 
     app.get('/api/profile-picture', async (req, res) => {
         const { jid } = req.query;
-        if (!sock || !jid) return res.status(400).send('Missing JID');
+        if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
+        if (!jid) return res.status(400).send('Missing JID');
         
         const targetJid = normalizeJid(jid as string);
 
@@ -968,6 +1230,7 @@ async function initWASocket() {
         
         proData.contacts[jid] = { ...(proData.contacts[jid] || {}), id: jid, name };
         saveProData();
+        saveContactToFirebase(jid, proData.contacts[jid]);
         broadcast({ type: 'CONTACTS_UPSERT', data: [proData.contacts[jid]] });
         res.json({ status: 'success' });
     });
@@ -1030,13 +1293,8 @@ async function initWASocket() {
             }
         } catch (e) {}
         
-        const authDir = path.join(__dirname, 'auth_info_baileys');
-        if (fs.existsSync(authDir)) {
-            try {
-                fs.rmSync(authDir, { recursive: true, force: true });
-                log('SUCCESS', 'Manual wipe executed.');
-            } catch (e) {}
-        }
+        const authDir = path.join(process.cwd(), 'auth_info_baileys');
+        cleanAuthDir(authDir);
         
         qrCode = null;
         realChats = [];
@@ -1047,14 +1305,15 @@ async function initWASocket() {
         broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
         
         setTimeout(async () => {
-             await initWASocket();
+             scheduleInit(0);
              res.json({ status: 'Logged out successfully' });
         }, 3000);
     });
 
     app.get('/api/media', async (req: any, res: any) => {
         const { msgId, chatId } = req.query;
-        if (!sock || !msgId || !chatId) return res.status(400).send('Missing params');
+        if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
+        if (!msgId || !chatId) return res.status(400).send('Missing message ID or chat ID');
 
         let jid = chatId as string;
         // Normalize JID for lookup
@@ -1190,14 +1449,17 @@ async function initWASocket() {
     });
 
     // Vite middleware
-    if (process.env.NODE_ENV !== 'production') {
+    const isProductionEnv = process.env.NODE_ENV === 'production' || __filename.includes('dist') || !fs.existsSync(path.join(process.cwd(), 'server.ts'));
+    if (!isProductionEnv) {
         const vite = await createViteServer({
             server: { middlewareMode: true },
             appType: 'spa',
         });
         app.use(vite.middlewares);
     } else {
-        const distPath = path.join(process.cwd(), 'dist');
+        const distPath = fs.existsSync(path.join(process.cwd(), 'dist')) 
+            ? path.join(process.cwd(), 'dist') 
+            : path.join(__dirname, 'dist');
         app.use(express.static(distPath));
         app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
     }

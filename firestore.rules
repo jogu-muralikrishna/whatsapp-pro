@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Settings matched collection
+    match /whatsapp_pro/settings {
+      allow read, write: if true; // In a server-authenticated context or trusted client
+    }
+
+    // Contacts collection matches
+    match /whatsapp_pro_contacts/{contactId} {
+      allow read, write: if true;
+    }
+
+    // Chats collection matches
+    match /whatsapp_pro_chats/{chatId} {
+      allow read, write: if true;
+      
+      match /messages/{messageId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}

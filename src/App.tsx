@@ -44,6 +44,25 @@ import { motion, AnimatePresence } from 'motion/react';
 import { format } from 'date-fns';
 import QRCode from 'react-qr-code';
 
+function safeFormat(dateVal: any, formatStr: string, fallback: string = ''): string {
+  if (dateVal === undefined || dateVal === null) return fallback;
+  try {
+    let d: Date;
+    if (typeof dateVal === 'number') {
+      const val = dateVal < 100000000000 ? dateVal * 1000 : dateVal;
+      d = new Date(val);
+    } else {
+      d = new Date(dateVal);
+    }
+    if (isNaN(d.getTime())) {
+      return fallback;
+    }
+    return format(d, formatStr);
+  } catch (e) {
+    return fallback;
+  }
+}
+
 interface Chat {
   id: string;
   name: string;
@@ -190,7 +209,7 @@ export default function App() {
     
     // Apply Theme
     const themes: any = {
-      'elegant-dark': { primary: '#00a884', bg: '#0b141a', surface: '#111b21', accent: '#202c33' },
+      'elegant-dark': { primary: '#00e676', bg: '#000000', surface: '#0d0d0d', accent: '#161619' },
       'matrix-green': { primary: '#22c55e', bg: '#000000', surface: '#050505', accent: '#0c0a09' },
       'cyber-blue': { primary: '#00f2ff', bg: '#020617', surface: '#0f172a', accent: '#1e293b' },
       'royal-purple': { primary: '#a855f7', bg: '#0f0714', surface: '#1a0b2e', accent: '#2d1b4e' },
@@ -932,11 +951,15 @@ export default function App() {
     setAiSuggestions([]);
     
     try {
-      await fetch('/api/send-message', {
+      const res = await fetch('/api/send-message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jid: activeChat.id, text: newMessage })
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Server returned status code ${res.status}`);
+      }
       // Update local chat timestamp/last message for immediate feedback
       setChats(prev => {
         const index = prev.findIndex(c => c.id === activeChat.id);
@@ -949,7 +972,9 @@ export default function App() {
         };
         return next.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       });
-    } catch (e) {}
+    } catch (e: any) {
+      setError(`Transmission Failure: ${e.message}`);
+    }
   };
 
   const deleteChat = async (chatId: string) => {
@@ -1028,32 +1053,32 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-[#0b141a] flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-[#111b21] rounded-2xl border border-white/5 shadow-2xl overflow-hidden">
-          <div className="h-1 bg-[#00a884] w-full shadow-[0_0_15px_#00a884]" />
+      <div className="min-h-screen bg-black flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-[#0a0a0c] rounded-2xl border border-white/5 shadow-2xl overflow-hidden">
+          <div className="h-1 bg-primary w-full shadow-[0_0_15px_var(--color-primary)]" />
           <div className="p-8">
             <div className="flex items-center justify-center mb-10 mt-4">
-              <div className="p-4 bg-[#00a884] rounded-2xl shadow-xl shadow-[#00a884]/20 rotate-3 transition-transform hover:rotate-0">
+              <div className="p-4 bg-primary rounded-2xl shadow-xl shadow-primary/20 rotate-3 transition-transform hover:rotate-0">
                 <Shield className="w-8 h-8 text-white" />
               </div>
             </div>
             
             <div className="flex items-center justify-center gap-2 mb-2">
-              <h1 className="text-3xl font-black text-white tracking-tight italic">SIGNAL PRO</h1>
+              <h1 className="text-3xl font-black text-white tracking-tight italic">WHATSAPP PRO</h1>
               <span className="text-primary text-xl">🛡️</span>
             </div>
             <p className="text-primary/60 text-center mb-8 text-[10px] font-black uppercase tracking-[0.3em]">Encrypted Command Engine</p>
 
-            <div className="flex gap-1 mb-8 bg-[#202c33] p-1 rounded-xl">
+            <div className="flex gap-1 mb-8 bg-zinc-900 p-1 rounded-xl">
               <button 
                 onClick={() => setLoginMethod('pairing')}
-                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === 'pairing' ? 'bg-[#00a884] text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === 'pairing' ? 'bg-primary text-black' : 'text-slate-400 hover:text-slate-200'}`}
               >
                 OTP Secure
               </button>
               <button 
                 onClick={() => setLoginMethod('qr')}
-                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === 'qr' ? 'bg-[#00a884] text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === 'qr' ? 'bg-primary text-black' : 'text-slate-400 hover:text-slate-200'}`}
               >
                 Optic Sync
               </button>
@@ -1063,13 +1088,13 @@ export default function App() {
               {loginMethod === 'pairing' ? (
                 <>
                   <div>
-                    <label className="block text-[10px] font-bold text-[#00a884]/50 uppercase tracking-widest mb-2 ml-1">Terminal Link identifier</label>
+                    <label className="block text-[10px] font-bold text-primary/50 uppercase tracking-widest mb-2 ml-1">Terminal Link identifier</label>
                     <div className="relative group">
-                      <div className="absolute left-4 top-1/2 -translate-y-1/2 text-[#00a884] font-mono font-bold text-sm">+91</div>
+                      <div className="absolute left-4 top-1/2 -translate-y-1/2 text-primary font-mono font-bold text-sm">+91</div>
                       <input 
                         type="text" 
                         placeholder="Master Phone" 
-                        className="w-full pl-14 pr-4 py-4 bg-[#202c33] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-[#00a884] transition-all font-mono"
+                        className="w-full pl-14 pr-4 py-4 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-primary transition-all font-mono"
                         value={phoneNumber}
                         onChange={(e) => setPhoneNumber(e.target.value.replace(/\D/g, '').slice(0, 10))}
                         disabled={!!pairingCode || loading}
@@ -1082,12 +1107,12 @@ export default function App() {
                       <motion.div 
                         initial={{ scale: 0.9, opacity: 0 }}
                         animate={{ scale: 1, opacity: 1 }}
-                        className="p-6 bg-[#202c33] rounded-xl border border-[#00a884]/20 flex flex-col items-center"
+                        className="p-6 bg-[#121214] rounded-xl border border-primary/20 flex flex-col items-center"
                       >
-                        <span className="text-[10px] text-[#00a884] font-black mb-4 uppercase tracking-[0.3em]">Access Code</span>
+                        <span className="text-[10px] text-primary font-black mb-4 uppercase tracking-[0.3em]">Access Code</span>
                         <div className="flex gap-1">
                           {pairingCode.split('').map((char, i) => (
-                            <span key={i} className="text-3xl font-mono font-black text-white bg-black/20 w-8 h-12 flex items-center justify-center rounded-lg border border-white/5 shadow-inner">
+                            <span key={i} className="text-3xl font-mono font-black text-white bg-black/40 w-8 h-12 flex items-center justify-center rounded-lg border border-white/5 shadow-inner">
                               {char}
                             </span>
                           ))}
@@ -1102,18 +1127,18 @@ export default function App() {
                       {qrCode ? (
                         <div className="relative">
                           <QRCode value={qrCode} size={180} />
-                          <div className="absolute inset-0 border-4 border-[#00a884]/20 rounded-lg pointer-events-none animate-pulse" />
+                          <div className="absolute inset-0 border-4 border-primary/20 rounded-lg pointer-events-none animate-pulse" />
                         </div>
                       ) : (
-                        <div className="w-[180px] h-[180px] flex flex-col items-center justify-center bg-[#f0f2f5] rounded-xl gap-4">
-                          <RefreshCw className="w-8 h-8 text-[#54656f] animate-spin" />
-                          <span className="text-[9px] font-black text-[#54656f] uppercase tracking-widest text-center px-4">Calibrating Neural Link...</span>
+                        <div className="w-[180px] h-[180px] flex flex-col items-center justify-center bg-[#1c1c1f] rounded-xl gap-4">
+                          <RefreshCw className="w-8 h-8 text-slate-500 animate-spin" />
+                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest text-center px-4">Calibrating Neural Link...</span>
                         </div>
                       )}
-                      <div className="absolute inset-0 bg-[#00a884]/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
+                      <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
                     </div>
                     {(!qrCode && !isRefreshing) && (
-                       <p className="text-[9px] text-[#00a884] font-black uppercase tracking-[0.2em] mb-4 animate-pulse">Awaiting Authentication Stream...</p>
+                       <p className="text-[9px] text-primary font-black uppercase tracking-[0.2em] mb-4 animate-pulse">Awaiting Authentication Stream...</p>
                     )}
                   </div>
               )}
@@ -1129,9 +1154,9 @@ export default function App() {
                 <button 
                   onClick={requestPairingCode}
                   disabled={loading || phoneNumber.length !== 10}
-                  className="w-full bg-[#00a884] text-white font-black py-4 rounded-xl hover:bg-[#00bc95] disabled:opacity-20 transition-all shadow-xl shadow-[#00a884]/10 text-xs uppercase tracking-widest flex items-center justify-center gap-3"
+                  className="w-full bg-primary text-black font-black py-4 rounded-xl hover:opacity-90 disabled:opacity-20 transition-all shadow-xl shadow-primary/10 text-xs uppercase tracking-widest flex items-center justify-center gap-3"
                 >
-                  {loading && <RefreshCw className="w-4 h-4 animate-spin" />}
+                  {loading && <RefreshCw className="w-4 h-4 animate-spin text-black" />}
                   {loading ? 'Initializing Stack...' : 'Link System 💎'}
                 </button>
               )}
@@ -1142,7 +1167,7 @@ export default function App() {
                     <button 
                       onClick={refreshQr}
                       disabled={isRefreshing}
-                      className="w-full bg-white/5 text-[#00a884] font-black py-4 rounded-xl hover:bg-white/10 disabled:opacity-50 transition-all text-[10px] uppercase tracking-[0.2em] flex items-center justify-center gap-3 border border-[#00a884]/10"
+                      className="w-full bg-white/5 text-primary font-black py-4 rounded-xl hover:bg-white/10 disabled:opacity-50 transition-all text-[10px] uppercase tracking-[0.2em] flex items-center justify-center gap-3 border border-primary/10"
                     >
                       <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
                       {isRefreshing ? 'Resetting Engine...' : 'Fast Refresh QR'}
@@ -1429,7 +1454,7 @@ export default function App() {
                       <div className="flex items-center gap-1.5">
                         {favorites.includes(chat.id) && <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />}
                         <span className="text-[9px] text-[#8696a0] font-black">
-                          {chat.timestamp ? format(chat.timestamp * 1000, 'HH:mm') : ''}
+                          {safeFormat(chat.timestamp, 'HH:mm')}
                         </span>
                       </div>
                     </div>
@@ -1512,7 +1537,7 @@ export default function App() {
                           )}
                        </div>
                        <p className="text-[9px] opacity-40 uppercase font-black">
-                         {format(new Date(status.timestamp * 1000), 'MMM dd, HH:mm')}
+                         {safeFormat(status.timestamp, 'MMM dd, HH:mm')}
                        </p>
                     </div>
                   </div>
@@ -1541,7 +1566,7 @@ export default function App() {
                        </div>
                        <div>
                          <p className="text-sm font-bold">{getDisplayName(activeStatus.participant) || activeStatus.pushName}</p>
-                         <p className="text-[10px] opacity-60">{format(new Date(activeStatus.timestamp * 1000), 'HH:mm')}</p>
+                         <p className="text-[10px] opacity-60">{safeFormat(activeStatus.timestamp, 'HH:mm')}</p>
                        </div>
                     </div>
                     <button className="absolute top-4 right-4 text-white z-[120]" onClick={() => setActiveStatus(null)}>
@@ -1550,12 +1575,30 @@ export default function App() {
                     
                     <div className="max-w-full max-h-screen p-4 flex flex-col items-center justify-center gap-6">
                       {activeStatus.message?.videoMessage && (
-                        <video 
-                          src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`} 
-                          controls 
-                          autoPlay 
-                          className="max-w-full max-h-[70vh] rounded-xl shadow-2xl" 
-                        />
+                        <div className="flex flex-col items-center gap-4" onClick={(e) => e.stopPropagation()}>
+                          <video 
+                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`} 
+                            controls 
+                            autoPlay 
+                            className="max-w-full max-h-[60vh] rounded-xl shadow-2xl border border-white/5" 
+                          />
+                          <div className="flex gap-3 justify-center">
+                            <button 
+                              onClick={() => downloadMedia(activeStatus.id, 'status@broadcast', `status_video_${activeStatus.id}.mp4`)}
+                              className="px-4 py-2.5 bg-zinc-950/80 hover:bg-zinc-900 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center gap-2 border border-white/10 shadow-lg hover:border-primary active:scale-95"
+                            >
+                              <Download className="w-4 h-4 text-primary animate-bounce" />
+                              Download MP4
+                            </button>
+                            <button 
+                              onClick={() => downloadMedia(activeStatus.id, 'status@broadcast', `status_audio_${activeStatus.id}.mp3`)}
+                              className="px-4 py-2.5 bg-zinc-950/80 hover:bg-zinc-900 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center gap-2 border border-white/10 shadow-lg hover:border-primary active:scale-95"
+                            >
+                              <Music className="w-4 h-4 text-primary animate-pulse" />
+                              Download MP3
+                            </button>
+                          </div>
+                        </div>
                       )}
                       {activeStatus.message?.audioMessage && (
                         <div className="bg-white/10 p-8 rounded-3xl backdrop-blur-xl flex flex-col items-center gap-4">
@@ -1619,11 +1662,18 @@ export default function App() {
                      <Phone className={`w-4 h-4 ${call.status === 'missed' ? 'text-red-500' : 'text-[#00a884]'}`} />
                    </div>
                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-bold truncate uppercase">{getDisplayName(call.from)}</p>
-                      <p className="text-[9px] opacity-40 uppercase font-black">{call.status} • {format(new Date(), 'MMM dd, HH:mm')}</p>
+                      <p className="text-xs font-bold truncate uppercase">{getDisplayName(call.from || '')}</p>
+                      <p className="text-[9px] opacity-40 uppercase font-black">
+                        {call.status} • {safeFormat(call.timestamp, 'MMM dd, HH:mm', safeFormat(new Date(), 'MMM dd, HH:mm'))}
+                      </p>
                    </div>
                    <button 
-                      onClick={() => window.location.href = `tel:+${call.from.split('@')[0]}`} 
+                      onClick={() => {
+                        if (call.from) {
+                          const num = call.from.split('@')[0];
+                          if (num) window.location.href = `tel:+${num}`;
+                        }
+                      }} 
                       className="p-2 hover:bg-white/5 rounded-full text-[#00a884]"
                    >
                      <Phone className="w-4 h-4" />
@@ -1651,7 +1701,7 @@ export default function App() {
               <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1">
                 {engineLogs.map((log, i) => (
                   <div key={i} className="py-1 border-b border-white/[0.02] flex gap-2 overflow-hidden">
-                    <span className="text-white/20 shrink-0">[{format(new Date(log.time), 'HH:mm:ss')}]</span>
+                    <span className="text-white/20 shrink-0">[{safeFormat(log.time, 'HH:mm:ss')}]</span>
                     <span className={`font-black shrink-0 ${log.level === 'ERROR' ? 'text-red-500' : log.level === 'WARN' ? 'text-yellow-500' : 'text-[#00a884]'}`}>{log.level}</span>
                     <span className="text-white/60 truncate">{log.msg}</span>
                   </div>
@@ -1754,7 +1804,7 @@ export default function App() {
                         </button>
                         <button 
                           onClick={() => {
-                            const content = messages.map(m => `[${format(m.timestamp, 'yyyy-MM-dd HH:mm:ss')}] ${m.sender}: ${m.text}`).join('\n');
+                            const content = messages.map(m => `[${safeFormat(m.timestamp, 'yyyy-MM-dd HH:mm:ss')}] ${m.sender}: ${m.text}`).join('\n');
                             const blob = new Blob([content], { type: 'text/plain' });
                             const url = URL.createObjectURL(blob);
                             const a = document.createElement('a');
@@ -1808,7 +1858,13 @@ export default function App() {
               </div>
               
                 {messages.map((msg, i) => (
-                  <div key={`${msg.id}-${i}`} className={`flex ${msg.fromMe ? 'justify-end' : 'justify-start'}`}>
+                  <motion.div 
+                    key={`${msg.id}-${i}`}
+                    initial={{ opacity: 0, y: 12, scale: 0.97 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    transition={{ type: "spring", stiffness: 350, damping: 25 }}
+                    className={`flex ${msg.fromMe ? 'justify-end' : 'justify-start'}`}
+                  >
                     <div className={`max-w-[70%] px-5 py-3 rounded-2xl shadow-2xl relative group ${msg.fromMe ? 'bg-[#005c4b] text-[#e9edef]' : 'bg-accent text-[#e9edef]'}`}>
                       {!msg.fromMe && activeChat?.id?.endsWith('@g.us') && (
                         <p className="text-[10px] font-black uppercase text-primary tracking-[1.5px] mb-1 italic truncate max-w-full">
@@ -1901,7 +1957,7 @@ export default function App() {
                     <p className={`text-sm leading-relaxed font-medium ${msg.rawMessage?.documentMessage ? 'mt-2' : ''}`}>{msg.text}</p>
                     <div className="flex items-center justify-between gap-2 mt-2 pt-1 border-t border-white/5">
                       <div className="flex items-center gap-2">
-                        <span className="text-[8px] opacity-40 font-black">{format(msg.timestamp, 'HH:mm')}</span>
+                        <span className="text-[8px] opacity-40 font-black">{safeFormat(msg.timestamp, 'HH:mm')}</span>
                         {msg.fromMe && <Check className={`w-3 h-3 ${msg.status === 'read' ? 'text-sky-400' : 'opacity-30'}`} />}
                         <button 
                           onClick={() => setStarredMessages(prev => prev.some(s => s.id === msg.id) ? prev.filter(s => s.id !== msg.id) : [...prev, msg])}
@@ -1943,7 +1999,7 @@ export default function App() {
                        </svg>
                     </div>
                   </div>
-                </div>
+                </motion.div>
               ))}
             </div>
 
@@ -2202,7 +2258,7 @@ export default function App() {
                           <div className="min-w-0 flex-1">
                              <div className="flex items-center gap-2 mb-1">
                                 <span className="text-[9px] font-black uppercase text-primary">{getDisplayName(m.originalChat)}</span>
-                                <span className="text-[8px] opacity-30 font-bold">{format(new Date(m.deletedAt), 'MMM dd, HH:mm')}</span>
+                                <span className="text-[8px] opacity-30 font-bold">{safeFormat(m.deletedAt, 'MMM dd, HH:mm')}</span>
                              </div>
                              <p className="text-sm opacity-80 truncate italic">"{getMsgText(m)}"</p>
                           </div>
@@ -2234,7 +2290,7 @@ export default function App() {
                              </div>
                              <div>
                                 <p className="text-sm font-bold uppercase">{getDisplayName(c)}</p>
-                                <p className="text-[9px] opacity-40 uppercase font-black">Nuked at {format(new Date(c.deletedAt), 'HH:mm')}</p>
+                                <p className="text-[9px] opacity-40 uppercase font-black">Nuked at {safeFormat(c.deletedAt, 'HH:mm')}</p>
                              </div>
                           </div>
                           <button 
@@ -2265,7 +2321,7 @@ export default function App() {
                               </div>
                               <div className="min-w-0">
                                  <p className="text-[9px] font-black uppercase truncate italic">{s.pushName || 'Unknown Entity'}</p>
-                                 <p className="text-[7px] opacity-30 font-mono">INTERCEPTED: {format(new Date(s.timestamp * 1000), 'HH:mm')}</p>
+                                 <p className="text-[7px] opacity-30 font-mono">INTERCEPTED: {safeFormat(s.timestamp, 'HH:mm')}</p>
                               </div>
                            </div>
                            <div 
@@ -2549,7 +2605,7 @@ export default function App() {
                            <div key={i} className="p-4 bg-[#202c33] rounded-2xl border border-white/5 flex flex-col gap-2">
                       <div className="flex justify-between items-center bg-[#202c33] p-1.5 rounded-lg mb-2">
                         <span className="text-[10px] font-black text-[#00a884] uppercase tracking-widest px-2">{m.sender}</span>
-                        <span className="text-[8px] opacity-30 font-bold px-2">{format(m.timestamp * 1000, 'MMM dd, HH:mm')}</span>
+                        <span className="text-[8px] opacity-30 font-bold px-2">{safeFormat(m.timestamp, 'MMM dd, HH:mm')}</span>
                       </div>
                       <div className="px-1 py-1">
                         <p className="text-sm italic opacity-80 leading-relaxed">"{m.message?.conversation || m.text || 'Encrypted Payload'}"</p>
@@ -2724,7 +2780,7 @@ export default function App() {
                         <div key={m.id} className="p-3 bg-accent/50 rounded-xl flex items-center justify-between mb-2 border border-white/[0.02]">
                            <div className="min-w-0">
                               <p className="text-[11px] font-bold truncate">"{m.text}"</p>
-                              <p className="text-[8px] opacity-40 font-mono italic">{format(new Date(m.time), 'MMM dd, HH:mm')}</p>
+                              <p className="text-[8px] opacity-40 font-mono italic">{safeFormat(m.time, 'MMM dd, HH:mm')}</p>
                            </div>
                            <Clock className="w-3 h-3 text-primary" />
                         </div>

@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "Settings": {
+      "title": "Settings",
+      "description": "WhatsApp Pro configuration settings",
+      "type": "object",
+      "properties": {
+        "autoTranslate": { "type": "boolean" },
+        "theme": { "type": "string" },
+        "font": { "type": "string" },
+        "aiContext": { "type": "string" },
+        "ghostMode": { "type": "boolean" },
+        "antiDelete": { "type": "boolean" },
+        "antiDeleteStatus": { "type": "boolean" },
+        "hideNumbers": { "type": "boolean" },
+        "hideBlueTicks": { "type": "boolean" },
+        "hideSecondTick": { "type": "boolean" },
+        "hideTyping": { "type": "boolean" },
+        "secretStatusView": { "type": "boolean" },
+        "dndMode": { "type": "boolean" },
+        "autoReply": { "type": "boolean" }
+      }
+    },
+    "Contact": {
+      "title": "Contact",
+      "description": "WhatsApp Pro sync'd contact information",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "pushName": { "type": "string" }
+      },
+      "required": ["id"]
+    },
+    "Chat": {
+      "title": "Chat",
+      "description": "WhatsApp Pro chat metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "lastMessage": { "type": "object" },
+        "unreadCount": { "type": "number" }
+      },
+      "required": ["id"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "WhatsApp Pro captured message",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sender": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "fromMe": { "type": "boolean" },
+        "isRevoked": { "type": "boolean" }
+      },
+      "required": ["id", "sender"]
+    }
+  },
+  "firestore": {
+    "/whatsapp_pro/settings": {
+      "schema": "Settings",
+      "description": "Current active settings of the engine"
+    },
+    "/whatsapp_pro_contacts/{contactId}": {
+      "schema": "Contact",
+      "description": "Synchronized device contacts"
+    },
+    "/whatsapp_pro_chats/{chatId}": {
+      "schema": "Chat",
+      "description": "Captured WhatsApp chat list objects"
+    },
+    "/whatsapp_pro_chats/{chatId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Full conversation messages list per chat"
+    }
+  }
+}

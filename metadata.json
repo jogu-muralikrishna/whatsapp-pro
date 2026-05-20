@@ -8,6 +8,7 @@
   "majorCapabilities": [
     "real_time_sync",
     "message_scheduling",
-    "ai_integration"
+    "ai_integration",
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]
 }
