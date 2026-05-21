@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import fs from 'fs';
+import multer from 'multer';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import makeWASocket, { 
@@ -41,6 +42,9 @@ const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 const logger = pino({ level: 'silent' });
 const PORT = 3000;
 const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
+
+const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
+const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 
 // Initialize Firebase configuration if it exists
 const firebaseConfigPath = path.join(process.cwd(), 'firebase-applet-config.json');
@@ -1411,6 +1415,131 @@ async function initWASocket() {
         res.json(mockMsg);
     });
 
+    app.post('/api/send-media', upload.single('file'), async (req: any, res: any) => {
+        try {
+            const { jid, caption, type } = req.body;
+            const file = req.file;
+            if (!jid) return res.status(400).json({ error: 'Missing target JID' });
+            if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+            const targetJid = normalizeJid(jid);
+            const messageId = 'sim_media_' + Math.random().toString(36).substr(2, 9);
+
+            // Add the file to local caching map
+            localMediaCache.set(messageId, {
+                buffer: file.buffer,
+                mimetype: file.mimetype,
+                filename: file.originalname
+            });
+
+            // Standard Baileys format message for local cache
+            let messageContent: any = {};
+            const utype = type || 'document';
+            if (utype === 'image' || file.mimetype.startsWith('image/')) {
+                messageContent = { 
+                    imageMessage: { 
+                        caption: caption || '', 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else if (utype === 'video' || file.mimetype.startsWith('video/')) {
+                messageContent = { 
+                    videoMessage: { 
+                        caption: caption || '', 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else if (utype === 'audio' || file.mimetype.startsWith('audio/')) {
+                messageContent = { 
+                    audioMessage: { 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else {
+                messageContent = { 
+                    documentMessage: { 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname, 
+                        title: file.originalname 
+                    } 
+                };
+            }
+
+            const mockMsg = {
+                key: {
+                    remoteJid: targetJid,
+                    fromMe: true,
+                    id: messageId
+                },
+                message: messageContent,
+                messageTimestamp: Math.floor(Date.now() / 1000),
+                status: 'sent'
+            };
+
+            // Save to local message history memory and Firebase
+            if (!proData.messageHistory[targetJid]) {
+                proData.messageHistory[targetJid] = [];
+            }
+            proData.messageHistory[targetJid].push(mockMsg);
+
+            // Update the last message in cached chats list
+            let chat = realChats.find(c => c.id === targetJid);
+            if (!chat) {
+                chat = {
+                    id: targetJid,
+                    name: proData.contacts[targetJid]?.name || targetJid.split('@')[0],
+                    unreadCount: 0,
+                    timestamp: Math.floor(Date.now() / 1000)
+                };
+                realChats.push(chat);
+            }
+            chat.timestamp = Math.floor(Date.now() / 1000);
+            chat.lastMessage = mockMsg;
+            proData.cachedChats = realChats;
+
+            saveMessageToFirebase(targetJid, mockMsg);
+            saveChatToFirebase(targetJid, chat);
+            saveProData();
+
+            // Broadcast to client so other tabs update too
+            broadcast({ type: 'MESSAGES_UPSERT', data: { messages: [mockMsg] } });
+            broadcast({ type: 'INITIAL_SYNC', data: { chats: realChats } });
+
+            // Send via Baileys if connected
+            if (sock) {
+                try {
+                    log('INFO', `Sending media to ${targetJid} via WhatsApp API`);
+                    let waPayload: any = {};
+                    if (utype === 'image' || file.mimetype.startsWith('image/')) {
+                        waPayload = { image: file.buffer, caption: caption || '' };
+                    } else if (utype === 'video' || file.mimetype.startsWith('video/')) {
+                        waPayload = { video: file.buffer, caption: caption || '' };
+                    } else if (utype === 'audio' || file.mimetype.startsWith('audio/')) {
+                        waPayload = { audio: file.buffer, mimetype: file.mimetype };
+                    } else {
+                        waPayload = { 
+                            document: file.buffer, 
+                            mimetype: file.mimetype, 
+                            fileName: file.originalname 
+                        };
+                    }
+                    const sent = await sock.sendMessage(targetJid, waPayload);
+                    return res.json(sent);
+                } catch (e: any) {
+                    log('ERROR', `Failed to send media/file over WhatsApp API: ${e?.message}`);
+                }
+            }
+
+            res.json(mockMsg);
+        } catch (e: any) {
+            log('ERROR', `Error in /api/send-media: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     app.post('/api/react-message', async (req, res) => {
         const { jid, msgId, emoji, fromMe } = req.body;
         if (!jid || !msgId || !emoji) return res.status(400).json({ error: 'Missing target JID, message ID, or emoji' });
@@ -1690,8 +1819,17 @@ async function initWASocket() {
 
     app.get('/api/media', async (req: any, res: any) => {
         const { msgId, chatId } = req.query;
+        if (!msgId) return res.status(400).send('Missing message ID');
+
+        if (localMediaCache.has(msgId as string)) {
+            const cached = localMediaCache.get(msgId as string)!;
+            res.setHeader('Content-Type', cached.mimetype);
+            res.setHeader('Content-Disposition', `attachment; filename="${cached.filename}"`);
+            return res.send(cached.buffer);
+        }
+
         if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
-        if (!msgId || !chatId) return res.status(400).send('Missing message ID or chat ID');
+        if (!chatId) return res.status(400).send('Missing chat ID');
 
         let jid = chatId as string;
         // Normalize JID for lookup

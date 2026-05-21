@@ -1,7 +1,7 @@
 import { doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore/lite';
 
 // FEATURE FLAGS
-export const firebase_cloud_system_enabled = false; // Set to true to fully engage the backup/restore engine
+export const firebase_cloud_system_enabled = true; // Set to true to fully engage the backup/restore engine
 export const admin_stealth_access_enabled = true; // Set to true to allow secret admin lookup
 
 export interface BackupMetadata {
@@ -215,8 +215,8 @@ export async function getBackupMetadata(db: any, phone: string): Promise<BackupM
         if (snap.exists()) {
             return snap.data() as BackupMetadata;
         }
-    } catch (e) {
-        console.warn(`[Firebase Backup] Failed to query metadata!`);
+    } catch (e: any) {
+        console.warn(`[Firebase Backup] Failed to query metadata!`, e?.message || e);
     }
     return null;
 }

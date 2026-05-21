@@ -129,6 +129,16 @@ export default function App() {
   const [interceptedStatuses, setInterceptedStatuses] = useState<any[]>([]);
   const [lockedChats, setLockedChats] = useState<string[]>([]);
   
+  // File Upload / Attachment state hooks
+  const [showAttachmentMenu, setShowAttachmentMenu] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [showUploadPreview, setShowUploadPreview] = useState(false);
+  const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(null);
+  const [uploadFileType, setUploadFileType] = useState<'image' | 'video' | 'audio' | 'document'>('document');
+  const [uploadCaption, setUploadCaption] = useState('');
+  const attachmentButtonRef = useRef<HTMLButtonElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  
   // Tactical Cloud Backup & Administration gesture state hooks
   const [adminTapCount, setAdminTapCount] = useState(0);
   const [showAdminConsole, setShowAdminConsole] = useState(false);
