@@ -57,24 +57,81 @@
         "isRevoked": { "type": "boolean" }
       },
       "required": ["id", "sender"]
+    },
+    "ScheduledMessage": {
+      "title": "ScheduledMessage",
+      "description": "WhatsApp Pro scheduled future message",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "jid": { "type": "string" },
+        "text": { "type": "string" },
+        "time": { "type": "string" },
+        "sent": { "type": "boolean" },
+        "sentAt": { "type": "string" }
+      },
+      "required": ["id", "jid", "text", "time"]
+    },
+    "AutoReply": {
+      "title": "AutoReply",
+      "description": "WhatsApp Pro keyword auto-responder match rules",
+      "type": "object",
+      "properties": {
+        "keyword": { "type": "string" },
+        "response": { "type": "string" },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["keyword", "response"]
     }
   },
   "firestore": {
-    "/whatsapp_pro/settings": {
+    "/whatsapp_pro_users/{userId}/config/settings": {
       "schema": "Settings",
       "description": "Current active settings of the engine"
     },
-    "/whatsapp_pro_contacts/{contactId}": {
+    "/whatsapp_pro_users/{userId}/contacts/{contactId}": {
       "schema": "Contact",
       "description": "Synchronized device contacts"
     },
-    "/whatsapp_pro_chats/{chatId}": {
+    "/whatsapp_pro_users/{userId}/chats/{chatId}": {
       "schema": "Chat",
       "description": "Captured WhatsApp chat list objects"
     },
-    "/whatsapp_pro_chats/{chatId}/messages/{messageId}": {
+    "/whatsapp_pro_users/{userId}/chats/{chatId}/messages/{messageId}": {
       "schema": "Message",
       "description": "Full conversation messages list per chat"
+    },
+    "/whatsapp_pro_users/{userId}/scheduled/{scheduledId}": {
+      "schema": "ScheduledMessage",
+      "description": "Messages scheduled for delivery on dynamic time trigger"
+    },
+    "/whatsapp_pro_users/{userId}/autoreplies/{keyword}": {
+      "schema": "AutoReply",
+      "description": "Incoming message auto response keyword match definitions"
+    },
+    "/users/{phone}/firebase_backup/settings/active": {
+      "schema": "Settings",
+      "description": "Prismatic user settings backup"
+    },
+    "/users/{phone}/firebase_backup/chats/{chatId}": {
+      "schema": "Chat",
+      "description": "Prismatic user chats history backup"
+    },
+    "/users/{phone}/firebase_backup/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Prismatic user individual messages backup"
+    },
+    "/users/{phone}/firebase_backup/calls/{callId}": {
+      "schema": "object",
+      "description": "Prismatic user call history log backup"
+    },
+    "/users/{phone}/firebase_backup/status/{statusId}": {
+      "schema": "object",
+      "description": "Prismatic user status stories backup"
+    },
+    "/users/{phone}/firebase_backup/groups/{groupId}": {
+      "schema": "Chat",
+      "description": "Prismatic group characteristics metadata"
     }
   }
 }

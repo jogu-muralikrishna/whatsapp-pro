@@ -6,17 +6,35 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Settings matched collection
-    match /whatsapp_pro/settings {
-      allow read, write: if true; // In a server-authenticated context or trusted client
+    // whatsapp_pro_users root and all inner subcollections/documents
+    match /whatsapp_pro_users/{userId} {
+      allow read, write: if true;
+      
+      match /{allSubcollections=**} {
+        allow read, write: if true;
+      }
     }
 
-    // Contacts collection matches
+    // users collections and all inner backup structures
+    match /users/{phone} {
+      allow read, write: if true;
+      
+      match /{allSubcollections=**} {
+        allow read, write: if true;
+      }
+    }
+
+    // Settings matched collection (legacy/compatibility)
+    match /whatsapp_pro/settings {
+      allow read, write: if true;
+    }
+
+    // Contacts collection matches (legacy/compatibility)
     match /whatsapp_pro_contacts/{contactId} {
       allow read, write: if true;
     }
 
-    // Chats collection matches
+    // Chats collection matches (legacy/compatibility)
     match /whatsapp_pro_chats/{chatId} {
       allow read, write: if true;
       

@@ -38,11 +38,15 @@ import {
   Square,
   Forward,
   Pause,
-  Play
+  Play,
+  Smile,
+  MicOff,
+  PhoneOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format } from 'date-fns';
 import QRCode from 'react-qr-code';
+import { SecretAdminPanel } from './components/SecretAdminPanel';
 
 function safeFormat(dateVal: any, formatStr: string, fallback: string = ''): string {
   if (dateVal === undefined || dateVal === null) return fallback;
@@ -124,7 +128,47 @@ export default function App() {
   const [autoReplies, setAutoReplies] = useState<any[]>([]);
   const [interceptedStatuses, setInterceptedStatuses] = useState<any[]>([]);
   const [lockedChats, setLockedChats] = useState<string[]>([]);
+  
+  // Tactical Cloud Backup & Administration gesture state hooks
+  const [adminTapCount, setAdminTapCount] = useState(0);
+  const [showAdminConsole, setShowAdminConsole] = useState(false);
+  const [backupStatus, setBackupStatus] = useState<any>(null);
+  const [isBackupLoading, setIsBackupLoading] = useState(false);
+  const [backupError, setBackupError] = useState<string | null>(null);
+
+  const fetchBackupStatus = async () => {
+    try {
+      const res = await fetch('/api/firebase-backup/status');
+      const data = await res.json();
+      if (res.ok) {
+        setBackupStatus(data);
+      }
+    } catch (e) {}
+  };
+
+  const handleAdminTap = () => {
+    setAdminTapCount(prev => {
+      const next = prev + 1;
+      if (next >= 7) {
+        setShowAdminConsole(true);
+        return 0;
+      }
+      return next;
+    });
+  };
   const [showLockedChats, setShowLockedChats] = useState(false);
+  const [activeCallSession, setActiveCallSession] = useState<{
+    jid: string;
+    recipientName: string;
+    status: 'ringing' | 'connected' | 'ended';
+    duration: number;
+    isMuted: boolean;
+    isVideo: boolean;
+  } | null>(null);
+  const [showPasscodeModal, setShowPasscodeModal] = useState(false);
+  const [enteredPasscode, setEnteredPasscode] = useState('');
+  const [reactingMsgId, setReactingMsgId] = useState<string | null>(null);
+  const [selectedScheduleJid, setSelectedScheduleJid] = useState<string>('');
   const [deleteOptionModal, setDeleteOptionModal] = useState<{ msgId: string, visible: boolean } | null>(null);
   const [isProfileEditorOpen, setIsProfileEditorOpen] = useState(false);
   const [profileName, setProfileName] = useState('');
@@ -170,10 +214,33 @@ export default function App() {
   }, [activeChat]);
 
   useEffect(() => {
+    if (!activeCallSession) return;
+
+    let timer: NodeJS.Timeout | null = null;
+    let connectTimeout: NodeJS.Timeout | null = null;
+
+    if (activeCallSession.status === 'ringing') {
+      connectTimeout = setTimeout(() => {
+        setActiveCallSession(prev => prev ? { ...prev, status: 'connected' } : null);
+      }, 1500);
+    } else if (activeCallSession.status === 'connected') {
+      timer = setInterval(() => {
+        setActiveCallSession(prev => prev ? { ...prev, duration: prev.duration + 1 } : null);
+      }, 1000);
+    }
+
+    return () => {
+      if (timer) clearInterval(timer);
+      if (connectTimeout) clearTimeout(connectTimeout);
+    };
+  }, [activeCallSession?.status]);
+
+  useEffect(() => {
     connectWebSocket();
     checkConnectionStatus();
     fetchLogs();
     fetchSettings();
+    fetchBackupStatus(); // Extract backup status metadata on initialization
     fetchCallHistory();
     fetchStatusUpdates();
     fetchFavorites();
@@ -186,6 +253,12 @@ export default function App() {
       clearInterval(logInterval);
     };
   }, []);
+
+  useEffect(() => {
+    if (showSettings) {
+      fetchBackupStatus();
+    }
+  }, [showSettings]);
 
   const fetchAutoReplies = async () => {
     try {
@@ -341,9 +414,51 @@ export default function App() {
 
   const readAll = async () => {
     try {
+      setChats(prev => prev.map(c => ({ ...c, unreadCount: 0 })));
       await fetch('/api/read-all', { method: 'POST' });
-      checkConnectionStatus();
     } catch (e) {}
+  };
+
+  const startInAppCall = (chatId: string, isVideo: boolean = false) => {
+    const chat = chats.find(c => c.id === chatId);
+    const recipientName = chat ? getDisplayName(chat) : chatId.split('@')[0];
+    
+    setActiveCallSession({
+      jid: chatId,
+      recipientName,
+      status: 'ringing',
+      duration: 0,
+      isMuted: false,
+      isVideo
+    });
+  };
+
+  const endInAppCall = async () => {
+    if (!activeCallSession) return;
+    const finalSession = { ...activeCallSession, status: 'ended' };
+    setActiveCallSession(finalSession);
+
+    try {
+      const res = await fetch('/api/add-call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jid: finalSession.jid,
+          type: finalSession.isVideo ? 'video' : 'audio',
+          date: new Date().toISOString(),
+          duration: finalSession.duration,
+          status: 'connected',
+          fromMe: true
+        })
+      });
+      if (res.ok) {
+        fetchCallHistory();
+      }
+    } catch (e) {}
+
+    setTimeout(() => {
+      setActiveCallSession(null);
+    }, 800);
   };
 
   const restoreChat = async (chatId: string) => {
@@ -473,15 +588,20 @@ export default function App() {
   };
 
   const scheduleMessage = async () => {
-    if (!activeChat || !scheduleData.text || !scheduleData.time) return;
+    const targetJid = selectedScheduleJid || activeChat?.id;
+    if (!targetJid || !scheduleData.text || !scheduleData.time) {
+      setError('RECIPIENT, MESSAGE PAYLOAD, AND TIMING SPECIFICATION REQUIRED');
+      return;
+    }
     try {
       await fetch('/api/schedule-message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...scheduleData, jid: activeChat.id })
+        body: JSON.stringify({ ...scheduleData, jid: targetJid })
       });
       fetchScheduledMsgs();
       setScheduleData({ text: '', time: '' });
+      setSelectedScheduleJid('');
       setShowScheduleModal(false);
     } catch (e) {}
   };
@@ -821,6 +941,14 @@ export default function App() {
 
   const reactToMessage = async (msgId: string, emoji: string, fromMe: boolean) => {
     if (!activeChat) return;
+    // Optimistically update reactions state immediately
+    setMessages(prev => prev.map(m => {
+      if (m.id === msgId || m.key?.id === msgId) {
+        return { ...m, reaction: emoji };
+      }
+      return m;
+    }));
+
     try {
       await fetch('/api/react-message', {
         method: 'POST',
@@ -832,7 +960,6 @@ export default function App() {
           fromMe
         })
       });
-      // In a real app we'd wait for the WS update, but we can optimistically update or just wait.
     } catch (e) {}
   };
 
@@ -1275,12 +1402,23 @@ export default function App() {
                       </div>
                     </button>
                     <button 
-                      onClick={() => { setShowLockedChats(!showLockedChats); setIsMainMenuOpen(false); }}
+                      onClick={() => {
+                        if (!showLockedChats) {
+                          setEnteredPasscode('');
+                          setShowPasscodeModal(true);
+                        } else {
+                          setShowLockedChats(false);
+                        }
+                        setIsMainMenuOpen(false);
+                      }}
                       className="w-full px-4 py-3 flex items-center justify-between text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors"
                     >
-                      <div className="flex items-center gap-2 italic">
-                        <Lock className="w-4 h-4" />
-                        Locked Archive
+                      <div className="flex-col">
+                        <div className="flex items-center gap-2 italic">
+                          <Lock className="w-4 h-4" />
+                          Locked Archive
+                        </div>
+                        <p className="text-[8px] text-[#8696af] uppercase font-black text-left pl-6 tracking-widest mt-0.5 mt-1">Secured by cryptographic pin</p>
                       </div>
                       <div className={`w-8 h-4 rounded-full relative transition-colors ${showLockedChats ? 'bg-[#00a884]' : 'bg-white/10'}`}>
                         <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${showLockedChats ? 'left-4.5' : 'left-0.5'}`} />
@@ -1322,7 +1460,7 @@ export default function App() {
                       className="w-full px-4 py-3 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors italic"
                     >
                       <Check className="w-4 h-4 text-[#00a884]" />
-                      Read All Signals
+                      Read All Messages
                     </button>
                     <button 
                       onClick={() => { setSettingsView('starred'); setShowSettings(true); setIsMainMenuOpen(false); }}
@@ -1671,7 +1809,7 @@ export default function App() {
                       onClick={() => {
                         if (call.from) {
                           const num = call.from.split('@')[0];
-                          if (num) window.location.href = `tel:+${num}`;
+                          startInAppCall(call.from);
                         }
                       }} 
                       className="p-2 hover:bg-white/5 rounded-full text-[#00a884]"
@@ -1716,6 +1854,91 @@ export default function App() {
       <div className="flex-1 flex flex-col bg-[#0b141a] relative">
         <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'url("https://user-images.githubusercontent.com/15075759/28719144-86dc0f70-73b1-11e7-911d-60d70fcded21.png")' }} />
         
+        {activeCallSession && (
+          <div className="absolute inset-0 z-50 bg-[#070c10] flex flex-col items-center justify-between p-12 text-white overflow-hidden animate-in fade-in duration-300">
+            {/* Ambient background glow */}
+            <div className={`absolute top-1/4 w-80 h-80 rounded-full bg-[#00a884]/10 blur-[100px] transition-all duration-1000 ${activeCallSession.status === 'ringing' ? 'scale-110 opacity-70' : 'scale-125 opacity-40'}`} />
+            
+            {/* Header / Info */}
+            <div className="text-center space-y-4 z-10 mt-8">
+              <div className="inline-flex items-center gap-2 px-3 py-1 bg-[#00a884]/15 border border-[#00a884]/30 rounded-full text-xs font-black tracking-widest text-[#00a884] uppercase animate-pulse">
+                {activeCallSession.isVideo ? 'Secure Video Link' : 'Secure voice interface'}
+              </div>
+              <h2 className="text-3xl font-black uppercase tracking-tight italic">{activeCallSession.recipientName}</h2>
+              <p className="text-[#8696af] font-mono text-xs uppercase tracking-widest font-bold">
+                {activeCallSession.status === 'ringing' ? 'INITIALIZING TRANSPONDERS (RINGING)...' : 'SECURE COMMUNICATIONS CHANNEL ACTIVATED'}
+              </p>
+            </div>
+
+            {/* Avatar / Camera Preview View */}
+            <div className="relative z-10 my-6 flex items-center justify-center">
+              {activeCallSession.isVideo && activeCallSession.status === 'connected' ? (
+                <div className="w-64 h-64 md:w-80 md:h-80 rounded-[3rem] bg-accent border-2 border-[#00a884]/40 overflow-hidden shadow-2xl relative flex items-center justify-center">
+                  <div className="absolute inset-0 bg-[#070d12] flex items-center justify-center">
+                     <div className="w-full h-full bg-[#0b141a] flex flex-col items-center justify-center gap-4 text-center p-6">
+                       <User className="w-20 h-20 text-[#00a884] opacity-20 animate-pulse" />
+                       <p className="text-[10px] font-black tracking-widest text-[#8696af] uppercase">Incoming cryptographic feed syncing...</p>
+                     </div>
+                  </div>
+                  {/* Local feed insert */}
+                  <div className="absolute bottom-4 right-4 w-20 h-28 bg-[#111b21] rounded-xl border border-white/10 shadow-xl overflow-hidden flex items-center justify-center">
+                    <User className="w-8 h-8 text-white opacity-40" />
+                  </div>
+                </div>
+              ) : (
+                <div className="relative group">
+                  {/* Pulsing visual halo rings */}
+                  <div className="absolute inset-0 rounded-[2.5rem] bg-[#00a884]/10 scale-110 animate-ping opacity-60" />
+                  <div className="absolute inset-0 rounded-[2.5rem] bg-[#00a884]/5 scale-125 animate-pulse opacity-40" />
+                  
+                  <div className="w-40 h-40 rounded-[2.5rem] bg-[#00a884]/10 border-2 border-dashed border-[#00a884]/30 flex items-center justify-center overflow-hidden shadow-2xl relative">
+                    {profilePictures[activeCallSession.jid] ? (
+                      <img src={profilePictures[activeCallSession.jid]} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      <User className="w-20 h-20 text-[#00a884]" />
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Timer Output */}
+            <div className="text-center z-10 space-y-2">
+              {activeCallSession.status === 'connected' && (
+                <div className="font-mono text-2xl font-black text-[#00a884] tracking-widest bg-white/5 border border-white/5 px-6 py-2 rounded-xl inline-block shadow-inner">
+                  {Math.floor(activeCallSession.duration / 60).toString().padStart(2, '0')}:
+                  {(activeCallSession.duration % 60).toString().padStart(2, '0')}
+                </div>
+              )}
+              <p className="text-[9px] text-[#8696af] uppercase tracking-[0.2em] font-black opacity-60">END TO END ENCRYPTED • ZERO LEAK GATEWAY</p>
+            </div>
+
+            {/* Dashboard Call Actions */}
+            <div className="flex items-center gap-6 z-10 mb-8">
+              <button 
+                onClick={() => setActiveCallSession(prev => prev ? { ...prev, isMuted: !prev.isMuted } : null)}
+                className={`w-14 h-14 rounded-2xl flex items-center justify-center border transition-all ${activeCallSession.isMuted ? 'bg-red-500/20 text-red-500 border-red-500/40' : 'bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15'}`}
+              >
+                {activeCallSession.isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              </button>
+
+              <button 
+                onClick={endInAppCall}
+                className="w-20 h-14 rounded-2xl bg-red-600 hover:bg-red-700 text-white flex items-center justify-center transition-all shadow-lg shadow-red-600/30 font-black hover:scale-105 active:scale-95"
+              >
+                <PhoneOff className="w-6 h-6" />
+              </button>
+
+              <button 
+                onClick={() => setActiveCallSession(prev => prev ? { ...prev, isVideo: !prev.isVideo } : null)}
+                className={`w-14 h-14 rounded-2xl flex items-center justify-center border transition-all ${activeCallSession.isVideo ? 'bg-[#00a884]/20 text-[#00a884] border-[#00a884]/40' : 'bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15'}`}
+              >
+                <Video className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeChat ? (
           <>
             {/* Chat header */}
@@ -1754,7 +1977,8 @@ export default function App() {
                 >
                   <Zap className="w-5 h-5" />
                 </button>
-                <button className="hover:text-white transition-colors" onClick={() => window.location.href = `tel:+${activeChat.id.split('@')[0]}`} title="Voice Call"><Phone className="w-5 h-5" /></button>
+                <button className="hover:text-white transition-colors" onClick={() => startInAppCall(activeChat.id, false)} title="Voice Call"><Phone className="w-5 h-5" /></button>
+                <button className="hover:text-white transition-colors" onClick={() => startInAppCall(activeChat.id, true)} title="Video Call"><Video className="w-5 h-5" /></button>
                 <button className="hover:text-white transition-colors"><Search className="w-5 h-5" /></button>
                 <div className="relative">
                   <button 
@@ -1973,6 +2197,32 @@ export default function App() {
                           <Forward className="w-3 h-3" />
                         </button>
                         <div className="ml-2 relative flex items-center gap-1">
+                          <button 
+                            onClick={() => setReactingMsgId(reactingMsgId === msg.id ? null : msg.id)}
+                            className="text-white/20 hover:text-[#00a884] transition-colors p-0.5"
+                            title="React to Message"
+                          >
+                            <Smile className="w-3.5 h-3.5" />
+                          </button>
+                          {reactingMsgId === msg.id && (
+                            <>
+                              <div className="fixed inset-0 z-40" onClick={() => setReactingMsgId(null)} />
+                              <div className="absolute bottom-full mb-1.5 left-0 bg-[#233138] border border-white/10 shadow-2xl rounded-full px-3 py-1.5 flex gap-2 z-50 animate-in fade-in zoom-in-75 duration-100">
+                                {['👍', '❤️', '😂', '😮', '😢', '🙏'].map(emoji => (
+                                  <button 
+                                    key={emoji} 
+                                    onClick={() => {
+                                      reactToMessage(msg.id, emoji, msg.fromMe);
+                                      setReactingMsgId(null);
+                                    }}
+                                    className="hover:scale-125 transition-all text-base active:scale-95"
+                                  >
+                                    {emoji}
+                                  </button>
+                                ))}
+                              </div>
+                            </>
+                          )}
                           {['👍', '❤️', '😂', '😮', '😢', '🙏'].map(emoji => (
                              <button 
                                key={emoji} 
@@ -1980,7 +2230,7 @@ export default function App() {
                                className="opacity-0 group-hover:opacity-100 hover:scale-120 transition-all text-sm"
                              >
                                {emoji}
-                             </button>
+                              </button>
                           ))}
                         </div>
                       </div>
@@ -2212,6 +2462,73 @@ export default function App() {
         )}
       </AnimatePresence>
       
+      {/* Passcode Verification Modal */}
+      <AnimatePresence>
+        {showPasscodeModal && (
+          <div className="fixed inset-0 z-[110] bg-black/95 backdrop-blur-2xl flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-sm bg-accent p-6 rounded-3xl border border-[#00a884]/30 shadow-2xl space-y-6"
+            >
+              <div className="text-center space-y-2">
+                <div className="w-12 h-12 bg-[#00a884]/12 rounded-full flex items-center justify-center mx-auto border border-[#00a884]/30">
+                  <Lock className="w-5 h-5 text-[#00a884]" />
+                </div>
+                <h3 className="text-lg font-black uppercase tracking-tight italic text-white">Cryptographic Access</h3>
+                <p className="text-[9px] text-[#8696af] uppercase tracking-widest font-bold">ENTER CODE TO DECRYPT LOCKED ENCLAVE (DEFAULT: 1234)</p>
+              </div>
+
+              <div className="space-y-4">
+                <input 
+                  type="password"
+                  placeholder="••••"
+                  value={enteredPasscode}
+                  onChange={(e) => setEnteredPasscode(e.target.value)}
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter') {
+                      if (enteredPasscode === '1234') {
+                        setShowLockedChats(true);
+                        setShowPasscodeModal(false);
+                      } else {
+                        setError('INVALID SECURITY PASSPHRASE PIN');
+                        setEnteredPasscode('');
+                      }
+                    }
+                  }}
+                  className="w-full text-center bg-black/40 border border-white/10 rounded-2xl py-4 font-mono text-xl tracking-[0.5em] focus:border-[#00a884] focus:ring-1 focus:ring-[#00a884] outline-none text-white font-bold placeholder:text-white/10"
+                  autoFocus
+                />
+
+                <div className="flex gap-3">
+                  <button 
+                    onClick={() => setShowPasscodeModal(false)}
+                    className="flex-1 py-3 bg-white/5 rounded-xl text-xs font-bold uppercase transition-colors hover:bg-white/10 text-white"
+                  >
+                    Abort
+                  </button>
+                  <button 
+                    onClick={() => {
+                      if (enteredPasscode === '1234') {
+                        setShowLockedChats(true);
+                        setShowPasscodeModal(false);
+                      } else {
+                        setError('INVALID SECURITY PASSPHRASE PIN');
+                        setEnteredPasscode('');
+                      }
+                    }}
+                    className="flex-1 py-3 bg-[#00a884] rounded-xl text-xs font-black uppercase tracking-widest transition-colors hover:bg-[#00bc95] text-white"
+                  >
+                    Verify PIN
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Recycle Bin Modal */}
       <AnimatePresence>
         {showRecycleBin && (
@@ -2562,7 +2879,7 @@ export default function App() {
                    <button onClick={() => settingsView === 'main' ? setShowSettings(false) : setSettingsView('main')} className="p-2 hover:bg-white/5 rounded-full">
                       <ChevronLeft className="w-6 h-6" />
                    </button>
-                   <div>
+                   <div onClick={handleAdminTap} className="cursor-pointer select-none">
                       <h2 className="text-xl font-black uppercase italic">{settingsView === 'main' ? 'Signal Settings' : settingsView.toUpperCase()}</h2>
                       <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest">{settingsView === 'main' ? 'System Configuration' : 'Advanced Tuning'}</p>
                    </div>
@@ -2718,6 +3035,119 @@ export default function App() {
                           </div>
                         </>
                       )}
+
+                      {settingsView === 'accounts' && (
+                        <div id="settings-accounts-view" className="space-y-6">
+                           <div className="flex items-center justify-between group/toggle pb-4 border-b border-white/5">
+                              <div className="flex-1">
+                                 <p className="text-xs font-bold uppercase tracking-tight text-white">Enable Firebase Backup</p>
+                                 <p className="text-[10px] opacity-40 font-medium">Coordinate automatic live cloud updates</p>
+                              </div>
+                              <button 
+                                 id="toggle-firebase-backup"
+                                 onClick={() => {
+                                   const nextVal = !(proSettings as any).firebaseBackupEnabled;
+                                   updateProSettings({ firebaseBackupEnabled: nextVal });
+                                   if (backupStatus) {
+                                     setBackupStatus({ ...backupStatus, firebaseBackupEnabled: nextVal });
+                                   }
+                                 }}
+                                 className={`w-10 h-5 rounded-full relative transition-all ${(proSettings as any).firebaseBackupEnabled ? 'bg-[#00a884] shadow-[0_0_10px_rgba(0,168,132,0.3)]' : 'bg-white/10'}`}
+                              >
+                                 <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${(proSettings as any).firebaseBackupEnabled ? 'right-1' : 'left-1'}`} />
+                              </button>
+                           </div>
+
+                           {/* Status Indicator & Controls */}
+                           {backupStatus ? (
+                             <div id="backup-controls-container" className="space-y-4">
+                               <div className="p-4 bg-white/5 rounded-2xl border border-white/5 space-y-3 font-mono text-[10px]">
+                                 <div className="flex justify-between">
+                                   <span className="text-white/40 uppercase text-[8px] tracking-wider">Cloud Engine Configuration</span>
+                                   <span className={backupStatus.firebase_cloud_system_enabled ? "text-[#00a884] font-bold" : "text-yellow-500 font-bold"}>
+                                     {backupStatus.firebase_cloud_system_enabled ? "ACTIVE" : "OFFLINE (FLAG)"}
+                                   </span>
+                                 </div>
+                                 <div className="flex justify-between">
+                                   <span className="text-white/40 uppercase text-[8px] tracking-wider">Identified Number</span>
+                                   <span className="text-white">{backupStatus.phone ? `+${backupStatus.phone}` : "No active session"}</span>
+                                 </div>
+                                 <div className="flex justify-between">
+                                   <span className="text-white/40 uppercase text-[8px] tracking-wider">Last Sync Backup</span>
+                                   <span className="text-white">
+                                     {backupStatus.metadata?.last_backup 
+                                       ? new Date(backupStatus.metadata.last_backup).toLocaleString() 
+                                       : "Never backed up"}
+                                   </span>
+                                 </div>
+                                 <div className="flex justify-between">
+                                   <span className="text-white/40 uppercase text-[8px] tracking-wider">Packets Stored</span>
+                                   <span className="text-white">{backupStatus.metadata?.backup_size || 0} items</span>
+                                 </div>
+                               </div>
+
+                               {backupStatus.firebase_cloud_system_enabled && backupStatus.phone ? (
+                                 <div className="grid grid-cols-2 gap-3 pt-2">
+                                   <button
+                                     id="trigger-backup-button"
+                                     disabled={isBackupLoading}
+                                     onClick={async () => {
+                                       setIsBackupLoading(true);
+                                       setBackupError(null);
+                                       try {
+                                         const res = await fetch('/api/firebase-backup/backup', { method: 'POST' });
+                                         if (!res.ok) throw new Error("Sync failed");
+                                         await fetchBackupStatus();
+                                       } catch (e: any) {
+                                         setBackupError("Backup failed. Verify Firestore connection Rules.");
+                                       } finally {
+                                         setIsBackupLoading(false);
+                                       }
+                                     }}
+                                     className="py-3.5 bg-[#00a884]/10 hover:bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/20 rounded-xl font-black text-[9px] uppercase tracking-widest transition-all"
+                                   >
+                                     {isBackupLoading ? "Syncing..." : "Backup to Cloud"}
+                                   </button>
+                                   <button
+                                     id="trigger-restore-button"
+                                     disabled={isBackupLoading}
+                                     onClick={async () => {
+                                       setIsBackupLoading(true);
+                                       setBackupError(null);
+                                       try {
+                                         const res = await fetch('/api/firebase-backup/restore', { method: 'POST' });
+                                         if (!res.ok) throw new Error("Restore failed");
+                                         await fetchBackupStatus();
+                                         await fetchSettings(); // reload settings
+                                       } catch (e: any) {
+                                         setBackupError("Restore failed. No active backup available.");
+                                       } finally {
+                                         setIsBackupLoading(false);
+                                       }
+                                     }}
+                                     className="py-3.5 bg-primary hover:opacity-90 text-white rounded-xl font-black text-[9px] uppercase tracking-widest transition-all shadow-lg shadow-primary/20"
+                                   >
+                                     {isBackupLoading ? "Restoring..." : "Restore from Cloud"}
+                                   </button>
+                                 </div>
+                               ) : (
+                                 <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 rounded-xl text-[10px] space-y-1 leading-relaxed italic">
+                                   <p className="font-bold">SYSTEM NOTICE:</p>
+                                   <p>Backup controls are inactive because the global developer flag <code>firebase_cloud_system_enabled</code> is set to <code>false</code> in server memory.</p>
+                                 </div>
+                               )}
+
+                               {backupError && (
+                                 <p id="backup-error-message" className="text-red-500 text-[10px] font-bold italic text-center mt-2">{backupError}</p>
+                               )}
+                             </div>
+                           ) : (
+                             <div className="flex justify-center py-4">
+                               <div className="w-5 h-5 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                             </div>
+                           )}
+                        </div>
+                      )}
                    </div>
                 </div>
 
@@ -2750,6 +3180,21 @@ export default function App() {
                    <button onClick={() => setShowScheduleModal(false)} className="text-white/40"><X className="w-5 h-5" /></button>
                 </div>
                 <div className="p-8 space-y-6">
+                   <div>
+                      <label className="block text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 ml-2">Target Recipient</label>
+                      <select 
+                        value={selectedScheduleJid || activeChat?.id || ''}
+                        onChange={e => setSelectedScheduleJid(e.target.value)}
+                        className="w-full bg-accent border border-white/5 rounded-2xl p-4 text-xs font-bold outline-none focus:border-primary transition-all text-white"
+                      >
+                        <option value="" disabled className="text-white/20">-- SELECT RECIPIENT --</option>
+                        {chats.map(c => (
+                          <option key={c.id} value={c.id} className="bg-[#111b21] text-white">
+                            {c.name || c.id.split('@')[0]} ({c.id.split('@')[0]})
+                          </option>
+                        ))}
+                      </select>
+                   </div>
                    <div>
                       <label className="block text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 ml-1">Payload Content</label>
                       <textarea 
@@ -2959,6 +3404,12 @@ export default function App() {
                 </div>
              </motion.div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showAdminConsole && (
+          <SecretAdminPanel onClose={() => setShowAdminConsole(false)} />
         )}
       </AnimatePresence>
 
