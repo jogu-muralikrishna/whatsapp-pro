@@ -139,6 +139,73 @@ export default function App() {
   const attachmentButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const emojiButtonRef = useRef<HTMLButtonElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setSelectedUploadFile(file);
+    
+    if (file.type.startsWith('image/')) {
+      setUploadFileType('image');
+    } else if (file.type.startsWith('video/')) {
+      setUploadFileType('video');
+    } else if (file.type.startsWith('audio/')) {
+      setUploadFileType('audio');
+    } else {
+      setUploadFileType('document');
+    }
+    
+    setShowUploadPreview(true);
+    setShowAttachmentMenu(false);
+  };
+
+  const triggerFileSelection = (type: 'image' | 'video' | 'audio' | 'document') => {
+    setUploadFileType(type);
+    if (fileInputRef.current) {
+      if (type === 'image') {
+        fileInputRef.current.accept = 'image/*';
+      } else if (type === 'video') {
+        fileInputRef.current.accept = 'video/*';
+      } else if (type === 'audio') {
+        fileInputRef.current.accept = 'audio/*';
+      } else {
+        fileInputRef.current.removeAttribute('accept');
+      }
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleUploadAndSend = async () => {
+    if (!selectedUploadFile || !activeChat) return;
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('file', selectedUploadFile);
+    formData.append('jid', activeChat.id);
+    formData.append('caption', uploadCaption);
+    formData.append('type', uploadFileType);
+
+    try {
+      const res = await fetch('/api/send-media', {
+        method: 'POST',
+        body: formData
+      });
+      if (res.ok) {
+        setSelectedUploadFile(null);
+        setUploadCaption('');
+        setShowUploadPreview(false);
+      } else {
+        const errData = await res.json();
+        setError(errData.error || 'Failed to transfer core media packet');
+      }
+    } catch (err: any) {
+      setError('Connection to node lost: failed to send file');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+  
   // Tactical Cloud Backup & Administration gesture state hooks
   const [adminTapCount, setAdminTapCount] = useState(0);
   const [showAdminConsole, setShowAdminConsole] = useState(false);
@@ -1951,6 +2018,120 @@ export default function App() {
 
         {activeChat ? (
           <>
+            <AnimatePresence>
+              {showUploadPreview && selectedUploadFile && (
+                 <motion.div 
+                   initial={{ opacity: 0, scale: 0.95 }}
+                   animate={{ opacity: 1, scale: 1 }}
+                   exit={{ opacity: 0, scale: 0.95 }}
+                   className="absolute inset-0 bg-[#0c1317]/98 backdrop-blur-md z-30 flex flex-col justify-between p-6 md:p-12"
+                 >
+                    {/* Header */}
+                    <div className="flex items-center justify-between pb-6 border-b border-white/5">
+                       <div>
+                          <h3 className="text-lg font-black uppercase tracking-widest italic text-white flex items-center gap-2">
+                            <span>PREPARE SONIC PAYLOAD</span>
+                            <span className="px-2 py-0.5 bg-[#00a884]/20 border border-[#00a884]/30 rounded text-[9px] font-mono text-[#00a884] non-italic">READY</span>
+                          </h3>
+                          <p className="text-[10px] text-white/40 uppercase tracking-wider font-bold mt-1">Verify file integrity and optional caption header</p>
+                       </div>
+                       <button 
+                         onClick={() => {
+                            setSelectedUploadFile(null);
+                            setShowUploadPreview(false);
+                            setUploadCaption('');
+                         }}
+                         className="p-2.5 hover:bg-white/5 rounded-full text-white/60 hover:text-white transition-all border border-white/5 hover:border-white/10"
+                       >
+                          <X className="w-5 h-5" />
+                       </button>
+                    </div>
+
+                    {/* File Visual Representation */}
+                    <div className="flex-1 flex flex-col items-center justify-center p-8">
+                       <div className="max-w-md w-full bg-white/[0.02] border border-white/5 rounded-3xl p-6 flex flex-col items-center text-center shadow-2xl relative overflow-hidden">
+                          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#00a884]/45 to-transparent animate-pulse" />
+                          
+                          {uploadFileType === 'image' ? (
+                            <div className="w-full max-h-[250px] mb-4 overflow-hidden rounded-xl border border-white/5 bg-black/20 flex items-center justify-center">
+                               <img 
+                                 src={URL.createObjectURL(selectedUploadFile)} 
+                                 alt="Upload preview" 
+                                 className="max-w-full max-h-[250px] object-contain rounded-xl"
+                               />
+                            </div>
+                          ) : uploadFileType === 'video' ? (
+                            <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
+                               <Video className="w-8 h-8 text-[#00a884]" />
+                            </div>
+                          ) : uploadFileType === 'audio' ? (
+                            <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
+                               <Music className="w-8 h-8 text-[#00a884]" />
+                            </div>
+                          ) : (
+                            <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
+                               <FileText className="w-8 h-8 text-[#00a884]" />
+                            </div>
+                          )}
+
+                          <p className="text-sm font-black text-white truncate max-w-full italic px-2">
+                             {selectedUploadFile.name}
+                          </p>
+                          <p className="text-[10px] uppercase font-mono text-[#00a884] font-black tracking-widest mt-1">
+                             {uploadFileType} • {(selectedUploadFile.size / 1024 / 1024).toFixed(2)} MB
+                          </p>
+                       </div>
+                    </div>
+
+                    {/* Caption & Send Actions footer */}
+                    <div className="space-y-4 pt-6 border-t border-white/5">
+                       <div className="bg-[#2a3942] rounded-2xl flex items-center px-5 py-2 border border-white/10 max-w-3xl mx-auto w-full">
+                          <input 
+                            type="text"
+                            placeholder="ADD A CAPTION FOR THIS PAYLOAD..."
+                            value={uploadCaption}
+                            onChange={e => setUploadCaption(e.target.value)}
+                            onKeyPress={e => e.key === 'Enter' && !isUploading && handleUploadAndSend()}
+                            className="bg-transparent border-none outline-none text-sm text-white px-2 py-3.5 w-full placeholder:text-white/20 font-bold tracking-tight"
+                            disabled={isUploading}
+                          />
+                       </div>
+
+                       <div className="flex justify-end gap-3 max-w-3xl mx-auto w-full">
+                          <button 
+                            onClick={() => {
+                               setSelectedUploadFile(null);
+                               setUploadCaption('');
+                               setShowUploadPreview(false);
+                            }}
+                            disabled={isUploading}
+                            className="px-6 py-3.5 bg-white/5 hover:bg-white/10 rounded-2xl text-[10px] font-black uppercase tracking-widest text-[#aebac1] hover:text-white transition-all disabled:opacity-50"
+                          >
+                             Discard
+                          </button>
+                          <button 
+                            onClick={handleUploadAndSend}
+                            disabled={isUploading}
+                            className="px-8 py-3.5 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 shadow-xl shadow-[#00a884]/20 disabled:scale-95 disabled:opacity-50"
+                          >
+                             {isUploading ? (
+                               <>
+                                 <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                                 <span>Sending...</span>
+                               </>
+                             ) : (
+                               <>
+                                 <Send className="w-3.5 h-3.5 text-white" />
+                                 <span>Transmit File</span>
+                               </>
+                             )}
+                          </button>
+                       </div>
+                    </div>
+                 </motion.div>
+              )}
+            </AnimatePresence>
+
             {/* Chat header */}
             <div className="bg-accent p-3 flex items-center justify-between z-10 shadow-lg">
               <div className="flex items-center gap-3">
@@ -2295,7 +2476,115 @@ export default function App() {
 
             {/* Input area */}
             <div className="bg-[#202c33] p-4 flex items-center gap-4 z-10 shadow-[0_-10px_20px_rgba(0,0,0,0.2)]">
-              <button className="text-[#aebac1] hover:text-[#00a884] transition-colors"><Plus className="w-6 h-6" /></button>
+              {/* Hidden File Input */}
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                onChange={handleFileChange} 
+                className="hidden" 
+              />
+
+              {/* Attachment Button & Menu */}
+              <div className="relative">
+                <button 
+                  ref={attachmentButtonRef}
+                  onClick={() => setShowAttachmentMenu(!showAttachmentMenu)}
+                  className={`p-2 rounded-full transition-all flex items-center justify-center ${showAttachmentMenu ? 'bg-[#00a884] text-white rotate-45' : 'text-[#aebac1] hover:text-[#00a884]'}`}
+                  title="Attach Payload"
+                >
+                  <Plus className="w-6 h-6 transition-transform duration-200" />
+                </button>
+                <AnimatePresence>
+                  {showAttachmentMenu && (
+                    <>
+                      {/* Click-out overlay */}
+                      <div className="fixed inset-0 z-30" onClick={() => setShowAttachmentMenu(false)} />
+                      <motion.div 
+                        initial={{ opacity: 0, y: 15, scale: 0.9 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 15, scale: 0.9 }}
+                        className="absolute bottom-full left-0 mb-4 bg-[#233138] border border-white/10 rounded-2xl shadow-2xl p-2 flex flex-col gap-1.5 z-40 min-w-[150px]"
+                      >
+                        <button 
+                          onClick={() => triggerFileSelection('image')}
+                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
+                        >
+                          <ImageIcon className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
+                          <span className="text-[11px] font-black uppercase tracking-wider">Image</span>
+                        </button>
+                        <button 
+                          onClick={() => triggerFileSelection('video')}
+                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
+                        >
+                          <Video className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
+                          <span className="text-[11px] font-black uppercase tracking-wider">Video</span>
+                        </button>
+                        <button 
+                          onClick={() => triggerFileSelection('audio')}
+                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
+                        >
+                          <Music className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
+                          <span className="text-[11px] font-black uppercase tracking-wider">Audio</span>
+                        </button>
+                        <button 
+                          onClick={() => triggerFileSelection('document')}
+                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
+                        >
+                          <FileText className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
+                          <span className="text-[11px] font-black uppercase tracking-wider">Document</span>
+                        </button>
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Emoji Picker Button & Menu */}
+              <div className="relative flex items-center">
+                <button 
+                  ref={emojiButtonRef}
+                  onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                  className={`p-2 rounded-full transition-colors flex items-center justify-center ${showEmojiPicker ? 'text-[#00a884] bg-white/5' : 'text-[#aebac1] hover:text-[#00a884]'}`}
+                  title="Emoji Menu"
+                >
+                  <Smile className="w-6 h-6" />
+                </button>
+                <AnimatePresence>
+                  {showEmojiPicker && (
+                    <>
+                      {/* Click-out overlay */}
+                      <div className="fixed inset-0 z-30" onClick={() => setShowEmojiPicker(false)} />
+                      <motion.div 
+                        initial={{ opacity: 0, y: 15, scale: 0.9 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 15, scale: 0.9 }}
+                        className="absolute bottom-full left-0 mb-4 bg-[#233138] border border-white/10 rounded-2xl shadow-2xl p-4 z-40 w-[280px] sm:w-[320px] max-h-[250px] overflow-y-auto custom-scrollbar"
+                      >
+                        <div className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-3 flex items-center justify-between pb-2 border-b border-white/5">
+                           <span>SYSTEM MATRIX EMOJIS</span>
+                           <span className="text-[#00a884]">SELECT</span>
+                        </div>
+                        <div className="grid grid-cols-7 gap-2.5">
+                          {[
+                            '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇', '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚', '😋', '😛', '😝', '😜', '🤪', '🤨', '🧐', '🤓', '😎', '🥸', '🤩', '🥳', '😏', '😒', '😞', '😔', '😟', '😕', '🙁', '☹️', '😣', '😖', '😫', '😩', '🥺', '😢', '😭', '😤', '😠', '😡', '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰', '😥', '😓', '🤗', '🤔', '🫣', '🤭', '🫢', '🤫', '🫠', '✍️', '👍', '👎', '👊', '✊', '🤛', '🤜', '🤞', '✌️', '🤟', '🤘', '👌', '🤌', '🤏', '👈', '👉', '👆', '👇', '☝️', '✋', '🤚', '🖐', '🖖', '👋', '🤙', '💪', '🦾', '🖕', '🙏', '🤝', '💅', '🤳', '👏', '🙌', '👐', '🫱', '🫲', '🫳', '🫴', '🫵', '🫶'
+                          ].map(emoji => (
+                            <button 
+                              key={emoji}
+                              onClick={() => {
+                                setNewMessage(prev => prev + emoji);
+                              }}
+                              className="text-lg hover:bg-white/10 p-1.5 rounded-lg transition-colors flex items-center justify-center scale-95 hover:scale-110 active:scale-90"
+                            >
+                              {emoji}
+                            </button>
+                          ))}
+                        </div>
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+
               <div className="flex-1 bg-[#2a3942] rounded-xl flex items-center px-4 py-1.5 border border-white/[0.02]">
                 <input 
                   type="text" 
