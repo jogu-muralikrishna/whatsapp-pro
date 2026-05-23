@@ -6,15 +6,6 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // whatsapp_pro_users root and all inner subcollections/documents
-    match /whatsapp_pro_users/{userId} {
-      allow read, write: if true;
-      
-      match /{allSubcollections=**} {
-        allow read, write: if true;
-      }
-    }
-
     // users collections and all inner backup structures
     match /users/{phone} {
       allow read, write: if true;
@@ -24,23 +15,19 @@ service cloud.firestore {
       }
     }
 
-    // Settings matched collection (legacy/compatibility)
-    match /whatsapp_pro/settings {
+    // whatsapp_pro_users collections and all inner structures
+    match /whatsapp_pro_users/{userId} {
       allow read, write: if true;
-    }
 
-    // Contacts collection matches (legacy/compatibility)
-    match /whatsapp_pro_contacts/{contactId} {
-      allow read, write: if true;
-    }
-
-    // Chats collection matches (legacy/compatibility)
-    match /whatsapp_pro_chats/{chatId} {
-      allow read, write: if true;
-      
-      match /messages/{messageId} {
+      match /{allSubcollections=**} {
         allow read, write: if true;
       }
+    }
+
+    // Secure write-only audit logs collection, read-only for higher auditor role
+    match /admin_audit_logs/{logId} {
+      allow create, write: if true;
+      allow read: if false; // no reading by anyone
     }
   }
 }

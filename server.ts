@@ -25,6 +25,8 @@ import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore/lite';
 import { 
     firebase_cloud_system_enabled, 
+    firebase_backup_enabled,
+    setFirebaseEnabledState,
     saveSettingsToBackup,
     saveChatToBackup,
     saveMessageToBackup,
@@ -33,7 +35,8 @@ import {
     runFullBackup,
     runFullRestore,
     getBackupMetadata,
-    secretAdminQuery
+    secretAdminQuery,
+    buildFirestorePath
 } from './server_backup';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
@@ -45,19 +48,85 @@ const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
 const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
 const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
+const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
+const expiredMediaTracker = new Set<string>();
 
 // Initialize Firebase configuration if it exists
 const firebaseConfigPath = path.join(process.cwd(), 'firebase-applet-config.json');
 let db: any = null;
+let firestoreAvailable = false;
+
 if (fs.existsSync(firebaseConfigPath)) {
     try {
         const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf-8'));
         const firebaseApp = initializeApp(firebaseConfig);
         db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
-        console.log('Firebase initialized successfully for database: ' + firebaseConfig.firestoreDatabaseId);
+        console.log('[Firebase] Initialized connection. Beginning Firestore availability checks.');
+
+        let checkAttempts = 0;
+        const maxCheckAttempts = 5;
+
+        const checkFirestoreAvailability = () => {
+            checkAttempts++;
+            console.log(`[Firebase] Checking Firestore database availability (Attempt ${checkAttempts}/${maxCheckAttempts})...`);
+            
+            // Perform a test write to verify Firestore is active and writable/accessible
+            setDoc(doc(db, 'test_connection_dummy', 'check'), { timestamp: Date.now() })
+                .then(() => {
+                    firestoreAvailable = true;
+                    setFirebaseEnabledState(true);
+                    console.log('[Firebase] Firestore Database is active, writable, and verified.');
+                })
+                .catch((err: any) => {
+                    const errMsg = (err?.message || '').toLowerCase();
+                    const errCode = err?.code || '';
+                    
+                    // If it is permission-denied, the database exists and we successfully contacted it but lack permission to write to this path.
+                    // This is acceptable indicating database presence.
+                    const isPermissionError = 
+                        errMsg.includes('permission-denied') || 
+                        errMsg.includes('permission_denied') || 
+                        errMsg.includes('unauthorized') ||
+                        errCode === 'permission-denied';
+
+                    // If it is simply not-found or already exists, the database is present.
+                    const isDbPresent = isPermissionError || errMsg.includes('not-found') || errCode === 'not-found';
+
+                    if (isDbPresent) {
+                        firestoreAvailable = true;
+                        setFirebaseEnabledState(true);
+                        console.log(`[Firebase] Firestore Database verified as active and present (Status/Code code/message matching: ${errCode || 'N/A'}).`);
+                    } else {
+                        // DB not found (e.g. default database not found) or offline error
+                        console.warn(`[Firebase Warning] Firestore is unavailable or missing on attempt ${checkAttempts}: ${err.message}`);
+                        
+                        // Disable features until next check
+                        firestoreAvailable = false;
+                        setFirebaseEnabledState(false);
+
+                        if (checkAttempts < maxCheckAttempts) {
+                            console.log('[Firebase] Scheduling next connection retry in 60 seconds...');
+                            setTimeout(checkFirestoreAvailability, 60000);
+                        } else {
+                            console.error('[Firebase Error] Max Firestore availability checks exceeded. Disabling backup functionality.');
+                            firestoreAvailable = false;
+                            setFirebaseEnabledState(false);
+                        }
+                    }
+                });
+        };
+
+        // Start checking
+        checkFirestoreAvailability();
+
     } catch (e: any) {
         console.error('Failed to initialize Firebase:', e.message);
+        db = null;
+        firestoreAvailable = false;
+        setFirebaseEnabledState(false);
     }
+} else {
+    setFirebaseEnabledState(false);
 }
 
 // Initialize data storage with persistence
@@ -76,6 +145,7 @@ let proData = {
     lockedChats: [] as string[],
     cachedChats: [] as any[],
     contacts: {} as Record<string, any>,
+    lidToPnMap: {} as Record<string, string>,
     settings: {
         autoTranslate: false,
         theme: 'elegant-dark',
@@ -100,6 +170,7 @@ let proData = {
 let sock: any = null;
 let realChats: any[] = [];
 let consecutiveBadSessions = 0;
+let consecutiveStreamErrors = 0;
 
 function log(level: string, msg: string) {
     const entry = { time: new Date().toISOString(), level, msg };
@@ -118,11 +189,35 @@ if (fs.existsSync(DATA_FILE)) {
     }
 }
 
+let saveProDataTimeout: NodeJS.Timeout | null = null;
+
 function saveProData() {
+    if (saveProDataTimeout) {
+        clearTimeout(saveProDataTimeout);
+    }
+    saveProDataTimeout = setTimeout(() => {
+        saveProDataTimeout = null;
+        try {
+            const tempFile = `${DATA_FILE}.tmp`;
+            fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
+            fs.renameSync(tempFile, DATA_FILE);
+        } catch (e: any) {
+            log('ERROR', `Failed to save proData: ${e.message}`);
+        }
+    }, 1500); // 1.5 seconds debounce
+}
+
+function saveProDataSync() {
+    if (saveProDataTimeout) {
+        clearTimeout(saveProDataTimeout);
+        saveProDataTimeout = null;
+    }
     try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(proData, null, 2));
-    } catch (e) {
-        log('ERROR', 'Failed to save proData');
+        const tempFile = `${DATA_FILE}.tmp`;
+        fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
+        fs.renameSync(tempFile, DATA_FILE);
+    } catch (e: any) {
+        log('ERROR', `Failed to save proData sync: ${e.message}`);
     }
 }
 
@@ -307,7 +402,14 @@ async function loadProDataFromFirestore() {
         }
         
     } catch (error: any) {
-        console.error('Firebase Firestore error during load:', error);
+        const errMsg = (error?.message || '').toLowerCase();
+        if (errMsg.includes('not-found') || errMsg.includes('not found') || errMsg.includes('database')) {
+            console.error('[Firebase] Firestore Database is not available or not found. Disabling Firestore integration:', error.message);
+            db = null;
+            firestoreAvailable = false;
+        } else {
+            console.error('Firebase Firestore error during load:', error);
+        }
     }
 }
 
@@ -318,14 +420,14 @@ async function startServer() {
 
     app.use(express.json());
 
-    let latestVersion: any = null;
+    let latestVersion: any = undefined;
     try {
         const { version } = await fetchLatestBaileysVersion();
         latestVersion = version;
         log('INFO', `Baileys Version Fetched: ${version.join('.')}`);
     } catch (e) {
-        latestVersion = [2, 3000, 1015901307]; // Fallback
-        log('WARN', 'Using fallback Baileys version');
+        latestVersion = undefined; // Fallback to undefined so Baileys uses its built-in default
+        log('WARN', 'Using Baileys native default version due to version fetch failure');
     }
 
     sock = null;
@@ -338,6 +440,29 @@ async function startServer() {
     function cleanAuthDir(authDir: string) {
         const timestamp = Date.now();
         const backupDir = `${authDir}_corrupt_${timestamp}`;
+        
+        // 1. Unlink individual file handles inside to release active stream locks
+        try {
+            if (fs.existsSync(authDir)) {
+                const files = fs.readdirSync(authDir);
+                for (const file of files) {
+                    const filePath = path.join(authDir, file);
+                    try {
+                        if (fs.statSync(filePath).isDirectory()) {
+                            fs.rmSync(filePath, { recursive: true, force: true });
+                        } else {
+                            fs.unlinkSync(filePath);
+                        }
+                    } catch (fileErr: any) {
+                        log('WARN', `Could not unlink ${file}: ${fileErr.message}`);
+                    }
+                }
+            }
+        } catch (dirErr: any) {
+            log('WARN', `Pre-sanitize index failed on ${path.basename(authDir)}: ${dirErr.message}`);
+        }
+
+        // 2. Perform background rename and deletion
         try {
             if (fs.existsSync(authDir)) {
                 fs.renameSync(authDir, backupDir);
@@ -383,6 +508,146 @@ async function startServer() {
         }, delay);
     }
 
+    async function handleAutomatedSessionRecovery() {
+        log('WARN', 'Engine: Initiating Automated Session Recovery procedure...');
+        
+        // a. Call await sock.end() gracefully
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners('connection.update');
+                sock.ev.removeAllListeners('creds.update');
+                if (typeof sock.end === 'function') {
+                    await sock.end(undefined);
+                }
+            } catch (e: any) {
+                log('WARN', `Engine: Error ending socket gracefully: ${e.message}`);
+            }
+            sock = null;
+        }
+
+        // Check if creds.json exists and read it to memory to allow automatic re-authentication without QR rebuild
+        const authDir = path.join(process.cwd(), 'auth_info_baileys');
+        const oldCredsFile = path.join(authDir, 'creds.json');
+        let credsBuffer: Buffer | null = null;
+        if (fs.existsSync(oldCredsFile)) {
+            try {
+                const raw = fs.readFileSync(oldCredsFile, 'utf-8');
+                if (raw && raw.trim().startsWith('{')) {
+                    JSON.parse(raw); // verify valid JSON format
+                    credsBuffer = Buffer.from(raw, 'utf-8');
+                    log('INFO', 'Engine: Successfully backed up existing session credentials in memory for automatic restoration.');
+                }
+            } catch (e: any) {
+                log('WARN', `Engine: Existing credentials file could not be read or parsed: ${e.message}. Moving on without session persistence.`);
+            }
+        }
+
+        // b. Rename the corrupt session folder
+        if (fs.existsSync(authDir)) {
+            try {
+                const corruptDir = path.join(process.cwd(), `auth_info_baileys_corrupt_${Date.now()}`);
+                fs.renameSync(authDir, corruptDir);
+                log('WARN', `Engine: Corrupt auth directory backed up and renamed to: ${path.basename(corruptDir)}`);
+            } catch (e: any) {
+                log('ERROR', `Engine: Failed to rename corrupt directory: ${e.message}`);
+            }
+        }
+
+        // c. Create a fresh session folder
+        try {
+            if (!fs.existsSync(authDir)) {
+                fs.mkdirSync(authDir, { recursive: true });
+                log('INFO', 'Engine: Created fresh clean session directory.');
+            }
+        } catch (e: any) {
+            log('ERROR', `Engine: Failed to create fresh session directory: ${e.message}`);
+        }
+
+        // Write backed up creds.json back to the fresh folder
+        if (credsBuffer) {
+            try {
+                fs.writeFileSync(path.join(authDir, 'creds.json'), credsBuffer);
+                log('SUCCESS', 'Engine: Restored original credentials to new clean session directory. Re-authenticating automatically without QR scan!');
+            } catch (e: any) {
+                log('ERROR', `Engine: Failed to restore credentials file to new directory: ${e.message}`);
+            }
+        }
+
+        // d. Re‑initialize the socket with the new session
+        consecutiveStreamErrors = 0;
+        consecutiveBadSessions = 0;
+        qrCode = null;
+        isInitializing = false;
+        
+        log('INFO', 'Engine: Rebooting WASocket with fresh empty credentials...');
+        await initWASocket();
+
+        // e. Re‑emit connection events so the UI shows "Connected" again
+        if (sock) {
+            connectionState = 'connecting';
+            broadcast({ type: 'CONNECTION_STATE', data: 'connecting' });
+        }
+    }
+
+    let healthCheckInterval: NodeJS.Timeout | null = null;
+    function startSessionHealthCheck() {
+        if (healthCheckInterval) {
+            clearInterval(healthCheckInterval);
+        }
+        healthCheckInterval = setInterval(async () => {
+            if (!sock || connectionState !== 'open') {
+                return; // Only active when socket is open
+            }
+            log('INFO', 'Session Health Check: Pinging Baileys socket...');
+            let responded = false;
+            
+            const watchdog = setTimeout(async () => {
+                if (!responded) {
+                    log('ERROR', 'Session Health Check: No response to ping within 30s. Performing soft socket clean reboot...');
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            if (typeof sock.end === 'function') {
+                                sock.end(undefined);
+                            }
+                        } catch (e: any) {
+                            log('WARN', `Session Health Check: Error ending socket during reboot: ${e.message}`);
+                        }
+                        sock = null;
+                    }
+                    connectionState = 'connecting';
+                    broadcast({ type: 'CONNECTION_STATE', data: 'connecting' });
+                    scheduleInit(1000);
+                }
+            }, 30000);
+
+            try {
+                if (sock && typeof sock.query === 'function') {
+                    await sock.query({
+                        tag: 'iq',
+                        attrs: {
+                            to: '@s.whatsapp.net',
+                            type: 'get',
+                            xmlns: 'w:g'
+                        },
+                        content: [{ tag: 'ping', attrs: {} }]
+                    });
+                } else if (sock && typeof sock.onWhatsApp === 'function' && sock.user?.id) {
+                    await sock.onWhatsApp(sock.user.id);
+                }
+                responded = true;
+                clearTimeout(watchdog);
+                log('SUCCESS', 'Session Health Check: Socket is alive and healthy.');
+            } catch (err: any) {
+                // If it threw an error but still responded, the socket connection is alive!
+                responded = true;
+                clearTimeout(watchdog);
+                log('INFO', `Session Health Check: Ping test responded with: ${err.message}. Connection alive.`);
+            }
+        }, 5 * 60 * 1000); // every 5 minutes
+    }
+
     // Load from Firestore pre-startup
     await loadProDataFromFirestore();
     realChats = proData.cachedChats || [];
@@ -395,18 +660,34 @@ async function startServer() {
         });
     }
 
-    // Normalize JID function to handle linked devices, LIDs and @c.us vs @s.whatsapp.net
+    function registerJidMapping(lid: string, pn: string) {
+        if (!lid || !pn || lid === pn) return;
+        if (!lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) return;
+        
+        if (!proData.lidToPnMap) proData.lidToPnMap = {};
+        if (proData.lidToPnMap[lid] !== pn) {
+            proData.lidToPnMap[lid] = pn;
+            log('INFO', `Registered JID mapping: ${lid} -> ${pn}`);
+            saveProData();
+            broadcast({ type: 'LID_MAPPING', data: { lid, pn } });
+        }
+    }
+
+// Normalize JID function to handle linked devices, LIDs and @c.us vs @s.whatsapp.net
 function normalizeJid(jid: string): string {
     if (!jid) return jid;
-    if (jid.includes(':')) {
-        const parts = jid.split(':');
-        const domain = jid.split('@')[1];
-        jid = parts[0] + '@' + domain;
+    if (jid.includes('@')) {
+        const [userWithDevice, domain] = jid.split('@');
+        const user = userWithDevice.split(':')[0];
+        jid = `${user}@${domain}`;
+    } else if (jid.includes(':')) {
+        jid = jid.split(':')[0];
     }
     if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
-    // Basic LID normalization if encountered
-    if (jid.endsWith('@lid')) {
-        // Keep as lid, but ensure no device suffix
+    
+    // Resolve @lid using our synchronized mappings
+    if (jid.endsWith('@lid') && proData.lidToPnMap && proData.lidToPnMap[jid]) {
+        jid = proData.lidToPnMap[jid];
     }
     return jid;
 }
@@ -448,32 +729,43 @@ async function initWASocket() {
         } catch (e) {}
     }
     
-    try {
-        sock = makeWASocket({
-            version: latestVersion || [2, 3000, 1015901307],
-            logger,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger),
-            },
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu('Chrome'),
-            syncFullHistory: true, // Re-enabled for full pro sync
-            markOnlineOnConnect: !proData.settings.ghostMode,
-            connectTimeoutMs: 60000,
-            generateHighQualityLinkPreview: true,
-            getMessage: async (key) => {
-                const jid = normalizeJid(key.remoteJid!);
-                const msgs = proData.messageHistory[jid] || [];
-                return msgs.find(m => m.key.id === key.id)?.message || undefined;
+    let constructRetries = 0;
+    while (constructRetries < 3) {
+        try {
+            sock = makeWASocket({
+                version: latestVersion,
+                logger,
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, logger),
+                },
+                printQRInTerminal: false,
+                browser: Browsers.ubuntu('Chrome'),
+                syncFullHistory: true, // Re-enabled for full pro sync
+                markOnlineOnConnect: !proData.settings.ghostMode,
+                connectTimeoutMs: 60000,
+                generateHighQualityLinkPreview: true,
+                getMessage: async (key) => {
+                    const jid = normalizeJid(key.remoteJid!);
+                    const msgs = proData.messageHistory[jid] || [];
+                    return msgs.find(m => m.key.id === key.id)?.message || undefined;
+                }
+            });
+            break; // connection built successfully
+        } catch (socketError: any) {
+            constructRetries++;
+            log('ERROR', `Failed to construct WASocket (Attempt ${constructRetries}/3): ${socketError.message}.`);
+            if (constructRetries >= 3) {
+                log('ERROR', `Maximum socket construction retries reached. Recovering via sanitization...`);
+                cleanAuthDir(authDir);
+                isInitializing = false;
+                scheduleInit(3000);
+                return;
             }
-        });
-    } catch (socketError: any) {
-        log('ERROR', `Failed to construct WASocket: ${socketError.message}. Recovering via sanitization...`);
-        cleanAuthDir(authDir);
-        isInitializing = false;
-        scheduleInit(3000);
-        return;
+            // Delay 2 seconds before retry
+            const start = Date.now();
+            while (Date.now() - start < 2000) {}
+        }
     }
 
     isInitializing = false;
@@ -490,7 +782,7 @@ async function initWASocket() {
             broadcast({ type: 'QR_CODE', data: qr });
         });
 
-        sock.ev.on('connection.update', (update: Partial<ConnectionState>) => {
+        sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
             if (socketInstance !== sock) return;
             const { connection, lastDisconnect, qr } = update;
             
@@ -508,24 +800,75 @@ async function initWASocket() {
                 const error = lastDisconnect?.error as Boom;
                 const statusCode = error?.output?.statusCode;
                 
-                // Detailed reason mapping
-                const reasonMap: any = {
-                    [DisconnectReason.loggedOut]: 'Logged out from device. Clean auth required.',
-                    [DisconnectReason.restartRequired]: 'Restart required. Rebooting engine...',
-                    [DisconnectReason.connectionClosed]: 'Connection closed. Re-establishing link...',
-                    [DisconnectReason.connectionReplaced]: 'Connection replaced by another session.',
-                    [DisconnectReason.badSession]: 'Bad session file. Wiping and retrying...',
-                };
+                const errMessage = error?.message || 'none';
+                const errStack = error?.stack || 'none';
+                const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
+                const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
                 
-                // Handle potential 408 collisions
-                reasonMap[DisconnectReason.timedOut] = 'Connection timed out. Retrying...';
-                reasonMap[DisconnectReason.connectionLost] = 'Network lost. Reconnecting...';
+                const isQrTimeout = fullErrorString.includes('qr refs attempts ended') || (statusCode === 408 && fullErrorString.includes('qr'));
+                
+                const isLoggedOut = 
+                    statusCode === DisconnectReason.loggedOut ||
+                    fullErrorString.includes('logged out') ||
+                    fullErrorString.includes('logout');
 
-                const message = reasonMap[statusCode] || `Engine link severed (Code: ${statusCode}). Recovering...`;
-                const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-                const isBadSession = statusCode === DisconnectReason.badSession;
+                const isBadSession = 
+                    (statusCode === DisconnectReason.badSession && 
+                     !fullErrorString.includes('stream errored') && 
+                     !fullErrorString.includes('xml-not-well-formed') &&
+                     !fullErrorString.includes('connection reset') &&
+                     !fullErrorString.includes('socket hang up') &&
+                     !fullErrorString.includes('connection closed') &&
+                     !fullErrorString.includes('timed out')
+                    ) ||
+                    (statusCode === 401 && !isLoggedOut) ||
+                    fullErrorString.includes('bad session') ||
+                    fullErrorString.includes('invalid credentials') ||
+                    fullErrorString.includes('unauthorized') ||
+                    fullErrorString.includes('decryption failed') ||
+                    fullErrorString.includes('bad_session');
 
-                if (isLoggedOut || isBadSession) {
+                const isTransientReconnectRequest = 
+                    statusCode === 515 || // DisconnectReason.restartRequired
+                    statusCode === 408 || // DisconnectReason.connectionLost / timedOut
+                    statusCode === 428 || // DisconnectReason.connectionClosed
+                    fullErrorString.includes('restart required') ||
+                    fullErrorString.includes('connection lost') ||
+                    fullErrorString.includes('connection closed') ||
+                    fullErrorString.includes('timed out') ||
+                    fullErrorString.includes('socket hang up') ||
+                    fullErrorString.includes('connection reset');
+
+                const isStreamError = 
+                    !isTransientReconnectRequest && (
+                        statusCode === 500 || 
+                        fullErrorString.includes('stream errored') ||
+                        fullErrorString.includes('xml-not-well-formed')
+                    );
+
+                // 1. Check for QR Timeout
+                if (isQrTimeout) {
+                    log('WARN', 'QR pairing reference attempts ended (timeout). Wiping stale registration state for clean reboot...');
+                    qrCode = null;
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+                    const authDir = path.join(process.cwd(), 'auth_info_baileys');
+                    cleanAuthDir(authDir);
+                    
+                    broadcast({ type: 'QR_TIMEOUT', data: { message: 'QR code pairing timed out. Re-generating fresh pairing reference...' } });
+                    scheduleInit(3000);
+                    return;
+                }
+
+                // 2. Check for Log Out
+                if (isLoggedOut) {
+                    const message = 'Logged out from mobile device. Clean authentication required.';
                     log('ERROR', message);
                     qrCode = null;
                     realChats = [];
@@ -534,42 +877,107 @@ async function initWASocket() {
                     
                     broadcast({ type: 'LOGOUT', data: { message, fatal: true } });
 
-                    if (isBadSession) {
-                        consecutiveBadSessions++;
-                    }
-
-                    // Cleanup auth for fresh start - More immediate destruction
                     if (sock) {
                         try {
                             sock.ev.removeAllListeners('connection.update');
                             sock.ev.removeAllListeners('creds.update');
                             sock.end(undefined);
-                            sock = null;
                         } catch (e) {}
+                        sock = null;
                     }
 
                     const authDir = path.join(process.cwd(), 'auth_info_baileys');
-                    if (initTimeout) clearTimeout(initTimeout);
-                    const backoffMs = consecutiveBadSessions > 3 ? 30000 : 5000;
-                    if (consecutiveBadSessions > 3) {
-                        log('WARN', `Engine: High frequency of session dropouts detected. Retrying with cautious cooldown: ${backoffMs/1000}s`);
-                    }
-                    initTimeout = setTimeout(async () => {
-                        initTimeout = null;
-                        cleanAuthDir(authDir);
-                        // Fresh start
-                        await initWASocket();
-                    }, backoffMs);
-                } else {
-                    log('WARN', message);
-                    
-                    // Reconnect for other reasons
-                    scheduleInit(2000);
+                    cleanAuthDir(authDir);
+                    scheduleInit(5000);
+                    return;
                 }
+
+                // 2.5 Check for Transient Reconnect Request
+                if (isTransientReconnectRequest) {
+                    log('INFO', `Engine: Transient socket disconnect/restart requested (statusCode: ${statusCode || 'none'}). Reconnecting connection cleanly...`);
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+                    scheduleInit(3000);
+                    return;
+                }
+
+                // 3. Check for Bad Session
+                if (isBadSession) {
+                    consecutiveBadSessions++;
+                    log('WARN', `Engine Connection close detected as BAD SESSION (statusCode: ${statusCode || 'none'}, consecutive: ${consecutiveBadSessions}/3).`);
+                    
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+
+                    if (consecutiveBadSessions >= 3) {
+                        log('ERROR', 'Multiple consecutive bad session errors encountered. Initiating automated session recovery...');
+                        consecutiveBadSessions = 0;
+                        await handleAutomatedSessionRecovery();
+                    } else {
+                        log('WARN', 'Bad session encountered. Preparing auto-reinitialization in 3 seconds...');
+                        scheduleInit(3000);
+                    }
+                    return;
+                }
+
+                // 3.5 Check for Stream Errors
+                if (isStreamError) {
+                    consecutiveStreamErrors++;
+                    log('WARN', `Engine Connection close detected as STREAM ERROR (statusCode: ${statusCode || 'none'}, consecutive: ${consecutiveStreamErrors}/3).`);
+                    
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+
+                    let delay = 3000;
+                    if (consecutiveStreamErrors > 3) {
+                        delay = 8000; // exponential-like wait backoff
+                    }
+                    if (consecutiveStreamErrors >= 30) {
+                        log('ERROR', 'Extremely high stream errors. Resetting state without deleting session.');
+                        consecutiveStreamErrors = 0;
+                    }
+
+                    log('WARN', `Stream closed due to network/protocol error. Preparing auto-reinitialization in ${delay / 1000} seconds...`);
+                    scheduleInit(delay);
+                    return;
+                }
+
+                // 4. Fallback for other reasons
+                log('WARN', `Severe disconnect close code: ${statusCode || 'unknown'}. message: ${errMessage}, stack: ${errStack}. Scheduling fallback socket reboot reconnect...`);
+                
+                if (sock) {
+                    try {
+                        sock.ev.removeAllListeners('connection.update');
+                        sock.ev.removeAllListeners('creds.update');
+                        sock.end(undefined);
+                    } catch (e) {}
+                    sock = null;
+                }
+                scheduleInit(2000);
             } else if (connection === 'open') {
                 log('SUCCESS', 'WhatsApp Pro Engine: CONNECTED and SYNCED');
                 consecutiveBadSessions = 0;
+                consecutiveStreamErrors = 0;
                 qrCode = null;
+                startSessionHealthCheck();
                 broadcast({ type: 'LOGGED_IN', data: sock.user });
                 // Force an immediate status check broadcast
                 broadcast({ type: 'SYNC_START', data: true });
@@ -582,7 +990,8 @@ async function initWASocket() {
                         favorites: proData.favorites,
                         lockedChats: proData.lockedChats,
                         callHistory: proData.callHistory,
-                        contacts: proData.contacts
+                        contacts: proData.contacts,
+                        lidToPnMap: proData.lidToPnMap
                     } });
                 }).catch(e => {
                     console.error('Failed to reload database for logged in user:', e.message);
@@ -600,6 +1009,15 @@ async function initWASocket() {
                 if (!jid) return;
 
                 // Normalize JID early
+                if (msg.key.participant && msg.participant) {
+                    const p1 = msg.key.participant;
+                    const p2 = msg.participant;
+                    if (p1.endsWith('@lid') && p2.endsWith('@s.whatsapp.net')) {
+                        registerJidMapping(p1, p2);
+                    } else if (p2.endsWith('@lid') && p1.endsWith('@s.whatsapp.net')) {
+                        registerJidMapping(p2, p1);
+                    }
+                }
                 jid = normalizeJid(jid);
                 msg.key.remoteJid = jid; // Mutate for consistency
                 if (msg.key.participant) msg.key.participant = normalizeJid(msg.key.participant);
@@ -778,6 +1196,12 @@ async function initWASocket() {
             if (socketInstance !== sock) return;
             newContacts.forEach((c: any) => {
                 const jid = normalizeJid(c.id);
+                if (c.id && c.lid) {
+                    registerJidMapping(normalizeJid(c.lid), normalizeJid(c.id));
+                }
+                if (c.id && c.pnJid) {
+                    registerJidMapping(normalizeJid(c.id), normalizeJid(c.pnJid));
+                }
                 proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...c, id: jid };
                 saveContactToFirebase(jid, proData.contacts[jid]);
             });
@@ -789,6 +1213,12 @@ async function initWASocket() {
             if (socketInstance !== sock) return;
             updates.forEach((u: any) => {
                 const jid = normalizeJid(u.id);
+                if (u.id && u.lid) {
+                    registerJidMapping(normalizeJid(u.lid), normalizeJid(u.id));
+                }
+                if (u.id && u.pnJid) {
+                    registerJidMapping(normalizeJid(u.id), normalizeJid(u.pnJid));
+                }
                 proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...u, id: jid };
                 saveContactToFirebase(jid, proData.contacts[jid]);
             });
@@ -1035,6 +1465,10 @@ async function initWASocket() {
 
     app.get('/api/settings', (req, res) => {
         res.json(proData.settings);
+    });
+
+    app.get('/api/engine-logs', (req, res) => {
+        res.json(proData.logs);
     });
 
     app.post('/api/settings', (req, res) => {
@@ -1806,7 +2240,7 @@ async function initWASocket() {
         qrCode = null;
         realChats = [];
         proData.cachedChats = [];
-        saveProData();
+        saveProDataSync();
         connectionState = 'close';
         
         broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
@@ -1817,14 +2251,37 @@ async function initWASocket() {
         }, 3000);
     });
 
+    function getMediaKeyAndTimestamp(msg: any): string | null {
+        if (!msg || !msg.message) return null;
+        const content = msg.message;
+        const media = content.imageMessage || content.videoMessage || content.documentMessage || content.audioMessage || content.stickerMessage;
+        if (!media) return null;
+        const mediaKey = (media as any).mediaKey ? Buffer.from((media as any).mediaKey).toString('base64') : '';
+        const timestamp = msg.messageTimestamp || '';
+        if (!mediaKey && !timestamp) return null;
+        return `${mediaKey}_${timestamp}`;
+    }
+
+    const expiredSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150" viewBox="0 0 300 150">
+  <rect width="100%" height="100%" fill="#1f2937" rx="10"/>
+  <g fill="#ef4444" transform="translate(138, 35)">
+    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" />
+  </g>
+  <text x="50%" y="95" fill="#f3f4f6" font-family="Inter, sans-serif" font-size="14" font-weight="600" text-anchor="middle">Media Expired</text>
+  <text x="50%" y="115" fill="#9ca3af" font-family="Inter, sans-serif" font-size="11" text-anchor="middle">This content is no longer available</text>
+</svg>`;
+
     app.get('/api/media', async (req: any, res: any) => {
         const { msgId, chatId } = req.query;
         if (!msgId) return res.status(400).send('Missing message ID');
 
+        const inlineOrAttachment = req.query.download === 'true' ? 'attachment' : 'inline';
+
+        // 1. Check local memory cache by msgId first
         if (localMediaCache.has(msgId as string)) {
             const cached = localMediaCache.get(msgId as string)!;
             res.setHeader('Content-Type', cached.mimetype);
-            res.setHeader('Content-Disposition', `attachment; filename="${cached.filename}"`);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${cached.filename}"`);
             return res.send(cached.buffer);
         }
 
@@ -1856,6 +2313,24 @@ async function initWASocket() {
             return res.status(404).send('Message not found in history');
         }
 
+        // 2. Check composite cache by (mediaKey + messageTimestamp)
+        const compositeKey = getMediaKeyAndTimestamp(msg);
+        if (compositeKey && localMediaCacheByMediaKey.has(compositeKey)) {
+            const cached = localMediaCacheByMediaKey.get(compositeKey)!;
+            res.setHeader('Content-Type', cached.mimetype);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${cached.filename}"`);
+            return res.send(cached.buffer);
+        }
+
+        // 3. Prevent retrying expired media more than once per session
+        const isAlreadyMarkedExpired = msg.mediaExpired || expiredMediaTracker.has(msgId as string);
+        if (isAlreadyMarkedExpired) {
+            log('INFO', `Media request bypassed since ${msgId} is marked as expired. Directing placeholder SVG...`);
+            res.setHeader('Content-Type', 'image/svg+xml');
+            res.setHeader('Cache-Control', 'public, max-age=31536000');
+            return res.status(200).send(expiredSvg);
+        }
+
         try {
             log('INFO', `Media request for ${msgId} (Origin: ${normalizedJid})...`);
             
@@ -1874,7 +2349,8 @@ async function initWASocket() {
                     }
                 );
             } catch (initialErr: any) {
-                const isFatal = initialErr.message?.toLowerCase().includes('re-upload') || initialErr.message?.includes('410');
+                const errStr = (initialErr.message || '').toLowerCase();
+                const isFatal = errStr.includes('re-upload') || errStr.includes('410') || errStr.includes('403') || errStr.includes('expired');
                 
                 if (isFatal) {
                     throw new Error('Media expired on WhatsApp servers (re-upload failed)');
@@ -1900,7 +2376,8 @@ async function initWASocket() {
                         throw new Error('Refresh returned empty result');
                     }
                 } catch (refreshErr: any) {
-                    const isMissing = refreshErr.message?.toLowerCase().includes('re-upload') || refreshErr.message?.toLowerCase().includes('404') || refreshErr.message?.toLowerCase().includes('410');
+                    const refreshErrStr = (refreshErr.message || '').toLowerCase();
+                    const isMissing = refreshErrStr.includes('re-upload') || refreshErrStr.includes('404') || refreshErrStr.includes('410') || refreshErrStr.includes('expired');
                     if (isMissing) {
                         log('WARN', `Media ${msgId} has expired permanently.`);
                         throw new Error('Media expired (re-upload not possible)');
@@ -1931,27 +2408,49 @@ async function initWASocket() {
             const mimetype = (media as any).mimetype || 'application/octet-stream';
             const filename = (media as any).fileName || `wa_media_${msgId}`;
 
+            // Save to memory cache (both msgId and compositeKey)
+            localMediaCache.set(msgId as string, { buffer, mimetype, filename });
+            if (compositeKey) {
+                localMediaCacheByMediaKey.set(compositeKey, { buffer, mimetype, filename });
+            }
+
             res.setHeader('Content-Type', mimetype);
-            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${filename}"`);
             res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 24h
             res.send(buffer);
             log('SUCCESS', `Downloaded media ${msgId}`);
         } catch (err: any) {
-            const isMissing = err.message?.toLowerCase().includes('404') || 
-                              err.message?.toLowerCase().includes('410') || 
-                              err.message?.toLowerCase().includes('re-upload') || 
-                              err.message?.toLowerCase().includes('expired') ||
-                              err.message?.toLowerCase().includes('not found') ||
-                              err.message?.toLowerCase().includes('failed');
-            const errorMsg = isMissing ? 'Media no longer available (Expired on WhatsApp)' : err.message;
+            const errStr = (err.message || '').toLowerCase();
+            const isMissing = errStr.includes('404') || 
+                              errStr.includes('410') || 
+                              errStr.includes('403') || 
+                              errStr.includes('re-upload') || 
+                              errStr.includes('expired') ||
+                              errStr.includes('not found') ||
+                              errStr.includes('failed');
             
             if (isMissing) {
                 log('WARN', `Media expired or unavailable on WhatsApp [${msgId}]: ${err.message}`);
+                
+                // Mark the media as "EXPIRED" in local DB
+                msg.mediaExpired = true;
+                if (msg.message) {
+                    const media = msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage || msg.message.stickerMessage;
+                    if (media) {
+                        (media as any).mediaExpired = true;
+                    }
+                }
+                saveProData();
+                expiredMediaTracker.add(msgId as string);
+
+                // Return standard placeholder icon with text "Media expired"
+                res.setHeader('Content-Type', 'image/svg+xml');
+                res.setHeader('Cache-Control', 'public, max-age=31536000');
+                return res.status(200).send(expiredSvg);
             } else {
                 log('ERROR', `Media download failed [${msgId}]: ${err.message}`);
+                res.status(500).send(err.message);
             }
-            
-            res.status(isMissing ? 410 : 500).send(errorMsg);
         }
     });
 
@@ -1989,5 +2488,14 @@ async function initWASocket() {
         console.log(`WhatsApp Pro running on http://localhost:${PORT}`);
     });
 }
+
+// Graceful termination state persistence
+const gracefulExit = () => {
+    console.log('Intercepted termination signal. Flushing Pro Engine State dynamically to storage disk...');
+    saveProDataSync();
+    process.exit(0);
+};
+process.on('SIGINT', gracefulExit);
+process.on('SIGTERM', gracefulExit);
 
 startServer();

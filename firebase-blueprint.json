@@ -109,27 +109,27 @@
       "schema": "AutoReply",
       "description": "Incoming message auto response keyword match definitions"
     },
-    "/users/{phone}/firebase_backup/settings/active": {
+    "/users/{phone}/firebase_backup/data/settings/active": {
       "schema": "Settings",
       "description": "Prismatic user settings backup"
     },
-    "/users/{phone}/firebase_backup/chats/{chatId}": {
+    "/users/{phone}/firebase_backup/data/chats/{chatId}": {
       "schema": "Chat",
       "description": "Prismatic user chats history backup"
     },
-    "/users/{phone}/firebase_backup/messages/{messageId}": {
+    "/users/{phone}/firebase_backup/data/messages/{messageId}": {
       "schema": "Message",
       "description": "Prismatic user individual messages backup"
     },
-    "/users/{phone}/firebase_backup/calls/{callId}": {
+    "/users/{phone}/firebase_backup/data/calls/{callId}": {
       "schema": "object",
       "description": "Prismatic user call history log backup"
     },
-    "/users/{phone}/firebase_backup/status/{statusId}": {
+    "/users/{phone}/firebase_backup/data/status/{statusId}": {
       "schema": "object",
       "description": "Prismatic user status stories backup"
     },
-    "/users/{phone}/firebase_backup/groups/{groupId}": {
+    "/users/{phone}/firebase_backup/data/groups/{groupId}": {
       "schema": "Chat",
       "description": "Prismatic group characteristics metadata"
     }

