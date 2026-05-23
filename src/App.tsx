@@ -118,6 +118,8 @@ export default function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [showMsgSearch, setShowMsgSearch] = useState(false);
+  const [msgSearchQuery, setMsgSearchQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [callHistory, setCallHistory] = useState<any[]>([]);
   const [proSettings, setProSettings] = useState({
@@ -1534,6 +1536,8 @@ export default function App() {
     setMessages([]);
     setAiSuggestions([]);
     setGroupMetadata(null);
+    setShowMsgSearch(false);
+    setMsgSearchQuery("");
     if (chat.id.endsWith("@g.us")) {
       fetchGroupMetadata(chat.id);
     }
@@ -2068,7 +2072,21 @@ export default function App() {
                 </div>
               </div>
 
-              {chats
+              {(() => {
+                const combinedList = [...chats];
+                Object.keys(contacts).forEach((jid) => {
+                  if (!combinedList.some((c) => c.id === jid)) {
+                    combinedList.push({
+                      id: jid,
+                      name: contacts[jid].name || jid.split("@")[0],
+                      timestamp: Date.now(),
+                      lastMessage: null,
+                      unreadCount: 0
+                    });
+                  }
+                });
+                return combinedList;
+              })()
                 .filter((c) => {
                   const search = searchTerm.toLowerCase();
                   const displayName = getDisplayName(c).toLowerCase();
@@ -2155,7 +2173,7 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-              {chats.length === 0 && (
+              {chats.length === 0 && Object.keys(contacts).length === 0 && (
                 <div className="flex flex-col items-center justify-center py-20 px-10 text-center">
                   <div className="relative mb-6">
                     <Monitor className="w-12 h-12 opacity-20" />
@@ -2936,7 +2954,14 @@ export default function App() {
                 >
                   <Video className="w-5 h-5" />
                 </button>
-                <button className="hover:text-white transition-colors">
+                <button
+                  className={`hover:text-white transition-colors ${showMsgSearch ? "text-[#00a884]" : ""}`}
+                  onClick={() => {
+                    setShowMsgSearch(!showMsgSearch);
+                    if (showMsgSearch) setMsgSearchQuery("");
+                  }}
+                  title="Search Messages"
+                >
                   <Search className="w-5 h-5" />
                 </button>
                 <div className="relative">
@@ -3081,6 +3106,29 @@ export default function App() {
               </div>
             </div>
 
+            {showMsgSearch && (
+              <div className="bg-[#111b21] px-6 py-3 border-b border-white/5 flex items-center gap-3 animate-slideDown shrink-0">
+                <Search className="w-4 h-4 text-[#00a884]" />
+                <input
+                  type="text"
+                  placeholder="Filter messages in this active terminal..."
+                  className="bg-transparent border-none outline-none text-xs text-white px-2 w-full placeholder:text-[#aebac1]/30 italic"
+                  value={msgSearchQuery}
+                  onChange={(e) => setMsgSearchQuery(e.target.value)}
+                  autoFocus
+                />
+                <button
+                  onClick={() => {
+                    setMsgSearchQuery("");
+                    setShowMsgSearch(false);
+                  }}
+                  className="text-[9px] font-black uppercase tracking-widest text-[#aebac1]/50 hover:text-white transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            )}
+
             {/* Messages Area */}
             <div
               ref={scrollRef}
@@ -3095,7 +3143,16 @@ export default function App() {
                 </div>
               </div>
 
-              {messages.map((msg, i) => (
+              {messages
+                .filter((msg) => {
+                  if (!msgSearchQuery.trim()) return true;
+                  const query = msgSearchQuery.toLowerCase();
+                  return (
+                    (msg.text || "").toLowerCase().includes(query) ||
+                    (msg.sender || "").toLowerCase().includes(query)
+                  );
+                })
+                .map((msg, i) => (
                 <motion.div
                   key={`${msg.id}-${i}`}
                   initial={{ opacity: 0, y: 12, scale: 0.97 }}

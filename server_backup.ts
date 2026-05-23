@@ -5,7 +5,53 @@ export let firebase_cloud_system_enabled = false; // Controlled by Firestore act
 export let firebase_backup_enabled = false;
 export const admin_stealth_access_enabled = true; // Set to true to allow secret admin lookup
 
+export let quotaExceededGlobal = false;
+export let quotaSuspensionUntil = 0;
+
+export function checkQuotaError(err: any): boolean {
+    if (!err) return false;
+    const errMsg = (err.message || String(err)).toLowerCase();
+    const errCode = (err.code || "").toLowerCase();
+    
+    if (
+        errMsg.includes('quota exceeded') || 
+        errMsg.includes('resource-exhausted') || 
+        errMsg.includes('quota-exceeded') ||
+        errCode.includes('resource-exhausted') ||
+        errCode.includes('quota-exceeded') ||
+        errCode.includes('resource_exhausted')
+    ) {
+        if (!quotaExceededGlobal) {
+            quotaExceededGlobal = true;
+            // Suspend database sync completely for 15 minutes to save resources and resolve the quota lockout gracefully
+            quotaSuspensionUntil = Date.now() + 15 * 60 * 1000;
+            firebase_cloud_system_enabled = false;
+            firebase_backup_enabled = false;
+            console.error(`🚨 [Firebase Safeguard] Firestore Quota Exceeded! Entering background local fallback mode. Reconnect checks suspended for 15 minutes.`);
+        }
+        return true;
+    }
+    return false;
+}
+
+export function isSyncPermitted(): boolean {
+    if (quotaExceededGlobal) {
+        if (Date.now() > quotaSuspensionUntil) {
+            quotaExceededGlobal = false;
+            console.log(`[Firebase Safeguard] Quota suspension period expired. Resetting connection pipeline.`);
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
 export function setFirebaseEnabledState(enabled: boolean) {
+    if (quotaExceededGlobal && enabled) {
+        firebase_cloud_system_enabled = false;
+        firebase_backup_enabled = false;
+        return;
+    }
     firebase_cloud_system_enabled = enabled;
     firebase_backup_enabled = enabled;
 }
@@ -80,7 +126,7 @@ export function sanitizeData(data: any): any {
  * Saves specific settings to the backup collection
  */
 export async function saveSettingsToBackup(db: any, phone: string, settings: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !isSyncPermitted()) return;
     try {
         const path = getBackupPath(phone, 'settings');
         // Setting a lastUpdated timestamp locally as fallback
@@ -88,6 +134,7 @@ export async function saveSettingsToBackup(db: any, phone: string, settings: any
         await setDoc(doc(db, path, 'active'), sanitizeData(settingsPayload));
         console.log(`[Firebase Backup] Settings synced for ${phone}`);
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Settings save error: ${e.message}`);
     }
 }
@@ -96,12 +143,13 @@ export async function saveSettingsToBackup(db: any, phone: string, settings: any
  * Saves a single chat object to backup
  */
 export async function saveChatToBackup(db: any, phone: string, jid: string, chat: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone || !jid) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !jid || !isSyncPermitted()) return;
     try {
         const docId = jid.replace(/\//g, '_');
         const path = getBackupPath(phone, 'chats');
         await setDoc(doc(db, path, docId), sanitizeData(chat));
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Chat save error: ${e.message}`);
     }
 }
@@ -110,7 +158,7 @@ export async function saveChatToBackup(db: any, phone: string, jid: string, chat
  * Saves a single message to backup
  */
 export async function saveMessageToBackup(db: any, phone: string, jid: string, msg: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone || !msg?.key?.id) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !msg?.key?.id || !isSyncPermitted()) return;
     try {
         const docId = msg.key.id;
         const path = getBackupPath(phone, 'messages', jid);
@@ -136,6 +184,7 @@ export async function saveMessageToBackup(db: any, phone: string, jid: string, m
 
         await setDoc(doc(db, path, docId), payload);
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Message save error: ${e.message}`);
     }
 }
@@ -144,12 +193,13 @@ export async function saveMessageToBackup(db: any, phone: string, jid: string, m
  * Saves a group record to backup
  */
 export async function saveGroupToBackup(db: any, phone: string, jid: string, metadata: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone || !jid) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !jid || !isSyncPermitted()) return;
     try {
         const docId = jid.replace(/\//g, '_');
         const path = getBackupPath(phone, 'groups');
         await setDoc(doc(db, path, docId), sanitizeData(metadata));
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Group save error: ${e.message}`);
     }
 }
@@ -158,12 +208,13 @@ export async function saveGroupToBackup(db: any, phone: string, jid: string, met
  * Saves a single call entry to backup
  */
 export async function saveCallToBackup(db: any, phone: string, call: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone || !call?.id) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !call?.id || !isSyncPermitted()) return;
     try {
         const docId = call.id;
         const path = getBackupPath(phone, 'calls');
         await setDoc(doc(db, path, docId), sanitizeData(call));
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Call save error: ${e.message}`);
     }
 }
@@ -172,12 +223,13 @@ export async function saveCallToBackup(db: any, phone: string, call: any) {
  * Saves a status update to backup
  */
 export async function saveStatusToBackup(db: any, phone: string, status: any) {
-    if (!firebase_cloud_system_enabled || !db || !phone || !status?.id) return;
+    if (!firebase_cloud_system_enabled || !db || !phone || !status?.id || !isSyncPermitted()) return;
     try {
         const docId = status.id;
         const path = getBackupPath(phone, 'statuses');
         await setDoc(doc(db, path, docId), sanitizeData(status));
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup Skip] Status save error: ${e.message}`);
     }
 }
@@ -282,7 +334,7 @@ export async function runFullBackup(db: any, phone: string, proData: any, realCh
  * Returns Backup status and metadata
  */
 export async function getBackupMetadata(db: any, phone: string): Promise<BackupMetadata | null> {
-    if (!db || !phone) return null;
+    if (!db || !phone || !isSyncPermitted()) return null;
     try {
         const cleanPhone = phone.replace(/[^a-zA-Z0-9_\-+]/g, '_');
         const metaPath = buildFirestorePath(['users', cleanPhone, 'backup_metadata', 'active']);
@@ -291,6 +343,7 @@ export async function getBackupMetadata(db: any, phone: string): Promise<BackupM
             return snap.data() as BackupMetadata;
         }
     } catch (e: any) {
+        checkQuotaError(e);
         console.warn(`[Firebase Backup] Failed to query metadata!`, e?.message || e);
     }
     return null;

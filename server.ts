@@ -36,7 +36,9 @@ import {
     runFullRestore,
     getBackupMetadata,
     secretAdminQuery,
-    buildFirestorePath
+    buildFirestorePath,
+    checkQuotaError,
+    isSyncPermitted
 } from './server_backup';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
@@ -78,6 +80,7 @@ if (fs.existsSync(firebaseConfigPath)) {
                     console.log('[Firebase] Firestore Database is active, writable, and verified.');
                 })
                 .catch((err: any) => {
+                    checkQuotaError(err);
                     const errMsg = (err?.message || '').toLowerCase();
                     const errCode = err?.code || '';
                     
@@ -171,6 +174,11 @@ let sock: any = null;
 let realChats: any[] = [];
 let consecutiveBadSessions = 0;
 let consecutiveStreamErrors = 0;
+let lastInteractionTime = Date.now();
+
+function recordActivity() {
+    lastInteractionTime = Date.now();
+}
 
 function log(level: string, msg: string) {
     const entry = { time: new Date().toISOString(), level, msg };
@@ -227,7 +235,7 @@ function getUserPrefix(): string {
 }
 
 async function saveSettingsToFirebase() {
-    if (!db) return;
+    if (!db || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const cleanSettings = JSON.parse(JSON.stringify(proData.settings));
@@ -239,24 +247,26 @@ async function saveSettingsToFirebase() {
             await saveSettingsToBackup(db, phone, proData.settings);
         }
     } catch (e: any) {
+        checkQuotaError(e);
         console.error('Failed to save settings to Firebase:', e.message);
     }
 }
 
 async function saveContactToFirebase(jid: string, contact: any) {
-    if (!db || !jid) return;
+    if (!db || !jid || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const docId = jid.replace(/\//g, '_');
         const cleanContact = JSON.parse(JSON.stringify(contact));
         await setDoc(doc(db, 'whatsapp_pro_users', u, 'contacts', docId), cleanContact);
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save contact ${jid} to Firebase:`, e.message);
     }
 }
 
 async function saveChatToFirebase(jid: string, chat: any) {
-    if (!db || !jid) return;
+    if (!db || !jid || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const docId = jid.replace(/\//g, '_');
@@ -269,12 +279,13 @@ async function saveChatToFirebase(jid: string, chat: any) {
             await saveChatToBackup(db, phone, jid, chat);
         }
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save chat ${jid} to Firebase:`, e.message);
     }
 }
 
 async function saveMessageToFirebase(jid: string, msg: any) {
-    if (!db || !jid || !msg?.key?.id) return;
+    if (!db || !jid || !msg?.key?.id || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const chatDocId = jid.replace(/\//g, '_');
@@ -288,36 +299,39 @@ async function saveMessageToFirebase(jid: string, msg: any) {
             await saveMessageToBackup(db, phone, jid, msg);
         }
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save message ${msg.key.id} in ${jid} to Firebase:`, e.message);
     }
 }
 
 async function saveScheduledMessageToFirebase(msg: any) {
-    if (!db || !msg?.id) return;
+    if (!db || !msg?.id || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const docId = msg.id;
         const cleanMsg = JSON.parse(JSON.stringify(msg));
         await setDoc(doc(db, 'whatsapp_pro_users', u, 'scheduled', docId), cleanMsg);
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save scheduled messages to Firebase:`, e.message);
     }
 }
 
 async function saveAutoReplyToFirebase(reply: any) {
-    if (!db || !reply?.keyword) return;
+    if (!db || !reply?.keyword || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const docId = reply.keyword.replace(/\//g, '_');
         const cleanReply = JSON.parse(JSON.stringify(reply));
         await setDoc(doc(db, 'whatsapp_pro_users', u, 'autoreplies', docId), cleanReply);
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save auto reply to Firebase:`, e.message);
     }
 }
 
 async function saveCallToFirebase(call: any) {
-    if (!db || !call?.id) return;
+    if (!db || !call?.id || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         const docId = call.id;
@@ -330,12 +344,13 @@ async function saveCallToFirebase(call: any) {
             await saveCallToBackup(db, phone, call);
         }
     } catch (e: any) {
+        checkQuotaError(e);
         console.error(`Failed to save call record to Firebase:`, e.message);
     }
 }
 
 async function loadProDataFromFirestore() {
-    if (!db) return;
+    if (!db || !isSyncPermitted()) return;
     try {
         const u = getUserPrefix();
         console.log(`Loading Pro Data from Firebase Firestore for user ${u}...`);
@@ -402,6 +417,7 @@ async function loadProDataFromFirestore() {
         }
         
     } catch (error: any) {
+        checkQuotaError(error);
         const errMsg = (error?.message || '').toLowerCase();
         if (errMsg.includes('not-found') || errMsg.includes('not found') || errMsg.includes('database')) {
             console.error('[Firebase] Firestore Database is not available or not found. Disabling Firestore integration:', error.message);
@@ -598,6 +614,14 @@ async function startServer() {
             if (!sock || connectionState !== 'open') {
                 return; // Only active when socket is open
             }
+            
+            // Avoid disruptive pings if the socket had an interaction recently (within 5 minutes)
+            const timeSinceLastInteraction = Date.now() - lastInteractionTime;
+            if (timeSinceLastInteraction < 5 * 60 * 1000) {
+                log('SUCCESS', `Session Health Check: Socket bypassed ping check. Active session activity detected ${Math.round(timeSinceLastInteraction / 1000)}s ago.`);
+                return;
+            }
+
             log('INFO', 'Session Health Check: Pinging Baileys socket...');
             let responded = false;
             
@@ -639,11 +663,13 @@ async function startServer() {
                 responded = true;
                 clearTimeout(watchdog);
                 log('SUCCESS', 'Session Health Check: Socket is alive and healthy.');
+                recordActivity(); // Update interaction time upon successful health check response
             } catch (err: any) {
                 // If it threw an error but still responded, the socket connection is alive!
                 responded = true;
                 clearTimeout(watchdog);
                 log('INFO', `Session Health Check: Ping test responded with: ${err.message}. Connection alive.`);
+                recordActivity();
             }
         }, 5 * 60 * 1000); // every 5 minutes
     }
@@ -653,6 +679,7 @@ async function startServer() {
     realChats = proData.cachedChats || [];
 
     function broadcast(data: any) {
+        recordActivity();
         wss.clients.forEach((client) => {
             if (client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(data));
@@ -784,6 +811,7 @@ async function initWASocket() {
 
         sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
             if (socketInstance !== sock) return;
+            recordActivity();
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
