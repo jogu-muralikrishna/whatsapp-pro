@@ -909,14 +909,23 @@ async function initWASocket() {
                         try {
                             sock.ev.removeAllListeners('connection.update');
                             sock.ev.removeAllListeners('creds.update');
+                            sock.ev.removeAllListeners('messages.upsert');
+                            sock.ev.removeAllListeners('messages.update');
+                            sock.ev.removeAllListeners('contacts.upsert');
+                            sock.ev.removeAllListeners('contacts.update');
+                            sock.ev.removeAllListeners('chats.upsert');
+                            sock.ev.removeAllListeners('chats.update');
                             sock.end(undefined);
                         } catch (e) {}
                         sock = null;
                     }
 
-                    const authDir = path.join(process.cwd(), 'auth_info_baileys');
-                    cleanAuthDir(authDir);
-                    scheduleInit(5000);
+                    // Introduce a critical delay to let all file descriptor locks release and socket to fully dispose
+                    setTimeout(() => {
+                        const authDir = path.join(process.cwd(), 'auth_info_baileys');
+                        cleanAuthDir(authDir);
+                        scheduleInit(1000);
+                    }, 1500);
                     return;
                 }
 
