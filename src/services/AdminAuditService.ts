@@ -12,6 +12,11 @@ export interface AuditLogEntry {
 export const AdminAuditService = {
     async logAction(email: string, targetPhone: string, action: string) {
         try {
+            if (!db) {
+                console.warn('[AdminAuditService] Firestore database not initialized. Skipping action log:', action);
+                return;
+            }
+
             // Safely attempt to fetch public IP
             let ipAddress = 'unknown';
             try {

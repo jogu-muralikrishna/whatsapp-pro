@@ -2134,6 +2134,8 @@ async function initWASocket() {
         res.json(metadata);
     });
 
+    const dpCache = new Map<string, string | null>();
+
     app.get('/api/profile-picture', async (req, res) => {
         const { jid } = req.query;
         if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
@@ -2141,11 +2143,17 @@ async function initWASocket() {
         
         const targetJid = normalizeJid(jid as string);
 
+        if (dpCache.has(targetJid)) {
+            return res.json({ url: dpCache.get(targetJid) || null });
+        }
+
         try {
             const url = await sock.profilePictureUrl(targetJid, 'image');
-            res.json({ url });
+            dpCache.set(targetJid, url || null);
+            res.json({ url: url || null });
         } catch (e) {
-            res.status(404).json({ error: 'Not found' });
+            dpCache.set(targetJid, null);
+            res.json({ url: null });
         }
     });
 
@@ -2346,8 +2354,7 @@ async function initWASocket() {
         }
         
         if (!msg) {
-            log('WARN', `Media failed: Message ${msgId} not found in history for ${normalizedJid}`);
-            return res.status(404).send('Message not found in history');
+            return res.status(404).json({ error: 'Media not found' });
         }
 
         // 2. Check composite cache by (mediaKey + messageTimestamp)

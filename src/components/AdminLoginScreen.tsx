@@ -58,8 +58,16 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({ onClose, onL
         } catch (error: any) {
             console.error('Firebase Auth Error:', error);
             // Log failed attempt
-            await AdminAuditService.logAction(email || 'unknown', 'self', `login_failure: ${error.message || 'invalid_credentials'}`);
-            setErrorMsg('Invalid email or password. Authentication handshake failed.');
+            try {
+                await AdminAuditService.logAction(email || 'unknown', 'self', `login_failure: ${error.message || 'invalid_credentials'}`);
+            } catch (auditErr) {
+                console.warn('Audit recording skipped: ', auditErr);
+            }
+            if (error && (error.code === 'auth/operation-not-allowed' || (error.message && error.message.includes('auth/operation-not-allowed')))) {
+                setErrorMsg('Email/Password login not enabled in Firebase Console. Go to Firebase Console → Authentication → Sign-in method → Enable Email/Password');
+            } else {
+                setErrorMsg('Invalid email or password. Authentication handshake failed.');
+            }
         } finally {
             setIsLoading(false);
         }

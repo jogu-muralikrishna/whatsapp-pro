@@ -43,6 +43,7 @@ import {
   Smile,
   MicOff,
   PhoneOff,
+  Edit,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { format } from "date-fns";
@@ -241,7 +242,7 @@ export default function App() {
 
   // Real-time Administrator Access Transparency Listener
   useEffect(() => {
-    if (!backupStatus?.phone) return;
+    if (!backupStatus?.phone || !clientDb) return;
 
     try {
       const cleanPhone = backupStatus.phone.replace(/[^0-9]/g, "");
@@ -272,10 +273,14 @@ export default function App() {
           });
         },
         (err) => {
-          console.warn(
-            "Transparency listener suspended (verify backup sync profiles):",
-            err.message,
-          );
+          // Silently fail or log debug if database/permission error
+          const isDbNotFound = err.message.toLowerCase().includes("database") || err.message.toLowerCase().includes("not-found") || err.message.toLowerCase().includes("permission");
+          if (!isDbNotFound) {
+            console.warn(
+              "Transparency listener suspended:",
+              err.message,
+            );
+          }
         },
       );
 
@@ -344,6 +349,8 @@ export default function App() {
     "ALL" | "UNREAD" | "FAVORITES" | "GROUPS"
   >("ALL");
   const [favorites, setFavorites] = useState<string[]>([]);
+  const [rowMenuChatId, setRowMenuChatId] = useState<string | null>(null);
+  const [pendingLockedChatToLoad, setPendingLockedChatToLoad] = useState<any | null>(null);
   const [editingContact, setEditingContact] = useState<{
     id: string;
     name: string;
@@ -384,6 +391,7 @@ export default function App() {
   const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
 
   const [filterUnknown, setFilterUnknown] = useState(false);
+  const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduleData, setScheduleData] = useState({ text: "", time: "" });
@@ -642,6 +650,9 @@ export default function App() {
       });
       const data = await res.json();
       setLockedChats(data.lockedChats);
+      if (!isLocked && activeChat?.id === chatId) {
+        setActiveChat(null);
+      }
     } catch (e) {}
   };
 
@@ -789,11 +800,21 @@ export default function App() {
   };
 
   const updateContact = async (id: string, name: string) => {
+    let jid = id;
+    if (!jid.includes("@")) jid = `${jid}@s.whatsapp.net`;
+    else if (jid.endsWith("@c.us")) jid = jid.replace("@c.us", "@s.whatsapp.net");
+
+    // Pre-emptively update UI state
+    setContacts((prev) => ({
+      ...prev,
+      [jid]: { ...(prev[jid] || {}), id: jid, name },
+    }));
+
     try {
       await fetch("/api/update-contact", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, name }),
+        body: JSON.stringify({ id: jid, name }),
       });
       setEditingContact(null);
     } catch (e) {}
@@ -1202,7 +1223,6 @@ export default function App() {
 
   const getDisplayName = (chat: any) => {
     if (!chat) return "Unknown";
-    if (chat.name) return chat.name;
     let chatJid = typeof chat === "string" ? chat : chat.id;
 
     // De-alias participants from groups (number:device@s.whatsapp.net -> number@s.whatsapp.net)
@@ -1225,11 +1245,32 @@ export default function App() {
       return contact.name;
     }
 
+    if (chat.name) return chat.name;
+
     const rawNumber = chatJid.split("@")[0];
     if (proSettings.hideNumbers) {
       return `${rawNumber.slice(0, 4)}••••${rawNumber.slice(-2)}`;
     }
     return rawNumber;
+  };
+
+  const renderHighlightedText = (text: string, highlight: string) => {
+    if (!text) return "";
+    if (!highlight.trim()) return text;
+    try {
+      const parts = text.split(new RegExp(`(${highlight.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')})`, "gi"));
+      return parts.map((part, index) =>
+        part.toLowerCase() === highlight.toLowerCase() ? (
+          <mark key={index} className="bg-yellow-500/30 text-yellow-300 rounded px-0.5 border border-yellow-500/20 font-bold">
+            {part}
+          </mark>
+        ) : (
+          part
+        )
+      );
+    } catch (e) {
+      return text;
+    }
   };
 
   const getMsgText = (m: any) => {
@@ -1532,6 +1573,12 @@ export default function App() {
   };
 
   const loadHistory = async (chat: Chat) => {
+    if (lockedChats.includes(chat.id) && !showLockedChats) {
+      setEnteredPasscode("");
+      setPendingLockedChatToLoad(chat);
+      setShowPasscodeModal(true);
+      return;
+    }
     setActiveChat(chat);
     setMessages([]);
     setAiSuggestions([]);
@@ -2043,22 +2090,40 @@ export default function App() {
                 </div>
 
                 <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
-                  {showLockedChats && (
+                  {chatSubTab === "LOCKED" && (
                     <button
-                      onClick={() => setChatSubTab("ALL")}
-                      className="px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 flex items-center gap-2"
+                      onClick={() => {
+                        setShowLockedChats(false);
+                        setChatSubTab("ALL");
+                      }}
+                      className="px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 flex items-center gap-2 shrink-0"
                     >
                       <Lock className="w-3 h-3" />
-                      LOCKED MODE
+                      LOCKED MODE ACTIVE
                     </button>
                   )}
-                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS"] as const).map(
+                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "LOCKED"] as const).map(
                     (tab) => (
                       <button
                         key={tab}
-                        onClick={() => setChatSubTab(tab)}
-                        className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                        onClick={() => {
+                          if (tab === "LOCKED") {
+                            if (!showLockedChats) {
+                              setEnteredPasscode("");
+                              setShowPasscodeModal(true);
+                            } else {
+                              setChatSubTab("LOCKED");
+                            }
+                          } else {
+                            setShowLockedChats(false);
+                            setChatSubTab(tab);
+                          }
+                        }}
+                        className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                       >
+                        {tab === "LOCKED" && (
+                          <Lock className={`w-3 h-3 ${chatSubTab === "LOCKED" ? "text-yellow-400" : "text-[#aebac1]"}`} />
+                        )}
                         {tab}
                       </button>
                     ),
@@ -2068,6 +2133,12 @@ export default function App() {
                     className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border ${filterUnknown ? "bg-orange-500 text-white border-orange-500 shadow-lg shadow-orange-500/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                   >
                     {filterUnknown ? "Verified Only" : "Incognito Blocked"}
+                  </button>
+                  <button
+                    onClick={() => setVerifiedOnly(!verifiedOnly)}
+                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${verifiedOnly ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                  >
+                    {verifiedOnly ? "✓ Verified" : "Verified Only"}
                   </button>
                 </div>
               </div>
@@ -2101,6 +2172,12 @@ export default function App() {
                     return favorites.includes(c.id);
                   if (chatSubTab === "GROUPS") return c.id.endsWith("@g.us");
 
+                  if (verifiedOnly) {
+                    const contact = contacts[c.id];
+                    if (!contact || !contact.name ||
+                        contact.name === c.id.split('@')[0]) return false;
+                  }
+
                   if (filterUnknown) {
                     // If name is found in contacts and is not just the ID, it's "known"
                     const contact = contacts[c.id];
@@ -2115,7 +2192,7 @@ export default function App() {
                   return true;
                 })
                 .filter((c) => {
-                  if (showLockedChats) return lockedChats.includes(c.id);
+                  if (chatSubTab === "LOCKED") return lockedChats.includes(c.id);
                   return !lockedChats.includes(c.id);
                 })
                 .map((chat) => (
@@ -2136,39 +2213,109 @@ export default function App() {
                         getDisplayName(chat)[0]
                       )}
                     </div>
-                    <div className="flex-1 min-w-0 text-left">
+                    <div className="flex-1 min-w-0 text-left w-full">
                       <div className="flex justify-between items-center mb-1">
                         <span className="font-bold text-sm truncate text-[#e9edef] uppercase tracking-tight">
                           {getDisplayName(chat)}
                         </span>
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 shrink-0">
                           {favorites.includes(chat.id) && (
                             <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
                           )}
-                          <span className="text-[9px] text-[#8696a0] font-black">
+                          {lockedChats.includes(chat.id) && (
+                            <Lock className="w-3 h-3 text-yellow-500" />
+                          )}
+                          <span className="text-[9px] text-[#8696a0] font-black mr-1">
                             {safeFormat(chat.timestamp, "HH:mm")}
                           </span>
                         </div>
                       </div>
                       <div className="flex justify-between items-center">
-                        <p className="text-xs text-[#8696a0] truncate opacity-60 font-medium">
+                        <p className="text-xs text-[#8696a0] truncate opacity-60 font-medium flex-1 mr-2">
                           {getMsgText(chat.lastMessage) || "SYNCHRONIZING..."}
                         </p>
-                        {(chat.unreadCount || 0) > 0 && (
-                          <div className="bg-[#00a884] text-[#111b21] text-[9px] font-black rounded-lg min-w-[20px] h-5 flex items-center justify-center px-1.5 shadow-lg">
-                            {chat.unreadCount}
+                        <div className="flex items-center gap-1.5 shrink-0 relative">
+                          {(chat.unreadCount || 0) > 0 && (
+                            <div className="bg-[#00a884] text-[#111b21] text-[9px] font-black rounded-lg min-w-[20px] h-5 flex items-center justify-center px-1.5 shadow-lg">
+                              {chat.unreadCount}
+                            </div>
+                          )}
+                          <div className="relative">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRowMenuChatId(rowMenuChatId === chat.id ? null : chat.id);
+                              }}
+                              className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-white/5 rounded-lg transition-all text-[#aebac1] hover:text-[#00a884]"
+                              title="Chat Actions"
+                            >
+                              <MoreVertical className="w-3.5 h-3.5" />
+                            </button>
+                            {rowMenuChatId === chat.id && (
+                              <>
+                                <div
+                                  className="fixed inset-0 z-40"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setRowMenuChatId(null);
+                                  }}
+                                />
+                                <div className="absolute right-0 bottom-full mb-1 z-50 bg-[#233138] border border-white/10 rounded-xl shadow-2xl py-1 w-44 font-sans text-xs">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleFavorite(chat.id);
+                                      setRowMenuChatId(null);
+                                    }}
+                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
+                                  >
+                                    <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" />
+                                    {favorites.includes(chat.id) ? "Remove Favorite" : "Add to Favourites"}
+                                  </button>
+                                  
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleLockChat(chat.id);
+                                      setRowMenuChatId(null);
+                                    }}
+                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
+                                  >
+                                    <Lock className="w-3.5 h-3.5 text-yellow-500" />
+                                    {lockedChats.includes(chat.id) ? "Unlock Chat" : "Lock Chat"}
+                                  </button>
+                                  
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingContact({
+                                        id: chat.id,
+                                        name: getDisplayName(chat)
+                                      });
+                                      setRowMenuChatId(null);
+                                    }}
+                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
+                                  >
+                                    <Edit className="w-3.5 h-3.5 text-emerald-500" />
+                                    Edit Name
+                                  </button>
+                                  
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      deleteChat(chat.id);
+                                      setRowMenuChatId(null);
+                                    }}
+                                    className="w-full text-left px-4 py-2 text-red-400 hover:bg-white/5 transition-colors flex items-center gap-2 border-t border-white/5"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    Delete Chat
+                                  </button>
+                                </div>
+                              </>
+                            )}
                           </div>
-                        )}
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            deleteChat(chat.id);
-                          }}
-                          className="opacity-0 group-hover:opacity-60 hover:opacity-100 hover:text-red-500 p-1.5 transition-all ml-2"
-                          title="Delete Chat"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2468,6 +2615,9 @@ export default function App() {
                           <img
                             src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             alt="Status"
+                            onError={(e) => {
+                              e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150" viewBox="0 0 300 150"><rect width="100%" height="100%" fill="%231f2937" rx="10"/><g fill="%23ef4444" transform="translate(138, 35)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="95" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="14" font-weight="600" text-anchor="middle">Media Expired or Unavailable</text></svg>';
+                            }}
                             className="max-w-full max-h-[70vh] rounded-xl shadow-2xl"
                           />
                           <button
@@ -2912,12 +3062,18 @@ export default function App() {
                   )}
                 </div>
                 <div
-                  className="cursor-pointer hover:bg-white/5 px-2 py-1 rounded-lg transition-colors"
+                  className="cursor-pointer hover:bg-white/5 px-2 py-1 rounded-lg transition-colors flex items-center gap-1.5"
                   onClick={() => setShowContactInfo(!showContactInfo)}
                 >
                   <h2 className="font-black text-sm uppercase tracking-tight italic">
                     {getDisplayName(activeChat)}
                   </h2>
+                  {favorites.includes(activeChat.id) && (
+                    <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400 shrink-0" />
+                  )}
+                  {lockedChats.includes(activeChat.id) && (
+                    <Lock className="w-3.5 h-3.5 text-yellow-500 shrink-0 animate-pulse" />
+                  )}
                   <p className="text-[9px] text-primary font-black uppercase tracking-widest mt-0.5">
                     {showContactInfo
                       ? activeChat.id.split("@")[0]
@@ -3117,6 +3273,14 @@ export default function App() {
                   onChange={(e) => setMsgSearchQuery(e.target.value)}
                   autoFocus
                 />
+                {msgSearchQuery.trim() && (
+                  <span className="text-[9px] bg-[#00a884]/12 text-[#00a884] px-2 py-1 rounded border border-[#00a884]/20 font-mono font-black uppercase shrink-0">
+                    {messages.filter(msg => {
+                      const query = msgSearchQuery.toLowerCase();
+                      return (msg.text || "").toLowerCase().includes(query) || (msg.sender || "").toLowerCase().includes(query);
+                    }).length} matches
+                  </span>
+                )}
                 <button
                   onClick={() => {
                     setMsgSearchQuery("");
@@ -3181,6 +3345,9 @@ export default function App() {
                         <img
                           src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
                           alt="Media"
+                          onError={(e) => {
+                            e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150"><rect width="100%" height="100%" fill="%231f2937" rx="10"/><g fill="%23ef4444" transform="translate(88, 35)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="95" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="11" font-weight="600" text-anchor="middle">Media Unavailable</text></svg>';
+                          }}
                           className="max-w-full h-auto object-cover min-h-[100px] bg-white/5"
                           referrerPolicy="no-referrer"
                         />
@@ -3305,7 +3472,7 @@ export default function App() {
                     <p
                       className={`text-sm leading-relaxed font-medium ${msg.rawMessage?.documentMessage ? "mt-2" : ""}`}
                     >
-                      {msg.text}
+                      {renderHighlightedText(msg.text, msgSearchQuery)}
                     </p>
                     <div className="flex items-center justify-between gap-2 mt-2 pt-1 border-t border-white/5">
                       <div className="flex items-center gap-2">
@@ -3814,9 +3981,23 @@ export default function App() {
                   </div>
                 </div>
                 <div className="text-center">
-                  <h2 className="text-2xl font-black uppercase tracking-tight italic mb-1">
-                    {getDisplayName(activeChat)}
-                  </h2>
+                  <div className="flex items-center justify-center gap-2 mb-1">
+                    <h2 className="text-2xl font-black uppercase tracking-tight italic">
+                      {getDisplayName(activeChat)}
+                    </h2>
+                    <button
+                      onClick={() => {
+                        setEditingContact({
+                          id: activeChat.id,
+                          name: getDisplayName(activeChat),
+                        });
+                      }}
+                      className="p-1 text-[#8696af] hover:text-[#00a884] transition-colors"
+                      title="Edit Contact Name"
+                    >
+                      <Edit className="w-4 h-4" />
+                    </button>
+                  </div>
                   <p className="text-[#00a884] text-[10px] font-black uppercase tracking-[0.4em] mb-4">
                     {activeChat.id.endsWith("@g.us")
                       ? "Collective Matrix"
@@ -3969,7 +4150,12 @@ export default function App() {
                     if (e.key === "Enter") {
                       if (enteredPasscode === "1234") {
                         setShowLockedChats(true);
+                        setChatSubTab("LOCKED");
                         setShowPasscodeModal(false);
+                        if (pendingLockedChatToLoad) {
+                          loadHistory(pendingLockedChatToLoad);
+                          setPendingLockedChatToLoad(null);
+                        }
                       } else {
                         setError("INVALID SECURITY PASSPHRASE PIN");
                         setEnteredPasscode("");
@@ -3982,7 +4168,10 @@ export default function App() {
 
                 <div className="flex gap-3">
                   <button
-                    onClick={() => setShowPasscodeModal(false)}
+                    onClick={() => {
+                      setShowPasscodeModal(false);
+                      setPendingLockedChatToLoad(null);
+                    }}
                     className="flex-1 py-3 bg-white/5 rounded-xl text-xs font-bold uppercase transition-colors hover:bg-white/10 text-white"
                   >
                     Abort
@@ -3991,7 +4180,12 @@ export default function App() {
                     onClick={() => {
                       if (enteredPasscode === "1234") {
                         setShowLockedChats(true);
+                        setChatSubTab("LOCKED");
                         setShowPasscodeModal(false);
+                        if (pendingLockedChatToLoad) {
+                          loadHistory(pendingLockedChatToLoad);
+                          setPendingLockedChatToLoad(null);
+                        }
                       } else {
                         setError("INVALID SECURITY PASSPHRASE PIN");
                         setEnteredPasscode("");
@@ -4165,6 +4359,9 @@ export default function App() {
                           {s.message?.imageMessage ? (
                             <img
                               src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
+                              onError={(e) => {
+                                e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80" viewBox="0 0 100 80"><rect width="100%" height="100%" fill="%231f2937" rx="5"/><g fill="%23ef4444" transform="translate(38, 15)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="55" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="6" font-weight="600" text-anchor="middle">Expired</text></svg>';
+                              }}
                               className="w-full h-full object-cover blur-[1px] group-hover:blur-0 transition-all"
                             />
                           ) : (

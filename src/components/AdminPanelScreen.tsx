@@ -34,6 +34,12 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         setErrorMsg('');
         setQueriedData(null);
 
+        if (!db) {
+            setErrorMsg('Firebase Firestore database not initialized. Offline / local mode only.');
+            setIsLoading(false);
+            return;
+        }
+
         try {
             // 1. Log query attempt
             await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_attempt');
