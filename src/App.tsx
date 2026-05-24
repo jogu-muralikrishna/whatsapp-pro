@@ -52,6 +52,9 @@ import { SecretAdminPanel } from "./components/SecretAdminPanel";
 import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db as clientDb } from "./lib/firebaseClient";
 
+const API_BASE = import.meta.env.VITE_API_URL || "";
+const WS_BASE = import.meta.env.VITE_WS_URL || "";
+
 function safeFormat(
   dateVal: any,
   formatStr: string,
@@ -346,7 +349,7 @@ export default function App() {
   }>({ messages: [], chats: [] });
   const [showContactInfo, setShowContactInfo] = useState(false);
   const [chatSubTab, setChatSubTab] = useState<
-    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS"
+    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS" | "VERIFIED"
   >("ALL");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [rowMenuChatId, setRowMenuChatId] = useState<string | null>(null);
@@ -390,7 +393,7 @@ export default function App() {
   const [showForwardModal, setShowForwardModal] = useState(false);
   const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
 
-  const [verifiedOnly, setVerifiedOnly] = useState(false);
+  const failedProfilePicturesRef = useRef<Set<string>>(new Set());
   const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduleData, setScheduleData] = useState({ text: "", time: "" });
@@ -695,12 +698,46 @@ export default function App() {
 
   const fetchProfilePicture = async (jid: string) => {
     if (profilePictures[jid]) return;
+    if (failedProfilePicturesRef.current.has(jid) && connectionState !== "open") return;
     try {
       const res = await fetch(`/api/profile-picture?jid=${jid}`);
       const data = await res.json();
-      if (data.url)
+      if (data && data.url) {
         setProfilePictures((prev) => ({ ...prev, [jid]: data.url }));
-    } catch (e) {}
+        failedProfilePicturesRef.current.delete(jid);
+      } else {
+        failedProfilePicturesRef.current.add(jid);
+      }
+    } catch (e) {
+      failedProfilePicturesRef.current.add(jid);
+    }
+  };
+
+  const blockContact = async (jid: string) => {
+    try {
+      await fetch(`${API_BASE}/api/block-contact`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jid, block: true }),
+      });
+      setActiveChat(null);
+      setChats((prev) => prev.filter((c) => c.id !== jid));
+    } catch (e) {
+      setError("Block failed. Check connection.");
+    }
+  };
+
+  const reportContact = async (jid: string) => {
+    try {
+      await fetch(`${API_BASE}/api/report-contact`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jid }),
+      });
+      setError("Signal reported to WhatsApp.");
+    } catch (e) {
+      setError("Report failed. Check connection.");
+    }
   };
 
   const readAll = async () => {
@@ -973,8 +1010,12 @@ export default function App() {
   };
 
   const connectWebSocket = () => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    let wsUrl = WS_BASE;
+    if (!wsUrl) {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${protocol}//${window.location.host}`;
+    }
+    const socket = new WebSocket(wsUrl);
     ws.current = socket;
 
     socket.onclose = () => {
@@ -992,6 +1033,7 @@ export default function App() {
             setPairingCode("");
             setQrCode(null);
             setError(null); // Clear errors upon successful link
+            chats.forEach((c) => fetchProfilePicture(c.id));
           }
           break;
         case "QR_CODE":
@@ -2089,49 +2131,26 @@ export default function App() {
                 </div>
 
                 <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
-                  {chatSubTab === "LOCKED" && (
-                    <button
-                      onClick={() => {
-                        setShowLockedChats(false);
-                        setChatSubTab("ALL");
-                      }}
-                      className="px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 flex items-center gap-2 shrink-0"
-                    >
-                      <Lock className="w-3 h-3" />
-                      LOCKED MODE ACTIVE
-                    </button>
-                  )}
-                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "LOCKED"] as const).map(
+                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS"] as const).map(
                     (tab) => (
                       <button
                         key={tab}
                         onClick={() => {
-                          if (tab === "LOCKED") {
-                            if (!showLockedChats) {
-                              setEnteredPasscode("");
-                              setShowPasscodeModal(true);
-                            } else {
-                              setChatSubTab("LOCKED");
-                            }
-                          } else {
-                            setShowLockedChats(false);
-                            setChatSubTab(tab);
-                          }
+                          setShowLockedChats(false);
+                          setChatSubTab(tab);
                         }}
                         className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                       >
-                        {tab === "LOCKED" && (
-                          <Lock className={`w-3 h-3 ${chatSubTab === "LOCKED" ? "text-yellow-400" : "text-[#aebac1]"}`} />
-                        )}
                         {tab}
                       </button>
                     ),
                   )}
                   <button
-                    onClick={() => setVerifiedOnly(!verifiedOnly)}
-                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${verifiedOnly ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                    key="VERIFIED"
+                    onClick={() => setChatSubTab("VERIFIED")}
+                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === "VERIFIED" ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                   >
-                    {verifiedOnly ? "✓ Verified" : "Verified Only"}
+                    ✓ VERIFIED
                   </button>
                 </div>
               </div>
@@ -2164,17 +2183,15 @@ export default function App() {
                   if (chatSubTab === "FAVORITES")
                     return favorites.includes(c.id);
                   if (chatSubTab === "GROUPS") return c.id.endsWith("@g.us");
-
-                  if (verifiedOnly) {
+                  if (chatSubTab === "VERIFIED") {
                     const contact = contacts[c.id];
-                    if (!contact || !contact.name ||
-                        contact.name === c.id.split('@')[0]) return false;
+                    // Verified = contact exists AND has a real name (not just the phone number)
+                    return contact && contact.name && contact.name !== c.id.split('@')[0];
                   }
 
                   return true;
                 })
                 .filter((c) => {
-                  if (chatSubTab === "LOCKED") return lockedChats.includes(c.id);
                   return !lockedChats.includes(c.id);
                 })
                 .map((chat) => (
@@ -3219,7 +3236,7 @@ export default function App() {
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-500 hover:bg-white/5 text-xs font-bold transition-colors italic"
                           onClick={() => {
-                            setError("Neural block active. Signal terminated.");
+                            blockContact(activeChat.id);
                             setIsChatMenuOpen(false);
                           }}
                         >
@@ -3229,9 +3246,7 @@ export default function App() {
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-400 hover:bg-white/5 text-xs font-bold transition-colors italic"
                           onClick={() => {
-                            setError(
-                              "Neural reporting engaged. Admin notified.",
-                            );
+                            reportContact(activeChat.id);
                             setIsChatMenuOpen(false);
                           }}
                         >

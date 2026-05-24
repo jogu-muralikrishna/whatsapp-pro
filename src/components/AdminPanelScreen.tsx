@@ -35,7 +35,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         setQueriedData(null);
 
         if (!db) {
-            setErrorMsg('Firebase Firestore database not initialized. Offline / local mode only.');
+            setErrorMsg('Firebase not configured. Check firebase-applet-config.json.');
             setIsLoading(false);
             return;
         }
@@ -60,6 +60,12 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 const settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/settings`, 'active'));
                 if (settingsDoc.exists()) {
                     result.settings = settingsDoc.data();
+                } else {
+                    // Fallback: try users/${cleanPhone}/settings (the document directly)
+                    const directDoc = await getDoc(doc(db, `users/${cleanPhone}`, 'settings'));
+                    if (directDoc.exists()) {
+                        result.settings = directDoc.data();
+                    }
                 }
             } catch (err) {
                 console.error('Failed to query settings backup:', err);
@@ -111,7 +117,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
             // Check if we hit nothing at all (empty backup)
             const totalRecords = (result.settings ? 1 : 0) + result.chats.length + result.messages.length + result.calls.length + result.status.length + result.groups.length;
             if (totalRecords === 0) {
-                setErrorMsg(`Uplink resolved with zero backup records cached under phone: +${cleanPhone}`);
+                setErrorMsg(`No data found for this phone number: +${cleanPhone}`);
                 await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_resolved_empty');
                 return;
             }

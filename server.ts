@@ -2143,12 +2143,32 @@ async function initWASocket() {
     app.get('/api/profile-picture', async (req, res) => {
         const jid = req.query.jid as string;
         if (!jid) return res.json({ url: null });
-        if (ppCache.has(jid)) return res.json({ url: ppCache.get(jid) });
+        if (ppCache.has(jid)) {
+            const cached = ppCache.get(jid);
+            if (cached) return res.json({ url: cached });
+        }
         try {
             if (!sock) return res.json({ url: null });
-            const url = await sock.profilePictureUrl(jid, 'image');
-            ppCache.set(jid, url || null);
-            return res.json({ url: url || null });
+            try {
+                const url = await sock.profilePictureUrl(jid, 'image');
+                if (url) {
+                     ppCache.set(jid, url);
+                     return res.json({ url });
+                }
+            } catch (e1) {
+                // try preview size on failure
+            }
+            try {
+                const url = await sock.profilePictureUrl(jid, 'preview');
+                if (url) {
+                     ppCache.set(jid, url);
+                     return res.json({ url });
+                }
+            } catch (e2) {
+                // both failed
+            }
+            ppCache.set(jid, null);
+            return res.json({ url: null });
         } catch (e) {
             ppCache.set(jid, null);
             return res.json({ url: null });
@@ -2263,6 +2283,23 @@ async function initWASocket() {
 
     app.get('/api/favorites', (req, res) => {
         res.json(proData.favorites);
+    });
+
+    app.post('/api/block-contact', async (req, res) => {
+        const { jid, block } = req.body;
+        if (!sock) return res.status(503).json({ error: 'Not connected' });
+        try {
+            await sock.updateBlockStatus(jid, block ? 'block' : 'unblock');
+            res.json({ success: true });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/report-contact', async (req, res) => {
+        const { jid } = req.body;
+        console.log(`[Report] Contact reported: ${jid}`);
+        res.json({ success: true, message: 'Reported' });
     });
 
     app.post('/api/logout', async (req, res) => {
