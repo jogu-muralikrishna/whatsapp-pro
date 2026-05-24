@@ -52,9 +52,6 @@ import { SecretAdminPanel } from "./components/SecretAdminPanel";
 import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db as clientDb } from "./lib/firebaseClient";
 
-const API_BASE = import.meta.env.VITE_API_URL || "";
-const WS_BASE = import.meta.env.VITE_WS_URL || "";
-
 function safeFormat(
   dateVal: any,
   formatStr: string,
@@ -210,7 +207,7 @@ export default function App() {
     formData.append("type", uploadFileType);
 
     try {
-      const res = await fetch("/api/send-media", {
+      const res = await fetch(`${API_BASE}/api/send-media`, {
         method: "POST",
         body: formData,
       });
@@ -304,7 +301,7 @@ export default function App() {
 
   const fetchBackupStatus = async () => {
     try {
-      const res = await fetch("/api/firebase-backup/status");
+      const res = await fetch(`${API_BASE}/api/firebase-backup/status`);
       const data = await res.json();
       if (res.ok) {
         setBackupStatus(data);
@@ -349,7 +346,7 @@ export default function App() {
   }>({ messages: [], chats: [] });
   const [showContactInfo, setShowContactInfo] = useState(false);
   const [chatSubTab, setChatSubTab] = useState<
-    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS" | "VERIFIED"
+    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS"
   >("ALL");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [rowMenuChatId, setRowMenuChatId] = useState<string | null>(null);
@@ -393,7 +390,7 @@ export default function App() {
   const [showForwardModal, setShowForwardModal] = useState(false);
   const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
 
-  const failedProfilePicturesRef = useRef<Set<string>>(new Set());
+  const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduleData, setScheduleData] = useState({ text: "", time: "" });
@@ -516,7 +513,7 @@ export default function App() {
 
   const fetchAutoReplies = async () => {
     try {
-      const res = await fetch("/api/auto-replies");
+      const res = await fetch(`${API_BASE}/api/auto-replies`);
       const data = await res.json();
       setAutoReplies(data);
     } catch (e) {}
@@ -524,7 +521,7 @@ export default function App() {
 
   const fetchScheduledMsgs = async () => {
     try {
-      const res = await fetch("/api/scheduled-messages");
+      const res = await fetch(`${API_BASE}/api/scheduled-messages`);
       const data = await res.json();
       setScheduledMsgs(data);
     } catch (e) {}
@@ -586,7 +583,7 @@ export default function App() {
 
   const fetchStatusUpdates = async () => {
     try {
-      const res = await fetch("/api/status-updates");
+      const res = await fetch(`${API_BASE}/api/status-updates`);
       const data = await res.json();
       setStatusUpdates(data.active || []);
       setInterceptedStatuses(data.intercepted || []);
@@ -595,7 +592,7 @@ export default function App() {
 
   const fetchCallHistory = async () => {
     try {
-      const res = await fetch("/api/history/calls");
+      const res = await fetch(`${API_BASE}/api/history/calls`);
       const data = await res.json();
       setCallHistory(data);
     } catch (e) {}
@@ -603,7 +600,7 @@ export default function App() {
 
   const fetchRecycleBin = async () => {
     try {
-      const res = await fetch("/api/recycle-bin");
+      const res = await fetch(`${API_BASE}/api/recycle-bin`);
       const data = await res.json();
       setRecycleBinData(data);
     } catch (e) {}
@@ -611,7 +608,7 @@ export default function App() {
 
   const fetchSettings = async () => {
     try {
-      const res = await fetch("/api/settings");
+      const res = await fetch(`${API_BASE}/api/settings`);
       const data = await res.json();
       setProSettings(data);
     } catch (e) {}
@@ -619,7 +616,7 @@ export default function App() {
 
   const fetchFavorites = async () => {
     try {
-      const res = await fetch("/api/favorites");
+      const res = await fetch(`${API_BASE}/api/favorites`);
       const data = await res.json();
       setFavorites(data);
     } catch (e) {}
@@ -627,7 +624,7 @@ export default function App() {
 
   const fetchLockedChats = async () => {
     try {
-      const res = await fetch("/api/locked-chats");
+      const res = await fetch(`${API_BASE}/api/locked-chats`);
       const data = await res.json();
       setLockedChats(data);
     } catch (e) {}
@@ -636,7 +633,7 @@ export default function App() {
   const fetchGroupMetadata = async (jid: string) => {
     if (!jid.endsWith("@g.us")) return;
     try {
-      const res = await fetch(`/api/group-metadata/${jid}`);
+      const res = await fetch(`${API_BASE}/api/group-metadata/${jid}`);
       const data = await res.json();
       setGroupMetadata(data);
     } catch (e) {}
@@ -645,7 +642,7 @@ export default function App() {
   const toggleLockChat = async (chatId: string) => {
     const isLocked = lockedChats.includes(chatId);
     try {
-      const res = await fetch("/api/lock-chat", {
+      const res = await fetch(`${API_BASE}/api/lock-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId, lock: !isLocked }),
@@ -661,7 +658,7 @@ export default function App() {
   const updateProfile = async () => {
     setLoading(true);
     try {
-      await fetch("/api/update-profile", {
+      await fetch(`${API_BASE}/api/update-profile`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: profileName, bio: profileBio }),
@@ -680,7 +677,7 @@ export default function App() {
     reader.onload = async (re: any) => {
       const base64 = re.target.result;
       try {
-        const res = await fetch("/api/update-profile-picture", {
+        const res = await fetch(`${API_BASE}/api/update-profile-picture`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ image: base64 }),
@@ -698,52 +695,18 @@ export default function App() {
 
   const fetchProfilePicture = async (jid: string) => {
     if (profilePictures[jid]) return;
-    if (failedProfilePicturesRef.current.has(jid) && connectionState !== "open") return;
     try {
-      const res = await fetch(`/api/profile-picture?jid=${jid}`);
+      const res = await fetch(`${API_BASE}/api/profile-picture?jid=${jid}`);
       const data = await res.json();
-      if (data && data.url) {
+      if (data.url)
         setProfilePictures((prev) => ({ ...prev, [jid]: data.url }));
-        failedProfilePicturesRef.current.delete(jid);
-      } else {
-        failedProfilePicturesRef.current.add(jid);
-      }
-    } catch (e) {
-      failedProfilePicturesRef.current.add(jid);
-    }
-  };
-
-  const blockContact = async (jid: string) => {
-    try {
-      await fetch(`${API_BASE}/api/block-contact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid, block: true }),
-      });
-      setActiveChat(null);
-      setChats((prev) => prev.filter((c) => c.id !== jid));
-    } catch (e) {
-      setError("Block failed. Check connection.");
-    }
-  };
-
-  const reportContact = async (jid: string) => {
-    try {
-      await fetch(`${API_BASE}/api/report-contact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid }),
-      });
-      setError("Signal reported to WhatsApp.");
-    } catch (e) {
-      setError("Report failed. Check connection.");
-    }
+    } catch (e) {}
   };
 
   const readAll = async () => {
     try {
       setChats((prev) => prev.map((c) => ({ ...c, unreadCount: 0 })));
-      await fetch("/api/read-all", { method: "POST" });
+      await fetch(`${API_BASE}/api/read-all`, { method: "POST" });
     } catch (e) {}
   };
 
@@ -767,7 +730,7 @@ export default function App() {
     setActiveCallSession(finalSession);
 
     try {
-      const res = await fetch("/api/add-call", {
+      const res = await fetch(`${API_BASE}/api/add-call`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -791,7 +754,7 @@ export default function App() {
 
   const restoreChat = async (chatId: string) => {
     try {
-      await fetch("/api/restore-chat", {
+      await fetch(`${API_BASE}/api/restore-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -803,7 +766,7 @@ export default function App() {
 
   const restoreMessage = async (msgId: string) => {
     try {
-      await fetch("/api/restore-message", {
+      await fetch(`${API_BASE}/api/restore-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ msgId }),
@@ -814,7 +777,7 @@ export default function App() {
 
   const toggleFavorite = async (chatId: string) => {
     try {
-      const res = await fetch("/api/favorite-chat", {
+      const res = await fetch(`${API_BASE}/api/favorite-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -826,7 +789,7 @@ export default function App() {
 
   const clearChat = async (chatId: string) => {
     try {
-      await fetch("/api/clear-chat", {
+      await fetch(`${API_BASE}/api/clear-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -847,7 +810,7 @@ export default function App() {
     }));
 
     try {
-      await fetch("/api/update-contact", {
+      await fetch(`${API_BASE}/api/update-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: jid, name }),
@@ -863,7 +826,7 @@ export default function App() {
   ) => {
     try {
       const res = await fetch(
-        `/api/media?msgId=${msgId}&chatId=${chatId}&download=true`,
+        `${API_BASE}/api/media?msgId=${msgId}&chatId=${chatId}&download=true`,
       );
       if (!res.ok) {
         const errorData = await res.text();
@@ -899,7 +862,7 @@ export default function App() {
     const newSettings = { ...proSettings, ...updates };
     setProSettings(newSettings);
     try {
-      await fetch("/api/settings", {
+      await fetch(`${API_BASE}/api/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(newSettings),
@@ -915,7 +878,7 @@ export default function App() {
 
   const fetchLogs = async () => {
     try {
-      const res = await fetch("/api/engine-logs");
+      const res = await fetch(`${API_BASE}/api/engine-logs`);
       const data = await res.json();
       setEngineLogs(data);
     } catch (e) {}
@@ -924,7 +887,7 @@ export default function App() {
   const addAutoReply = async () => {
     if (!newAutoReply.keyword || !newAutoReply.response) return;
     try {
-      await fetch("/api/auto-replies", {
+      await fetch(`${API_BASE}/api/auto-replies`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(newAutoReply),
@@ -942,7 +905,7 @@ export default function App() {
       return;
     }
     try {
-      await fetch("/api/schedule-message", {
+      await fetch(`${API_BASE}/api/schedule-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...scheduleData, jid: targetJid }),
@@ -956,7 +919,7 @@ export default function App() {
 
   const checkConnectionStatus = async () => {
     try {
-      const res = await fetch("/api/connection-status");
+      const res = await fetch(`${API_BASE}/api/connection-status`);
       const data = await res.json();
       setConnectionState(data.state);
       if (data.statusUpdates) setStatusUpdates(data.statusUpdates);
@@ -983,7 +946,7 @@ export default function App() {
     setIsRefreshing(true);
     setQrCode(null);
     try {
-      await fetch("/api/refresh-qr");
+      await fetch(`${API_BASE}/api/refresh-qr`);
       // The socket will re-init and broadcast a new QR
     } catch (e) {
       setError("Failed to refresh engine");
@@ -996,7 +959,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      await fetch("/api/logout", { method: "POST" });
+      await fetch(`${API_BASE}/api/logout`, { method: "POST" });
       setUser(null);
       setChats([]);
       setActiveChat(null);
@@ -1010,12 +973,8 @@ export default function App() {
   };
 
   const connectWebSocket = () => {
-    let wsUrl = WS_BASE;
-    if (!wsUrl) {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      wsUrl = `${protocol}//${window.location.host}`;
-    }
-    const socket = new WebSocket(wsUrl);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
     ws.current = socket;
 
     socket.onclose = () => {
@@ -1033,7 +992,6 @@ export default function App() {
             setPairingCode("");
             setQrCode(null);
             setError(null); // Clear errors upon successful link
-            chats.forEach((c) => fetchProfilePicture(c.id));
           }
           break;
         case "QR_CODE":
@@ -1347,7 +1305,7 @@ export default function App() {
         reader.onload = async () => {
           const base64 = reader.result as string;
           if (activeChat) {
-            await fetch("/api/send-audio", {
+            await fetch(`${API_BASE}/api/send-audio`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -1387,7 +1345,7 @@ export default function App() {
   const forwardMessage = async (targetJid: string) => {
     if (!forwardMsg || !activeChat) return;
     try {
-      await fetch("/api/forward-message", {
+      await fetch(`${API_BASE}/api/forward-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1418,7 +1376,7 @@ export default function App() {
     );
 
     try {
-      await fetch("/api/react-message", {
+      await fetch(`${API_BASE}/api/react-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1435,7 +1393,7 @@ export default function App() {
     if (!activeStatus || !statusReplyText.trim()) return;
     try {
       const targetJid = activeStatus.participant;
-      await fetch("/api/send-message", {
+      await fetch(`${API_BASE}/api/send-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1467,7 +1425,7 @@ export default function App() {
     caption?: string,
   ) => {
     try {
-      await fetch("/api/post-status", {
+      await fetch(`${API_BASE}/api/post-status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ type, content, caption }),
@@ -1482,7 +1440,7 @@ export default function App() {
 
   const markStatusSeen = async (status: any) => {
     try {
-      await fetch("/api/read-status", {
+      await fetch(`${API_BASE}/api/read-status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1502,7 +1460,7 @@ export default function App() {
     if (!text || text.length < 5) return;
     setIsAiLoading(true);
     try {
-      const res = await fetch("/api/ai-suggestion", {
+      const res = await fetch(`${API_BASE}/api/ai-suggestion`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
@@ -1526,7 +1484,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/request-pairing-code", {
+      const res = await fetch(`${API_BASE}/api/request-pairing-code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phoneNumber }),
@@ -1556,7 +1514,7 @@ export default function App() {
     setAiSuggestions([]);
 
     try {
-      const res = await fetch("/api/send-message", {
+      const res = await fetch(`${API_BASE}/api/send-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid: activeChat.id, text: newMessage }),
@@ -1590,7 +1548,7 @@ export default function App() {
 
   const deleteChat = async (chatId: string) => {
     try {
-      await fetch("/api/delete-chat", {
+      await fetch(`${API_BASE}/api/delete-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -1603,7 +1561,7 @@ export default function App() {
   const deleteMessage = async (msgId: string, revoke: boolean = false) => {
     if (!activeChat) return;
     try {
-      await fetch("/api/delete-message", {
+      await fetch(`${API_BASE}/api/delete-message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId: activeChat.id, msgId, revoke }),
@@ -1630,7 +1588,7 @@ export default function App() {
       fetchGroupMetadata(chat.id);
     }
     try {
-      const res = await fetch(`/api/history/${chat.id}`);
+      const res = await fetch(`${API_BASE}/api/history/${chat.id}`);
       const data = await res.json();
       const formatted = data.map((m: any) => {
         // Resolve sender name for group chats
@@ -1659,7 +1617,7 @@ export default function App() {
 
         // Mark as read if not in ghost mode
         if (!proSettings.ghostMode) {
-          fetch("/api/read-chat", {
+          fetch(`${API_BASE}/api/read-chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -2131,26 +2089,49 @@ export default function App() {
                 </div>
 
                 <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
-                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS"] as const).map(
+                  {chatSubTab === "LOCKED" && (
+                    <button
+                      onClick={() => {
+                        setShowLockedChats(false);
+                        setChatSubTab("ALL");
+                      }}
+                      className="px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 flex items-center gap-2 shrink-0"
+                    >
+                      <Lock className="w-3 h-3" />
+                      LOCKED MODE ACTIVE
+                    </button>
+                  )}
+                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "LOCKED"] as const).map(
                     (tab) => (
                       <button
                         key={tab}
                         onClick={() => {
-                          setShowLockedChats(false);
-                          setChatSubTab(tab);
+                          if (tab === "LOCKED") {
+                            if (!showLockedChats) {
+                              setEnteredPasscode("");
+                              setShowPasscodeModal(true);
+                            } else {
+                              setChatSubTab("LOCKED");
+                            }
+                          } else {
+                            setShowLockedChats(false);
+                            setChatSubTab(tab);
+                          }
                         }}
                         className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                       >
+                        {tab === "LOCKED" && (
+                          <Lock className={`w-3 h-3 ${chatSubTab === "LOCKED" ? "text-yellow-400" : "text-[#aebac1]"}`} />
+                        )}
                         {tab}
                       </button>
                     ),
                   )}
                   <button
-                    key="VERIFIED"
-                    onClick={() => setChatSubTab("VERIFIED")}
-                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === "VERIFIED" ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                    onClick={() => setVerifiedOnly(!verifiedOnly)}
+                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${verifiedOnly ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                   >
-                    ✓ VERIFIED
+                    {verifiedOnly ? "✓ Verified" : "Verified Only"}
                   </button>
                 </div>
               </div>
@@ -2183,15 +2164,17 @@ export default function App() {
                   if (chatSubTab === "FAVORITES")
                     return favorites.includes(c.id);
                   if (chatSubTab === "GROUPS") return c.id.endsWith("@g.us");
-                  if (chatSubTab === "VERIFIED") {
+
+                  if (verifiedOnly) {
                     const contact = contacts[c.id];
-                    // Verified = contact exists AND has a real name (not just the phone number)
-                    return contact && contact.name && contact.name !== c.id.split('@')[0];
+                    if (!contact || !contact.name ||
+                        contact.name === c.id.split('@')[0]) return false;
                   }
 
                   return true;
                 })
                 .filter((c) => {
+                  if (chatSubTab === "LOCKED") return lockedChats.includes(c.id);
                   return !lockedChats.includes(c.id);
                 })
                 .map((chat) => (
@@ -2542,7 +2525,7 @@ export default function App() {
                       {activeStatus.message?.videoMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <video
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`${API_BASE}/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             onError={(e) => { e.currentTarget.style.display='none'; }}
                             controls
                             autoPlay
@@ -2592,7 +2575,7 @@ export default function App() {
                         <div className="bg-white/10 p-8 rounded-3xl backdrop-blur-xl flex flex-col items-center gap-4">
                           <Mic className="w-12 h-12 text-[#00a884] animate-pulse" />
                           <audio
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`${API_BASE}/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             controls
                             autoPlay
                             onPlay={() => setIsStatusPaused(false)}
@@ -2613,7 +2596,7 @@ export default function App() {
                       {activeStatus.message?.imageMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <img
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`${API_BASE}/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             alt="Status"
                             onError={(e) => {
                               e.currentTarget.style.display = 'none';
@@ -3236,7 +3219,7 @@ export default function App() {
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-500 hover:bg-white/5 text-xs font-bold transition-colors italic"
                           onClick={() => {
-                            blockContact(activeChat.id);
+                            setError("Neural block active. Signal terminated.");
                             setIsChatMenuOpen(false);
                           }}
                         >
@@ -3246,7 +3229,9 @@ export default function App() {
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-400 hover:bg-white/5 text-xs font-bold transition-colors italic"
                           onClick={() => {
-                            reportContact(activeChat.id);
+                            setError(
+                              "Neural reporting engaged. Admin notified.",
+                            );
                             setIsChatMenuOpen(false);
                           }}
                         >
@@ -3341,7 +3326,7 @@ export default function App() {
                     {msg.rawMessage?.imageMessage && (
                       <div className="mb-2 rounded-lg overflow-hidden border border-white/5 relative group/img">
                         <img
-                          src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
+                          src={`${API_BASE}/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
                           alt="Media"
                           onError={(e) => {
                             e.currentTarget.style.display = 'none';
@@ -3428,7 +3413,7 @@ export default function App() {
                           <button
                             onClick={async () => {
                               const res = await fetch(
-                                `/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
+                                `${API_BASE}/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
                               );
                               const blob = await res.blob();
                               const url = URL.createObjectURL(blob);
@@ -4356,7 +4341,7 @@ export default function App() {
                         >
                           {s.message?.imageMessage ? (
                             <img
-                              src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
+                              src={`${API_BASE}/api/media?msgId=${s.id}&chatId=status@broadcast`}
                               onError={(e) => {
                                 e.currentTarget.style.display = 'none';
                               }}
@@ -5182,7 +5167,7 @@ export default function App() {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            "/api/firebase-backup/backup",
+                                            `${API_BASE}/api/firebase-backup/backup`,
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
@@ -5210,7 +5195,7 @@ export default function App() {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            "/api/firebase-backup/restore",
+                                            `${API_BASE}/api/firebase-backup/restore`,
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
@@ -5480,7 +5465,7 @@ export default function App() {
                     <div className="flex items-center gap-3">
                       <button
                         onClick={async () => {
-                          await fetch("/api/auto-replies/toggle", {
+                          await fetch(`${API_BASE}/api/auto-replies/toggle`, {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ keyword: r.keyword }),
@@ -5495,7 +5480,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={async () => {
-                          await fetch(`/api/auto-replies/${r.keyword}`, {
+                          await fetch(`${API_BASE}/api/auto-replies/${r.keyword}`, {
                             method: "DELETE",
                           });
                           fetchAutoReplies();
