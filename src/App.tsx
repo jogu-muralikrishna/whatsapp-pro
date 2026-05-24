@@ -390,7 +390,6 @@ export default function App() {
   const [showForwardModal, setShowForwardModal] = useState(false);
   const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
 
-  const [filterUnknown, setFilterUnknown] = useState(false);
   const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -2129,12 +2128,6 @@ export default function App() {
                     ),
                   )}
                   <button
-                    onClick={() => setFilterUnknown(!filterUnknown)}
-                    className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border ${filterUnknown ? "bg-orange-500 text-white border-orange-500 shadow-lg shadow-orange-500/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
-                  >
-                    {filterUnknown ? "Verified Only" : "Incognito Blocked"}
-                  </button>
-                  <button
                     onClick={() => setVerifiedOnly(!verifiedOnly)}
                     className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${verifiedOnly ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                   >
@@ -2176,17 +2169,6 @@ export default function App() {
                     const contact = contacts[c.id];
                     if (!contact || !contact.name ||
                         contact.name === c.id.split('@')[0]) return false;
-                  }
-
-                  if (filterUnknown) {
-                    // If name is found in contacts and is not just the ID, it's "known"
-                    const contact = contacts[c.id];
-                    if (
-                      !contact ||
-                      !contact.name ||
-                      contact.name === c.id.split("@")[0]
-                    )
-                      return false;
                   }
 
                   return true;
@@ -2544,6 +2526,7 @@ export default function App() {
                         <div className="flex flex-col items-center gap-4">
                           <video
                             src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            onError={(e) => { e.currentTarget.style.display='none'; }}
                             controls
                             autoPlay
                             playsInline
@@ -2616,7 +2599,7 @@ export default function App() {
                             src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             alt="Status"
                             onError={(e) => {
-                              e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150" viewBox="0 0 300 150"><rect width="100%" height="100%" fill="%231f2937" rx="10"/><g fill="%23ef4444" transform="translate(138, 35)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="95" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="14" font-weight="600" text-anchor="middle">Media Expired or Unavailable</text></svg>';
+                              e.currentTarget.style.display = 'none';
                             }}
                             className="max-w-full max-h-[70vh] rounded-xl shadow-2xl"
                           />
@@ -3346,7 +3329,7 @@ export default function App() {
                           src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
                           alt="Media"
                           onError={(e) => {
-                            e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150"><rect width="100%" height="100%" fill="%231f2937" rx="10"/><g fill="%23ef4444" transform="translate(88, 35)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="95" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="11" font-weight="600" text-anchor="middle">Media Unavailable</text></svg>';
+                            e.currentTarget.style.display = 'none';
                           }}
                           className="max-w-full h-auto object-cover min-h-[100px] bg-white/5"
                           referrerPolicy="no-referrer"
@@ -4360,7 +4343,7 @@ export default function App() {
                             <img
                               src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
                               onError={(e) => {
-                                e.currentTarget.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80" viewBox="0 0 100 80"><rect width="100%" height="100%" fill="%231f2937" rx="5"/><g fill="%23ef4444" transform="translate(38, 15)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></g><text x="50%" y="55" fill="%23f3f4f6" font-family="Inter, sans-serif" font-size="6" font-weight="600" text-anchor="middle">Expired</text></svg>';
+                                e.currentTarget.style.display = 'none';
                               }}
                               className="w-full h-full object-cover blur-[1px] group-hover:blur-0 transition-all"
                             />

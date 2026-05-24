@@ -40,6 +40,8 @@ import {
     checkQuotaError,
     isSyncPermitted
 } from './server_backup';
+import { DatabaseService } from './src/DatabaseService.js';
+import { adminRouter } from './src/adminRouter.js';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
@@ -435,6 +437,8 @@ async function startServer() {
     const wss = new WebSocketServer({ server });
 
     app.use(express.json());
+    app.use('/api/admin', adminRouter);
+    await DatabaseService.initDatabase();
 
     let latestVersion: any = undefined;
     try {
@@ -2134,26 +2138,20 @@ async function initWASocket() {
         res.json(metadata);
     });
 
-    const dpCache = new Map<string, string | null>();
+    const ppCache = new Map<string, string | null>();
 
     app.get('/api/profile-picture', async (req, res) => {
-        const { jid } = req.query;
-        if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
-        if (!jid) return res.status(400).send('Missing JID');
-        
-        const targetJid = normalizeJid(jid as string);
-
-        if (dpCache.has(targetJid)) {
-            return res.json({ url: dpCache.get(targetJid) || null });
-        }
-
+        const jid = req.query.jid as string;
+        if (!jid) return res.json({ url: null });
+        if (ppCache.has(jid)) return res.json({ url: ppCache.get(jid) });
         try {
-            const url = await sock.profilePictureUrl(targetJid, 'image');
-            dpCache.set(targetJid, url || null);
-            res.json({ url: url || null });
+            if (!sock) return res.json({ url: null });
+            const url = await sock.profilePictureUrl(jid, 'image');
+            ppCache.set(jid, url || null);
+            return res.json({ url: url || null });
         } catch (e) {
-            dpCache.set(targetJid, null);
-            res.json({ url: null });
+            ppCache.set(jid, null);
+            return res.json({ url: null });
         }
     });
 
@@ -2423,7 +2421,6 @@ async function initWASocket() {
                     const refreshErrStr = (refreshErr.message || '').toLowerCase();
                     const isMissing = refreshErrStr.includes('re-upload') || refreshErrStr.includes('404') || refreshErrStr.includes('410') || refreshErrStr.includes('expired');
                     if (isMissing) {
-                        log('WARN', `Media ${msgId} has expired permanently.`);
                         throw new Error('Media expired (re-upload not possible)');
                     }
                     log('ERROR', `Metadata refresh failed for ${msgId}: ${refreshErr.message}`);
@@ -2474,8 +2471,6 @@ async function initWASocket() {
                               errStr.includes('failed');
             
             if (isMissing) {
-                log('WARN', `Media expired or unavailable on WhatsApp [${msgId}]: ${err.message}`);
-                
                 // Mark the media as "EXPIRED" in local DB
                 msg.mediaExpired = true;
                 if (msg.message) {

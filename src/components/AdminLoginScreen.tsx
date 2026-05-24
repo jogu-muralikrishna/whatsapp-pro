@@ -1,8 +1,5 @@
 import React, { useState } from 'react';
-import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import { ShieldAlert, LogIn, Mail, Key, X, CornerDownLeft } from 'lucide-react';
-import { auth } from '../lib/firebaseClient';
-import { AdminAuditService } from '../services/AdminAuditService';
 
 interface AdminLoginScreenProps {
     onClose: () => void;
@@ -18,56 +15,37 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({ onClose, onL
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!email || !password) return;
-
         setIsLoading(true);
         setErrorMsg('');
-
-        // Pre-approved admin bypass with 100% reliability
-        const normalizedEmail = email.trim().toLowerCase();
-        const isBypassEmail = normalizedEmail === 'whatsapppro.@gmail.com' || normalizedEmail === 'whatsapppro@gmail.com';
-        const isBypassPassword = password === 'murali@93927';
-
-        if (isBypassEmail && isBypassPassword) {
-            try {
-                await AdminAuditService.logAction(email, 'self', 'login_success_bypass');
-            } catch (auditErr) {
-                console.warn('Audit recording skipped: ', auditErr);
-            }
-            onLoginSuccess(email);
-            setIsLoading(false);
-            return;
-        }
-
         try {
-            const userCredential = await signInWithEmailAndPassword(auth, email, password);
-            const idTokenResult = await userCredential.user.getIdTokenResult();
-            
-            // Check custom claims
-            const isAdmin = idTokenResult.claims.role === 'admin';
-            
-            if (isAdmin) {
-                // Log successful login
-                await AdminAuditService.logAction(email, 'self', 'login_success');
-                onLoginSuccess(email);
+            const res = await fetch('/api/admin/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: email.trim(), password })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                // Log action via API
+                try {
+                    await fetch('/api/admin/audit-log', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            email: email.trim(),
+                            targetPhone: 'self',
+                            action: 'login_success',
+                            timestamp: Date.now(),
+                            userAgent: navigator.userAgent
+                        })
+                    });
+                } catch (ae) {}
+
+                onLoginSuccess(email.trim());
             } else {
-                // Deny access and sign out
-                await AdminAuditService.logAction(email, 'self', 'login_denied_no_claim');
-                await signOut(auth);
-                setErrorMsg('Access Denied: Your account does not possess the designated "admin" authorization privilege.');
+                setErrorMsg(data.error || 'Invalid credentials.');
             }
-        } catch (error: any) {
-            console.error('Firebase Auth Error:', error);
-            // Log failed attempt
-            try {
-                await AdminAuditService.logAction(email || 'unknown', 'self', `login_failure: ${error.message || 'invalid_credentials'}`);
-            } catch (auditErr) {
-                console.warn('Audit recording skipped: ', auditErr);
-            }
-            if (error && (error.code === 'auth/operation-not-allowed' || (error.message && error.message.includes('auth/operation-not-allowed')))) {
-                setErrorMsg('Email/Password login not enabled in Firebase Console. Go to Firebase Console → Authentication → Sign-in method → Enable Email/Password');
-            } else {
-                setErrorMsg('Invalid email or password. Authentication handshake failed.');
-            }
+        } catch (err: any) {
+            setErrorMsg('Connection error. Try again.');
         } finally {
             setIsLoading(false);
         }

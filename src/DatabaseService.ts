@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import bcrypt from 'bcryptjs';
 
 const filePath = path.join(process.cwd(), 'pro_data.db.json');
 
@@ -50,7 +51,10 @@ export async function initDatabase(): Promise<void> {
 export async function seedDefaultAdmin(): Promise<void> {
   const admin = await getAdminByEmail('admin@pro.com');
   if (!admin) {
-    await createAdmin('admin@pro.com', 'admin123', 'Super Admin');
+    // Hash password with bcrypt for secure and exact prompt compatibility
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash('admin123', salt);
+    await createAdmin('admin@pro.com', passwordHash, 'Super Admin');
   }
 }
 
@@ -170,6 +174,7 @@ export async function createAdmin(email: string, passwordHashOrPlain: string, ro
   db.admins[email] = {
     email,
     password: passwordHashOrPlain,
+    password_hash: passwordHashOrPlain, // Support both named properties for absolute compatibility with route handlers
     role,
     createdAt: Date.now()
   };
