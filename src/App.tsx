@@ -52,6 +52,9 @@ import { SecretAdminPanel } from "./components/SecretAdminPanel";
 import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db as clientDb } from "./lib/firebaseClient";
 
+const API_BASE = import.meta.env.VITE_API_URL || "";
+const WS_BASE = import.meta.env.VITE_WS_URL || "";
+
 function safeFormat(
   dateVal: any,
   formatStr: string,
@@ -973,8 +976,12 @@ export default function App() {
   };
 
   const connectWebSocket = () => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    let wsUrl = WS_BASE;
+    if (!wsUrl) {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${protocol}//${window.location.host}`;
+    }
+    const socket = new WebSocket(wsUrl);
     ws.current = socket;
 
     socket.onclose = () => {
