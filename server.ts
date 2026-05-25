@@ -864,6 +864,7 @@ async function initWASocket() {
                     statusCode === 515 || // DisconnectReason.restartRequired
                     statusCode === 408 || // DisconnectReason.connectionLost / timedOut
                     statusCode === 428 || // DisconnectReason.connectionClosed
+                    statusCode === 500 || // Standard transient sub-socket disconnect
                     fullErrorString.includes('restart required') ||
                     fullErrorString.includes('connection lost') ||
                     fullErrorString.includes('connection closed') ||
@@ -873,7 +874,6 @@ async function initWASocket() {
 
                 const isStreamError = 
                     !isTransientReconnectRequest && (
-                        statusCode === 500 || 
                         fullErrorString.includes('stream errored') ||
                         fullErrorString.includes('xml-not-well-formed')
                     );
@@ -1743,6 +1743,45 @@ async function initWASocket() {
         res.status(404).json({ error: 'Chat not found' });
     });
 
+    app.post('/api/block-contact', async (req, res) => {
+        const { jid, block } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (sock) {
+                await sock.updateBlockStatus(jid, block ? 'block' : 'unblock');
+            }
+            await DatabaseService.insertAuditLog({
+                admin_email: 'SYSTEM',
+                target_phone: jid,
+                action: block ? 'Blocked BlockContact' : 'Unblocked BlockContact',
+                ip_address: '127.0.0.1',
+                user_agent: 'Server Interface'
+            });
+            return res.json({ status: 'success' });
+        } catch (e: any) {
+            console.error('Block contact error:', e);
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/report-contact', async (req, res) => {
+        const { jid } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            await DatabaseService.insertAuditLog({
+                admin_email: 'SYSTEM',
+                target_phone: jid,
+                action: 'Reported ReportContact',
+                ip_address: '127.0.0.1',
+                user_agent: 'Server Interface'
+            });
+            return res.json({ status: 'success' });
+        } catch (e: any) {
+            console.error('Report contact error:', e);
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
     app.post('/api/restore-chat', (req, res) => {
         const { chatId } = req.body;
         const chatIndex = proData.recycleBin.chats.findIndex(c => c.id === chatId);
@@ -2143,32 +2182,21 @@ async function initWASocket() {
     app.get('/api/profile-picture', async (req, res) => {
         const jid = req.query.jid as string;
         if (!jid) return res.json({ url: null });
-        if (ppCache.has(jid)) {
-            const cached = ppCache.get(jid);
-            if (cached) return res.json({ url: cached });
-        }
+        if (ppCache.has(jid)) return res.json({ url: ppCache.get(jid) });
         try {
             if (!sock) return res.json({ url: null });
+            let url: string | null = null;
             try {
-                const url = await sock.profilePictureUrl(jid, 'image');
-                if (url) {
-                     ppCache.set(jid, url);
-                     return res.json({ url });
+                url = await sock.profilePictureUrl(jid, 'image');
+            } catch (errImage) {
+                try {
+                    url = await sock.profilePictureUrl(jid, 'preview');
+                } catch (errPreview) {
+                    url = null;
                 }
-            } catch (e1) {
-                // try preview size on failure
             }
-            try {
-                const url = await sock.profilePictureUrl(jid, 'preview');
-                if (url) {
-                     ppCache.set(jid, url);
-                     return res.json({ url });
-                }
-            } catch (e2) {
-                // both failed
-            }
-            ppCache.set(jid, null);
-            return res.json({ url: null });
+            ppCache.set(jid, url || null);
+            return res.json({ url: url || null });
         } catch (e) {
             ppCache.set(jid, null);
             return res.json({ url: null });
@@ -2283,23 +2311,6 @@ async function initWASocket() {
 
     app.get('/api/favorites', (req, res) => {
         res.json(proData.favorites);
-    });
-
-    app.post('/api/block-contact', async (req, res) => {
-        const { jid, block } = req.body;
-        if (!sock) return res.status(503).json({ error: 'Not connected' });
-        try {
-            await sock.updateBlockStatus(jid, block ? 'block' : 'unblock');
-            res.json({ success: true });
-        } catch (e: any) {
-            res.status(500).json({ error: e.message });
-        }
-    });
-
-    app.post('/api/report-contact', async (req, res) => {
-        const { jid } = req.body;
-        console.log(`[Report] Contact reported: ${jid}`);
-        res.json({ success: true, message: 'Reported' });
     });
 
     app.post('/api/logout', async (req, res) => {

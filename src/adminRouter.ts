@@ -7,13 +7,13 @@ const router = express.Router();
 router.post('/login', async (req: any, res: any) => {
   const { email, password } = req.body;
   if (!email || !password) {
-    return res.status(400).json({ success: false, error: 'Missing email or password' });
+    return res.status(400).json({ error: 'Missing email or password' });
   }
 
   try {
     const admin = await DatabaseService.getAdminByEmail(email.trim());
     if (!admin) {
-      return res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
 
     // Verify signature
@@ -25,11 +25,11 @@ router.post('/login', async (req: any, res: any) => {
       if (password === admin.password || password === admin.password_hash) {
         return res.json({ success: true, email: admin.email, role: admin.role });
       }
-      return res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
   } catch (err: any) {
     console.error('Admin Login Error:', err);
-    return res.status(500).json({ success: false, error: 'Internal system verification malfunction.' });
+    return res.status(500).json({ error: 'Internal system verification malfunction.' });
   }
 });
 

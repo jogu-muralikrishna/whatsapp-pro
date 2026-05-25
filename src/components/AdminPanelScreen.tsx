@@ -23,22 +23,33 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     const [isCopySuccess, setIsCopySuccess] = useState(false);
 
     const handleSearch = async (e: React.FormEvent) => {
+        const setError = setErrorMsg;
+        if (!db) {
+            setError("Firebase not configured. Check firebase-applet-config.json.");
+            return;
+        }
         e.preventDefault();
-        const cleanPhone = searchPhone.replace(/[^0-9]/g, '');
+
+        // Strip all spaces, dashes, brackets, plus before processing
+        let cleanPhone = searchPhone.replace(/[\s\-\(\)\[\]\+]/g, '');
+        cleanPhone = cleanPhone.replace(/[^0-9]/g, '');
+
+        if (cleanPhone.startsWith('0')) {
+            cleanPhone = cleanPhone.substring(1);
+        }
+
+        if (cleanPhone.length === 10) {
+            cleanPhone = '91' + cleanPhone;
+        }
+
         if (!cleanPhone) {
-            setErrorMsg('Invalid look-up number layout provided.');
+            setError('Invalid look-up number layout provided.');
             return;
         }
 
         setIsLoading(true);
-        setErrorMsg('');
+        setError('');
         setQueriedData(null);
-
-        if (!db) {
-            setErrorMsg('Firebase not configured. Check firebase-applet-config.json.');
-            setIsLoading(false);
-            return;
-        }
 
         try {
             // 1. Log query attempt
@@ -55,16 +66,20 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 groups: []
             };
 
-            // Fetch Settings
+            // Fetch Settings - Try all fallback paths in order
             try {
-                const settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/settings`, 'active'));
-                if (settingsDoc.exists()) {
+                let settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/settings`, 'active'));
+                if (settingsDoc.exists() && settingsDoc.data()) {
                     result.settings = settingsDoc.data();
                 } else {
-                    // Fallback: try users/${cleanPhone}/settings (the document directly)
-                    const directDoc = await getDoc(doc(db, `users/${cleanPhone}`, 'settings'));
-                    if (directDoc.exists()) {
-                        result.settings = directDoc.data();
+                    const settingsDocFallback = await getDoc(doc(db, `users/${cleanPhone}/settings`));
+                    if (settingsDocFallback.exists() && settingsDocFallback.data()) {
+                        result.settings = settingsDocFallback.data();
+                    } else {
+                        const proDataDoc = await getDoc(doc(db, `users/${cleanPhone}/pro_data`));
+                        if (proDataDoc.exists() && proDataDoc.data()) {
+                            result.settings = proDataDoc.data();
+                        }
                     }
                 }
             } catch (err) {
@@ -79,12 +94,16 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 console.error('Failed to query chats backup:', err);
             }
 
-            // Fetch Messages
+            // Fetch Messages with inner try-catch isolation
             try {
                 for (const chat of result.chats) {
                     if (!chat.id) continue;
-                    const msgsSnap = await getDocs(collection(db, `users/${cleanPhone}/chats/${chat.id}/messages`));
-                    msgsSnap.forEach(d => result.messages.push(d.data()));
+                    try {
+                        const msgsSnap = await getDocs(collection(db, `users/${cleanPhone}/chats/${chat.id}/messages`));
+                        msgsSnap.forEach(d => result.messages.push(d.data()));
+                    } catch (chatMsgsErr) {
+                        console.error(`Failed to query messages for chat ${chat.id}:`, chatMsgsErr);
+                    }
                 }
             } catch (err) {
                 console.error('Failed to query messages backup:', err);
@@ -117,7 +136,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
             // Check if we hit nothing at all (empty backup)
             const totalRecords = (result.settings ? 1 : 0) + result.chats.length + result.messages.length + result.calls.length + result.status.length + result.groups.length;
             if (totalRecords === 0) {
-                setErrorMsg(`No data found for this phone number: +${cleanPhone}`);
+                setError("No backup data found for this number. Ensure the target device has performed at least one cloud backup.");
                 await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_resolved_empty');
                 return;
             }
@@ -139,7 +158,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
             setQueriedData(result);
         } catch (error: any) {
             console.error('Tactical Lookup Error:', error);
-            setErrorMsg(`Lookup failed. Access is blockaded. Verify your Auth role or Firebase Security Rules.`);
+            setError(`Lookup failed. Access is blockaded. Verify your Auth role or Firebase Security Rules.`);
             await AdminAuditService.logAction(adminEmail, cleanPhone, `query_error: ${error.message || 'permission_denied'}`);
         } finally {
             setIsLoading(false);
@@ -270,7 +289,19 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                         {isLoading ? (
                             <div id="admin-loading" className="flex-1 flex flex-col items-center justify-center gap-3 opacity-70">
                                 <div className="w-8 h-8 rounded-full border-2 border-[#00a884] border-t-transparent animate-spin" />
-                                <p className="text-[9px] font-black text-[#00a884] uppercase tracking-widest animate-pulse">Establishing uplink connection...</p>
+                                <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest animate-pulse">Fetching encrypted records...</p>
+                            </div>
+                        ) : !db ? (
+                            <div id="admin-db-null" className="flex-1 flex flex-col items-center justify-center text-center p-6 border border-dashed border-red-500/20 rounded-2xl">
+                                <ShieldAlert className="w-12 h-12 mb-4 text-red-500 animate-pulse" />
+                                <p className="text-xs font-black uppercase tracking-wider text-red-400">Firebase not initialized. Check your firebase-applet-config.json file.</p>
+                            </div>
+                        ) : errorMsg && errorMsg.includes("No backup data found") ? (
+                            <div id="admin-empty-backup" className="flex-1 flex flex-col items-center justify-center text-center p-6 border border-dashed border-yellow-500/20 rounded-2xl">
+                                <Info className="w-12 h-12 mb-4 text-[#00a884]" />
+                                <p className="text-xs font-black uppercase tracking-wider text-white/80 max-w-md">
+                                    No backup data found for this number. Ensure the target device has performed at least one cloud backup.
+                                </p>
                             </div>
                         ) : queriedData ? (
                             <div id="admin-scrollable-details" className="flex-1 flex flex-col overflow-hidden h-full">

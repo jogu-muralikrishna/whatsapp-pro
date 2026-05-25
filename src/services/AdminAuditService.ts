@@ -1,3 +1,5 @@
+import { db } from '../lib/firebaseClient';
+
 export interface AuditLogEntry {
     admin_email: string;
     target_phone: string;
@@ -8,6 +10,9 @@ export interface AuditLogEntry {
 
 export const AdminAuditService = {
     async logAction(email: string, targetPhone: string, action: string) {
+        if (!db) {
+            return null;
+        }
         try {
             await fetch('/api/admin/audit-log', {
                 method: 'POST',
