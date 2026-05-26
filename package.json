@@ -16,6 +16,7 @@
     "pino": "^10.3.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-qr-code": "^2.0.21",
     "ws": "^8.20.0"
   },
   "devDependencies": {
