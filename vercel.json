@@ -1,19 +1,15 @@
 {
   "version": 2,
-  "builds": [
+  "buildCommand": "npm run vercel-build",
+  "outputDirectory": "dist",
+  "rewrites": [
     {
-      "src": "server.ts",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "server.ts"
+      "source": "/api/:path*",
+      "destination": "https://your-railway-backend-url.up.railway.app/api/:path*"
     },
     {
-      "src": "/(.*)",
-      "dest": "server.ts"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }
