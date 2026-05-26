@@ -13,42 +13,38 @@ import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
 let sock: any = null;
 let qrCode: string | null = null;
 let connectionState: string = 'close';
 
-let proData: any = {
-    settings: { theme: 'elegant-dark' },
-    logs: []
-};
+const app = express();
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
 
-if (fs.existsSync(DATA_FILE)) {
-    try {
-        proData = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
-    } catch (e) {}
-}
+app.use(express.json());
 
-function saveProData() {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(proData, null, 2));
-    } catch (e) {}
-}
-
-function log(level: string, msg: string) {
-    const entry = { time: new Date().toISOString(), level, msg };
-    console.log(`[${level}] ${msg}`);
-    proData.logs.push(entry);
-    if (proData.logs.length > 100) proData.logs.shift();
-    saveProData();
-}
-
-function broadcast(data: any) {
-    wss.clients.forEach((client: any) => {
-        if (client.readyState === 1) client.send(JSON.stringify(data));
+// Simple status endpoint
+app.get('/api/connection-status', (req, res) => {
+    res.json({ 
+        state: connectionState, 
+        qrCode: qrCode 
     });
-}
+});
+
+app.get('/api/refresh-qr', (req, res) => {
+    if (sock) sock.end();
+    qrCode = null;
+    setTimeout(initWASocket, 1000);
+    res.json({ status: 'QR refreshed' });
+});
+
+// Serve built frontend
+const distPath = path.join(process.cwd(), 'dist');
+app.use(express.static(distPath));
+app.get('*', (req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+});
 
 async function initWASocket() {
     const authDir = path.join(process.cwd(), 'auth_info_baileys');
@@ -78,7 +74,7 @@ async function initWASocket() {
         }
 
         if (connection === 'open') {
-            console.log("✅ WhatsApp Connected!");
+            console.log("✅ Connected!");
             qrCode = null;
             broadcast({ type: 'LOGGED_IN', data: sock.user });
         }
@@ -89,28 +85,11 @@ async function initWASocket() {
     });
 }
 
-const app = express();
-const server = createServer(app);
-const wss = new WebSocketServer({ server });
-
-app.use(express.json());
-
-app.get('/api/connection-status', (req, res) => {
-    res.json({ state: connectionState, qrCode });
-});
-
-app.get('/api/refresh-qr', (req, res) => {
-    if (sock) sock.end();
-    qrCode = null;
-    setTimeout(initWASocket, 1000);
-    res.json({ status: 'QR refreshed' });
-});
-
-// Serve frontend
-app.use(express.static(path.join(process.cwd(), 'dist')));
-app.get('*', (req, res) => {
-    res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
-});
+function broadcast(data: any) {
+    wss.clients.forEach((client: any) => {
+        if (client.readyState === 1) client.send(JSON.stringify(data));
+    });
+}
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
