@@ -4,7 +4,6 @@ import { WebSocketServer } from 'ws';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
-import { fileURLToPath } from 'url';
 import makeWASocket, { 
     useMultiFileAuthState, 
     DisconnectReason, 
@@ -18,12 +17,8 @@ import { Boom } from '@hapi/boom';
 import cron from 'node-cron';
 import { parseISO, isAfter } from 'date-fns';
 import { GoogleGenAI } from "@google/genai";
-import { DatabaseService } from './src/DatabaseService.js';
-import { adminRouter } from './src/adminRouter.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const logger = pino({ level: 'silent' });
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
@@ -61,28 +56,22 @@ let proData: any = {
         autoReply: false,
         theme: 'elegant-dark',
         font: 'Inter',
-        firebaseBackupEnabled: false
     },
     logs: []
 };
 
-// Load saved data
+// Load data
 if (fs.existsSync(DATA_FILE)) {
     try {
         const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
         proData = { ...proData, ...saved };
-        console.log('✅ Pro data loaded');
-    } catch (e) {
-        console.log('⚠️ Failed to load pro_data.json');
-    }
+    } catch (e) {}
 }
 
 function saveProData() {
     try {
         fs.writeFileSync(DATA_FILE, JSON.stringify(proData, null, 2));
-    } catch (e) {
-        console.error('Failed to save proData');
-    }
+    } catch (e) {}
 }
 
 function log(level: string, msg: string) {
@@ -95,45 +84,30 @@ function log(level: string, msg: string) {
 
 function broadcast(data: any) {
     wss.clients.forEach((client: any) => {
-        if (client.readyState === 1) {
-            client.send(JSON.stringify(data));
-        }
+        if (client.readyState === 1) client.send(JSON.stringify(data));
     });
 }
 
-// ====================== MAIN SERVER ======================
-const app = express();
-const server = createServer(app);
-const wss = new WebSocketServer({ server });
-
-app.use(express.json());
-app.use('/api/admin', adminRouter);
-
-let latestVersion: any;
-
 async function initWASocket() {
     const authDir = path.join(process.cwd(), 'auth_info_baileys');
-
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     sock = makeWASocket({
-        version: latestVersion,
+        version: (await fetchLatestBaileysVersion()).version,
         auth: state,
         logger,
         printQRInTerminal: false,
         browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: true,
-        markOnlineOnConnect: true,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update: any) => {
-        const { connection, lastDisconnect, qr } = update;
+    sock.ev.on('connection.update', (update: any) => {
+        const { connection, qr } = update;
 
         if (qr) {
             qrCode = qr;
-            console.log("📱 QR Code Generated");
             broadcast({ type: 'QR_CODE', data: qr });
         }
 
@@ -143,61 +117,35 @@ async function initWASocket() {
         }
 
         if (connection === 'open') {
-            console.log("✅ WhatsApp Connected Successfully!");
+            console.log("✅ Connected!");
             qrCode = null;
             broadcast({ type: 'LOGGED_IN', data: sock.user });
-            log('SUCCESS', 'WhatsApp Engine Connected');
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) {
-                console.log("🔄 Reconnecting...");
-                setTimeout(initWASocket, 3000);
-            } else {
-                console.log("🚪 Logged out");
-                broadcast({ type: 'LOGOUT', data: { message: "Logged out from mobile" } });
-            }
+            setTimeout(initWASocket, 3000);
         }
     });
 
-    // Other event listeners (messages, chats, etc.) remain as before
-    sock.ev.on('messages.upsert', (m: any) => {
-        broadcast({ type: 'MESSAGES_UPSERT', data: m });
-        // ... your existing message handling
-    });
-
-    // ... (keep all your other event listeners)
+    // Keep your other listeners (messages.upsert, etc.)
 }
 
-async function startServer() {
-    try {
-        const { version } = await fetchLatestBaileysVersion();
-        latestVersion = version;
-    } catch (e) {}
+const app = express();
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
 
-    await initWASocket();
+app.use(express.json());
 
-    // API Routes (keep your existing routes)
-    app.get('/api/connection-status', (req, res) => {
-        res.json({
-            state: connectionState,
-            user: sock?.user,
-            qrCode: qrCode,
-            chats: realChats
-        });
-    });
+// Your existing API routes here...
 
-    // ... rest of your API routes (send-message, etc.)
+// Serve frontend
+app.use(express.static(path.join(process.cwd(), 'dist')));
+app.get('*', (req, res) => {
+    res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
+});
 
-    // Serve frontend
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
 
-    server.listen(PORT, '0.0.0.0', () => {
-        console.log(`🚀 WhatsApp Pro running on port ${PORT}`);
-    });
-}
-
-startServer();
+initWASocket();
