@@ -4,7 +4,8 @@ import { db } from '../lib/firebaseClient';
 import { AdminAuditService } from '../services/AdminAuditService';
 import { 
     ShieldAlert, Search, Eye, Settings, MessageSquare, Phone, 
-    Activity, Users, X, Code, Clipboard, LogOut, Info, CheckCircle 
+    Activity, Users, X, Code, Clipboard, LogOut, Info, CheckCircle,
+    Download, Mic, RefreshCw
 } from 'lucide-react';
 
 interface AdminPanelScreenProps {
@@ -21,6 +22,111 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     const [activeTab, setActiveTab] = useState<'settings' | 'chats' | 'messages' | 'calls' | 'status' | 'groups'>('settings');
     const [showRawJson, setShowRawJson] = useState(false);
     const [isCopySuccess, setIsCopySuccess] = useState(false);
+
+    // New User Consent Live Uplink States
+    const [uplinkMode, setUplinkMode] = useState<'backup' | 'live'>('live');
+    const [consentTokenField, setConsentTokenField] = useState('');
+    const [consentStatusText, setConsentStatusText] = useState('');
+
+    const downloadAdminMediaWithFormat = async (msgId: string, chatId: string, format: string) => {
+        try {
+            const url = `/api/media/download?msgId=${msgId}&chatId=${chatId}&format=${format}`;
+            const res = await fetch(url);
+            if (!res.ok) {
+                throw new Error("Format conversion failed on backend.");
+            }
+            const blob = await res.blob();
+            const blobUrl = window.URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = blobUrl;
+            a.download = `audited_media_${msgId}.${format}`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(blobUrl);
+            document.body.removeChild(a);
+        } catch (err: any) {
+            alert(`Download error: ${err.message}`);
+        }
+    };
+
+    const cleanPhoneNumberForm = (phone: string) => {
+        let clean = phone.replace(/[\s\-\(\)\[\]\+]/g, '');
+        clean = clean.replace(/[^0-9]/g, '');
+        if (clean.startsWith('0')) {
+            clean = clean.substring(1);
+        }
+        if (clean.length === 10) {
+            clean = '91' + clean;
+        }
+        return clean;
+    };
+
+    const handleRequestLiveConsent = async () => {
+        const clean = cleanPhoneNumberForm(searchPhone);
+        if (!clean) {
+            setErrorMsg('Invalid look-up number layout provided.');
+            return;
+        }
+        setIsLoading(true);
+        setErrorMsg('');
+        setConsentStatusText('');
+        try {
+            const res = await fetch('/api/request-user-consent', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: clean, adminEmail })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                setConsentTokenField(data.token || '');
+                setConsentStatusText(`⏳ Request sent! Token: ${data.token}. Waiting status approval.`);
+                await AdminAuditService.logAction(adminEmail, clean, 'live_consent_request_initiated');
+            } else {
+                setErrorMsg(data.error || 'Failed to dispatch live device consent request.');
+            }
+        } catch (err: any) {
+            setErrorMsg(`Uplink request failed: ${err.message}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleLoadLiveConsentData = async () => {
+        const clean = cleanPhoneNumberForm(searchPhone);
+        if (!clean) {
+            setErrorMsg('Invalid look-up number layout.');
+            return;
+        }
+        if (!consentTokenField) {
+            setErrorMsg('Active user-consent 6-digit token is required.');
+            return;
+        }
+        setIsLoading(true);
+        setErrorMsg('');
+        try {
+            const res = await fetch('/api/access-user-data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phone: clean,
+                    adminToken: adminEmail,
+                    userConsentToken: consentTokenField
+                })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setQueriedData(data);
+                setConsentStatusText('✅ Live User-Consent Connection Established!');
+                await AdminAuditService.logAction(adminEmail, clean, 'live_consent_access_success');
+            } else {
+                setErrorMsg(data.error || 'Access Denied. Check token validity or approval state.');
+            }
+        } catch (err: any) {
+            setErrorMsg(`Failed live payload pull: ${err.message}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
 
     const handleSearch = async (e: React.FormEvent) => {
         const setError = setErrorMsg;
@@ -213,31 +319,117 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                     
                     {/* Left Column: Search & Tab List */}
                     <div id="admin-search-nav" className="w-full md:w-80 bg-[#111b21] border-r border-white/5 p-6 flex flex-col gap-6 shrink-0">
-                        <form id="admin-search-form" onSubmit={handleSearch} className="space-y-3">
-                            <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">Search Target Phone</label>
-                            <div className="relative">
-                                <input 
-                                    id="admin-search-input"
-                                    type="text"
-                                    value={searchPhone}
-                                    onChange={e => setSearchPhone(e.target.value)}
-                                    placeholder="e.g. +12065550100"
-                                    className="w-full pl-4 pr-10 py-3.5 bg-[#202c33] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
-                                />
-                                <button 
-                                    id="admin-search-submit"
-                                    type="submit"
-                                    disabled={isLoading}
-                                    className="absolute right-2 top-2 p-1.5 hover:bg-white/5 text-[#00a884] rounded-lg transition-all"
+                        <div className="flex bg-[#202c33] p-1.5 rounded-2xl border border-white/5 shrink-0 gap-1.5">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setUplinkMode('live');
+                                    setQueriedData(null);
+                                    setErrorMsg('');
+                                }}
+                                className={`flex-1 py-2 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all ${
+                                    uplinkMode === 'live' 
+                                        ? 'bg-[#00a884] text-white shadow-[#00a884]/20 shadow-md' 
+                                        : 'text-white/40 hover:text-white/70'
+                                }`}
+                            >
+                                📡 User Consent Live
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setUplinkMode('backup');
+                                    setQueriedData(null);
+                                    setErrorMsg('');
+                                }}
+                                className={`flex-1 py-2 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all ${
+                                    uplinkMode === 'backup' 
+                                        ? 'bg-[#00a884] text-white shadow-[#00a884]/20 shadow-md' 
+                                        : 'text-white/40 hover:text-white/70'
+                                }`}
+                            >
+                                📼 Node Backups
+                            </button>
+                        </div>
+
+                        {uplinkMode === 'backup' ? (
+                            <form id="admin-search-form" onSubmit={handleSearch} className="space-y-3">
+                                <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">Target Backup Phone</label>
+                                <div className="relative">
+                                    <input 
+                                        id="admin-search-input"
+                                        type="text"
+                                        value={searchPhone}
+                                        onChange={e => setSearchPhone(e.target.value)}
+                                        placeholder="e.g. +12065550100"
+                                        className="w-full pl-4 pr-10 py-3.5 bg-[#202c33] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                    />
+                                    <button 
+                                        id="admin-search-submit"
+                                        type="submit"
+                                        disabled={isLoading}
+                                        className="absolute right-2 top-2 p-1.5 hover:bg-white/5 text-[#00a884] rounded-lg transition-all"
+                                    >
+                                        <Search className="w-4 h-4" />
+                                    </button>
+                                </div>
+                                <div className="flex gap-1.5 items-start p-3 bg-[#00a884]/5 border border-[#00a884]/10 rounded-xl text-[8px] text-white/40 leading-relaxed italic animate-fadeIn">
+                                    <Info className="w-3.5 h-3.5 text-[#00a884] shrink-0 mt-0.5" />
+                                    <p>NOTICE: Under the transparency treaty, looking up an entity will notify that user in real time on their terminal.</p>
+                                </div>
+                            </form>
+                        ) : (
+                            <div className="space-y-4 animate-fadeIn">
+                                <div className="space-y-1.5">
+                                    <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">Active Phone Number</label>
+                                    <input 
+                                        type="text"
+                                        value={searchPhone}
+                                        onChange={e => setSearchPhone(e.target.value)}
+                                        placeholder="e.g. +12065550100"
+                                        className="w-full px-4 py-3 bg-[#202c33] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                    />
+                                </div>
+
+                                <button
+                                    type="button"
+                                    onClick={handleRequestLiveConsent}
+                                    disabled={isLoading || !searchPhone}
+                                    className="w-full py-3 bg-white/5 hover:bg-white/10 text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all border border-white/5 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                                 >
-                                    <Search className="w-4 h-4" />
+                                    <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+                                    Request Access
+                                </button>
+
+                                {consentStatusText && (
+                                    <div className="p-3.5 bg-[#00a884]/5 border border-[#00a884]/15 rounded-xl text-[9px] text-white/70 italic leading-relaxed text-center animate-pulse">
+                                        {consentStatusText}
+                                    </div>
+                                )}
+
+                                <div className="space-y-1.5 pt-2 border-t border-white/5">
+                                    <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">6-Digit User Consent Token</label>
+                                    <input 
+                                        type="text"
+                                        maxLength={6}
+                                        value={consentTokenField}
+                                        onChange={e => setConsentTokenField(e.target.value)}
+                                        placeholder="Enter 6-digit code"
+                                        className="w-full px-4 py-3 bg-[#202c33] border border-[#00a884]/20 rounded-xl text-center text-sm font-black tracking-widest text-[#00a884] focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                    />
+                                </div>
+
+                                <button
+                                    type="button"
+                                    onClick={handleLoadLiveConsentData}
+                                    disabled={isLoading || !consentTokenField || !searchPhone}
+                                    className="w-full py-3.5 bg-[#00a884] hover:bg-[#00bc95] text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all shadow-md shadow-[#00a884]/15 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    <ShieldAlert className="w-3.5 h-3.5 animate-bounce" />
+                                    Load Approved Live Data
                                 </button>
                             </div>
-                            <div className="flex gap-1.5 items-start p-3 bg-[#00a884]/5 border border-[#00a884]/10 rounded-xl text-[8px] text-white/40 leading-relaxed italic">
-                                <Info className="w-3.5 h-3.5 text-[#00a884] shrink-0 mt-0.5" />
-                                <p>NOTICE: Under the transparency treaty, looking up an entity will notify that user in real time on their terminal.</p>
-                            </div>
-                        </form>
+                        )}
 
                         {errorMsg && (
                             <div id="admin-dash-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[10px] font-bold italic text-center leading-relaxed">
@@ -389,23 +581,74 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                                 <div id="tab-messages-view" className="space-y-4">
                                                     <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Transmitted Signal Packets</h4>
                                                     {queriedData.messages?.length > 0 ? (
-                                                        queriedData.messages.map((m: any, idx: number) => (
-                                                            <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3">
-                                                                <div className="flex justify-between text-[9px] font-mono text-white/40 pb-2 border-b border-white/5">
-                                                                    <span>Msg ID: {m.key?.id}</span>
-                                                                    <span className={m.key?.fromMe ? 'text-[#00a884] font-bold' : 'text-blue-400 font-bold'}>
-                                                                        {m.key?.fromMe ? 'OUTBOUND' : 'INBOUND'}
-                                                                    </span>
+                                                        queriedData.messages.map((m: any, idx: number) => {
+                                                            const serialized = typeof m.message === 'object' ? JSON.stringify(m.message) : '';
+                                                            const isImage = m.message?.imageMessage || m.text?.includes("📷 Image") || serialized.includes("imageMessage");
+                                                            const isVideo = m.message?.videoMessage || m.text?.includes("🎥 Video") || serialized.includes("videoMessage");
+                                                            const isAudio = m.message?.audioMessage || m.text?.includes("🎵 Audio") || serialized.includes("audioMessage") || m.text?.includes("Sonic Signal");
+                                                            
+                                                            return (
+                                                                <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3 animate-fadeIn">
+                                                                    <div className="flex justify-between text-[9px] font-mono text-white/40 pb-2 border-b border-white/5">
+                                                                        <span>Msg ID: {m.key?.id}</span>
+                                                                        <span className={m.key?.fromMe ? 'text-[#00a884] font-bold' : 'text-blue-400 font-bold'}>
+                                                                            {m.key?.fromMe ? 'OUTBOUND' : 'INBOUND'}
+                                                                        </span>
+                                                                    </div>
+                                                                    <p className="text-xs text-white bg-[#202c33]/20 p-4 rounded-xl leading-relaxed whitespace-pre-wrap font-mono">
+                                                                        {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
+                                                                    </p>
+
+                                                                    {/* Auditable format-specific downloads inside Admin messages list */}
+                                                                    {isImage && (
+                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">📷 Image Payload Detected</span>
+                                                                            <div className="flex gap-2">
+                                                                                <button
+                                                                                    onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'jpg')}
+                                                                                    className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
+                                                                                >
+                                                                                    Download JPG
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'png')}
+                                                                                    className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
+                                                                                >
+                                                                                    Download PNG
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    )}
+                                                                    {isVideo && (
+                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">🎥 Video Payload Detected</span>
+                                                                            <button
+                                                                                onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp4')}
+                                                                                className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
+                                                                            >
+                                                                                <Download className="w-3.5 h-3.5" /> Download MP4
+                                                                            </button>
+                                                                        </div>
+                                                                    )}
+                                                                    {isAudio && (
+                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">🎙️ Recorded Voice Note</span>
+                                                                            <button
+                                                                                onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp3')}
+                                                                                className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
+                                                                            >
+                                                                                <Download className="w-3.5 h-3.5" /> Download MP3
+                                                                            </button>
+                                                                        </div>
+                                                                    )}
+
+                                                                    <div className="flex justify-between items-center text-[9px] text-white/30 font-mono">
+                                                                        <span>JID: {m.chatJid}</span>
+                                                                        <span>{new Date(m.timestamp * 1000).toLocaleString()}</span>
+                                                                    </div>
                                                                 </div>
-                                                                <p className="text-xs text-white bg-[#202c33]/20 p-4 rounded-xl leading-relaxed whitespace-pre-wrap">
-                                                                    {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
-                                                                </p>
-                                                                <div className="flex justify-between items-center text-[9px] text-white/30 font-mono">
-                                                                    <span>JID: {m.chatJid}</span>
-                                                                    <span>{new Date(m.timestamp * 1000).toLocaleString()}</span>
-                                                                </div>
-                                                            </div>
-                                                        ))
+                                                            );
+                                                        })
                                                     ) : (
                                                         <p className="text-xs text-white/30 italic">No packet logs registered on this node backup.</p>
                                                     )}
@@ -414,22 +657,51 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
 
                                             {activeTab === 'calls' && (
                                                 <div id="tab-calls-view" className="space-y-3">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Voice/Video Call Records</h4>
+                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Voice/Video Call Records (Audited)</h4>
                                                     {queriedData.calls?.length > 0 ? (
-                                                        queriedData.calls.map((c: any, idx: number) => (
-                                                            <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center font-mono">
-                                                                <div>
-                                                                    <p className="text-xs font-bold text-white uppercase">{c.type || 'Voice'} Connection</p>
-                                                                    <p className="text-[10px] text-white/40 mt-1">Status: {c.status || 'Settled'}</p>
+                                                        queriedData.calls.map((c: any, idx: number) => {
+                                                            const hasRecording = c.recording_url || c.id;
+                                                            const recUrl = c.recording_url || `/api/recordings/${c.id || 'sim_' + idx}`;
+                                                            
+                                                            return (
+                                                                <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex flex-col gap-3 font-mono animate-fadeIn">
+                                                                    <div className="flex justify-between items-center">
+                                                                        <div>
+                                                                            <p className="text-xs font-bold text-white uppercase">{c.type || 'Voice'} Connection</p>
+                                                                            <p className="text-[10px] text-white/40 mt-1">Status: {c.status || 'Settled'}</p>
+                                                                        </div>
+                                                                        <div className="text-right text-[10px]">
+                                                                            <p className="text-[#00a884] font-bold">Duration: {c.duration || 0}s</p>
+                                                                            <p className="text-[8px] text-white/30 mt-1">
+                                                                                {c.timestamp ? new Date(c.timestamp).toLocaleString() : 'N/A'}
+                                                                            </p>
+                                                                        </div>
+                                                                    </div>
+                                                                    
+                                                                    {hasRecording && (
+                                                                        <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#202c33]/20 p-2.5 rounded-xl">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <span className="text-[8px] font-black text-red-500 uppercase tracking-widest flex items-center gap-1.5 font-sans">
+                                                                                    🎙️ Recording
+                                                                                </span>
+                                                                                <audio 
+                                                                                    controls 
+                                                                                    src={recUrl} 
+                                                                                    className="h-8 w-44 opacity-80" 
+                                                                                />
+                                                                            </div>
+                                                                            <a
+                                                                                href={`${recUrl}?download=true`}
+                                                                                download={`call_recording_${c.id || idx}.mp3`}
+                                                                                className="px-2.5 py-1.5 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg text-[9px] font-black uppercase tracking-widest transition-all text-center cursor-pointer"
+                                                                            >
+                                                                                ⬇️ Download MP3
+                                                                            </a>
+                                                                        </div>
+                                                                    )}
                                                                 </div>
-                                                                <div className="text-right text-[10px]">
-                                                                    <p className="text-[#00a884] font-bold">Duration: {c.duration || 0}s</p>
-                                                                    <p className="text-[8px] text-white/30 mt-1">
-                                                                        {c.timestamp ? new Date(c.timestamp).toLocaleString() : 'N/A'}
-                                                                    </p>
-                                                                </div>
-                                                            </div>
-                                                        ))
+                                                            );
+                                                        })
                                                     ) : (
                                                         <p className="text-xs text-white/30 italic">No call indices cached.</p>
                                                     )}

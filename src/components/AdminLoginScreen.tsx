@@ -83,8 +83,18 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({ onClose, onL
                     </div>
 
                     {errorMsg && (
-                        <div id="admin-login-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-500 text-[11px] text-center font-bold italic leading-relaxed">
-                            {errorMsg}
+                        <div id="admin-login-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-500 text-[11px] text-center font-bold italic leading-relaxed flex flex-col items-center gap-2">
+                            <span>{errorMsg}</span>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    const fakeEvent = { preventDefault: () => {} } as any;
+                                    handleSubmit(fakeEvent);
+                                }}
+                                className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 text-white rounded-lg font-black uppercase text-[9px] tracking-widest transition-all mt-1"
+                            >
+                                🔄 Retry Verification
+                            </button>
                         </div>
                     )}
 
