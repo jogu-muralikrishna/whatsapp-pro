@@ -24,12 +24,8 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.json());
 
-// Simple status endpoint
 app.get('/api/connection-status', (req, res) => {
-    res.json({ 
-        state: connectionState, 
-        qrCode: qrCode 
-    });
+    res.json({ state: connectionState, qrCode });
 });
 
 app.get('/api/refresh-qr', (req, res) => {
@@ -39,7 +35,7 @@ app.get('/api/refresh-qr', (req, res) => {
     res.json({ status: 'QR refreshed' });
 });
 
-// Serve built frontend
+// Serve frontend
 const distPath = path.join(process.cwd(), 'dist');
 app.use(express.static(distPath));
 app.get('*', (req, res) => {
