@@ -120,6 +120,9 @@ export default function App() {
   const [contacts, setContacts] = useState<Record<string, any>>({});
   const [lidToPnMap, setLidToPnMap] = useState<Record<string, string>>({});
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [waLinkPhone, setWaLinkPhone] = useState("12065550100"); // FIXED
+  const [waLinkMessage, setWaLinkMessage] = useState("Hello! I need support with WhatsApp Pro."); // FIXED
+  const [waConnectMode, setWaConnectMode] = useState<"engine" | "direct">("engine"); // FIXED
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [showMsgSearch, setShowMsgSearch] = useState(false);
@@ -1034,17 +1037,49 @@ export default function App() {
       const data = await res.json();
       setConnectionState(data.state);
       if (data.statusUpdates) setStatusUpdates(data.statusUpdates);
+      if (data.supportPhoneNumber) {
+        setWaLinkPhone(data.supportPhoneNumber); // FIXED
+      }
       if (data.isRegistered && data.user) {
         setUser(data.user);
         if (data.chats) {
-          const sorted = data.chats.sort(
+          // Filter out obvious system, empty JIDs, or junk contacts to prevent "many fake numbers will came" // FIXED
+          const normalizedAndFiltered = data.chats
+            .map((c: any) => {
+              let nextId = c.id;
+              if (nextId && nextId.includes(":")) {
+                const parts = nextId.split(":");
+                const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
+                nextId = `${parts[0]}@${suffix}`;
+              }
+              if (nextId && nextId.endsWith("@c.us")) {
+                nextId = nextId.replace("@c.us", "@s.whatsapp.net");
+              }
+              return { ...c, id: nextId };
+            })
+            .filter((c: any) => {
+              if (!c.id) return false;
+              if (c.id === "status@broadcast" || c.id === "0@s.whatsapp.net") return false;
+              if (c.id.endsWith("@lid")) return false; // Filter out LID numbers // FIXED
+              const idNum = c.id.split("@")[0];
+              if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
+              return true;
+            });
+          const sorted = normalizedAndFiltered.sort(
             (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
           );
           setChats(sorted);
           sorted.forEach((c: any) => fetchProfilePicture(c.id));
         }
         if (data.contacts) {
-          setContacts(data.contacts);
+          // Clean contact list to prevent dummy or fake LID numbers // FIXED
+          const cleanedContacts: Record<string, any> = {};
+          Object.keys(data.contacts).forEach((key) => {
+            if (!key.endsWith("@lid") && key !== "0@s.whatsapp.net") {
+              cleanedContacts[key] = data.contacts[key];
+            }
+          });
+          setContacts(cleanedContacts);
         }
       }
       if (data.qrCode) {
@@ -1188,9 +1223,20 @@ export default function App() {
             updates.forEach((update) => {
               if (!update.id) return;
               let jid = update.id;
+              if (jid.includes(":")) {
+                const parts = jid.split(":");
+                const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
+                jid = `${parts[0]}@${suffix}`;
+              }
               if (jid.endsWith("@c.us"))
                 jid = jid.replace("@c.us", "@s.whatsapp.net");
               update.id = jid;
+
+              // Filter out system or duplicate LID junk contacts // FIXED
+              if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
+              if (jid.endsWith("@lid")) return;
+              const idNum = jid.split("@")[0];
+              if (idNum.length < 7 || idNum.length > 20) return;
 
               const index = newChats.findIndex((c) => c.id === jid);
               if (index !== -1) {
@@ -1214,9 +1260,20 @@ export default function App() {
               const merged = [...prev];
               data.chats.forEach((newChat: any) => {
                 let jid = newChat.id;
+                if (jid.includes(":")) {
+                  const parts = jid.split(":");
+                  const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
+                  jid = `${parts[0]}@${suffix}`;
+                }
                 if (jid.endsWith("@c.us"))
                   jid = jid.replace("@c.us", "@s.whatsapp.net");
                 newChat.id = jid;
+
+                // Filter out system or duplicate LID junk contacts // FIXED
+                if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
+                if (jid.endsWith("@lid")) return;
+                const idNum = jid.split("@")[0];
+                if (idNum.length < 7 || idNum.length > 20) return;
 
                 const index = merged.findIndex((c) => c.id === jid);
                 if (index !== -1) {
@@ -1871,27 +1928,112 @@ export default function App() {
                   </AnimatePresence>
                 </>
               ) : (
-                <div className="flex flex-col items-center">
-                  <div className="p-4 bg-white rounded-2xl mb-6 shadow-2xl relative group">
-                    {qrCode ? (
-                      <div className="relative">
-                        <QRCode value={qrCode} size={180} />
-                        <div className="absolute inset-0 border-4 border-primary/20 rounded-lg pointer-events-none animate-pulse" />
-                      </div>
-                    ) : (
-                      <div className="w-[180px] h-[180px] flex flex-col items-center justify-center bg-[#1c1c1f] rounded-xl gap-4">
-                        <RefreshCw className="w-8 h-8 text-slate-500 animate-spin" />
-                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest text-center px-4">
-                          Calibrating Neural Link...
-                        </span>
-                      </div>
-                    )}
-                    <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
+                <div className="flex flex-col items-center w-full">
+                  {/* Mode switcher for Optic Sync // FIXED */}
+                  <div className="flex gap-1 bg-black/40 p-1 rounded-xl border border-white/5 mb-6 w-full">
+                    <button
+                      type="button"
+                      onClick={() => setWaConnectMode("engine")}
+                      className={`flex-1 py-2 rounded-lg text-[8.5px] font-black uppercase tracking-widest transition-all ${waConnectMode === "engine" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
+                    >
+                      Engine Sync
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWaConnectMode("direct")}
+                      className={`flex-1 py-2 rounded-lg text-[8.5px] font-black uppercase tracking-widest transition-all ${waConnectMode === "direct" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
+                    >
+                      Chat QR Link
+                    </button>
                   </div>
-                  {!qrCode && !isRefreshing && (
-                    <p className="text-[9px] text-primary font-black uppercase tracking-[0.2em] mb-4 animate-pulse">
-                      Awaiting Authentication Stream...
-                    </p>
+
+                  {waConnectMode === "direct" ? (
+                    /* Direct WA.me Link Generator QR // FIXED */
+                    <div className="w-full flex flex-col items-center space-y-4">
+                      <div className="p-4 bg-white rounded-2xl shadow-2xl relative group">
+                        <div className="relative bg-white p-1 rounded-lg">
+                          <QRCode 
+                            id="direct-wa-qr"
+                            value={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`} 
+                            size={180} 
+                          />
+                          <div className="absolute inset-0 border-4 border-[#00a884]/20 rounded-lg pointer-events-none animate-pulse" />
+                        </div>
+                        <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
+                      </div>
+
+                      <div className="text-center">
+                        <p className="text-[10px] text-primary font-black uppercase tracking-widest mb-1">
+                          Scan to Chat Now
+                        </p>
+                        <p className="text-[8px] text-slate-400 font-medium">
+                          Opens real WhatsApp instantly
+                        </p>
+                      </div>
+
+                      {/* Inputs to customize target link */}
+                      <div className="w-full space-y-3 pt-2">
+                        <div className="space-y-1">
+                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
+                            Target Phone Number
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="e.g. 12065550100"
+                            className="w-full px-3 py-2.5 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all font-mono"
+                            value={waLinkPhone}
+                            onChange={(e) => setWaLinkPhone(e.target.value.replace(/[^\d+]/g, ""))}
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
+                            Preset Message content
+                          </label>
+                          <textarea
+                            rows={2}
+                            placeholder="Type greeting message..."
+                            className="w-full px-3 py-2 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all"
+                            value={waLinkMessage}
+                            onChange={(e) => setWaLinkMessage(e.target.value)}
+                          />
+                        </div>
+
+                        <a
+                          href={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="w-full bg-[#00a884] text-white font-black py-3 rounded-xl hover:opacity-90 transition-all text-[9px] uppercase tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-[#00a884]/15"
+                        >
+                          Send Message / Open Link 🚀
+                        </a>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Default Baileys Authenticator Token QR */
+                    <div className="flex flex-col items-center w-full">
+                      <div className="p-4 bg-white rounded-2xl mb-6 shadow-2xl relative group">
+                        {qrCode ? (
+                          <div className="relative bg-white p-1 rounded-lg">
+                            <QRCode value={qrCode} size={180} />
+                            <div className="absolute inset-0 border-4 border-primary/20 rounded-lg pointer-events-none animate-pulse" />
+                          </div>
+                        ) : (
+                          <div className="w-[180px] h-[180px] flex flex-col items-center justify-center bg-[#1c1c1f] rounded-xl gap-4">
+                            <RefreshCw className="w-8 h-8 text-slate-500 animate-spin" />
+                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest text-center px-4">
+                              Calibrating Neural Link...
+                            </span>
+                          </div>
+                        )}
+                        <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
+                      </div>
+                      {!qrCode && !isRefreshing && (
+                        <p className="text-[9px] text-primary font-black uppercase tracking-[0.2em] mb-4 animate-pulse">
+                          Awaiting Authentication Stream...
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
@@ -2240,7 +2382,7 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
+                <div className="flex gap-1.5 pb-2 overflow-x-auto no-scrollbar scroll-smooth whitespace-nowrap scrollbar-none max-w-full">
                   {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "VERIFIED"] as const).map(
                     (tab) => (
                       <button
@@ -2249,7 +2391,7 @@ export default function App() {
                           setShowLockedChats(false);
                           setChatSubTab(tab);
                         }}
-                        className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center gap-1.5 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                        className={`px-3 sm:px-4 py-1.5 rounded-full text-[8px] sm:text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
                       >
                         {tab}
                       </button>

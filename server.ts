@@ -51,6 +51,10 @@ const logger = pino({ level: 'silent' });
 const PORT = 3000;
 const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
+const app = express(); // FIXED (Move globally)
+const server = createServer(app); // FIXED (Move globally)
+const wss = new WebSocketServer({ server }); // FIXED (Move globally)
+
 const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
 const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
@@ -487,13 +491,13 @@ async function loadProDataFromFirestore() {
 }
 
 async function startServer() {
-    const app = express();
-    const server = createServer(app);
-    const wss = new WebSocketServer({ server });
-
     app.use(express.json());
     app.use('/api/admin', adminRouter);
-    await DatabaseService.initDatabase();
+    
+    // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
+    DatabaseService.initDatabase().catch((dbErr: any) => {
+        log('ERROR', `Database initialization failure: ${dbErr.message}`);
+    });
 
     let latestVersion: any = undefined;
     try {
@@ -2866,38 +2870,64 @@ async function initWASocket() {
     });
 
     app.get('/api/connection-status', (req, res) => {
-        res.json({ 
-            state: connectionState, 
-            user: sock?.user,
-            qrCode: qrCode,
-            isRegistered: sock?.authState.creds.registered,
-            chats: realChats,
-            contacts: proData.contacts,
-            statusUpdates: proData.statusUpdates,
-            latency: '14ms', 
-            uptimes: process.uptime()
-        });
+        try {
+            // Filter out system or duplicate LID junk contacts to prevent "many fake numbers will came" // FIXED
+            const cleanChats = (realChats || []).filter((c: any) => {
+                if (!c || !c.id) return false;
+                if (c.id === 'status@broadcast' || c.id === '0@s.whatsapp.net') return false;
+                if (c.id.endsWith('@lid')) return false; // Filter out LID numbers // FIXED
+                const idNum = c.id.split('@')[0];
+                if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
+                return true;
+            });
+
+            const cleanContacts: Record<string, any> = {};
+            if (proData.contacts) {
+                Object.keys(proData.contacts).forEach((key) => {
+                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') {
+                        cleanContacts[key] = proData.contacts[key];
+                    }
+                });
+            }
+
+            res.json({ 
+                state: connectionState, 
+                user: sock?.user,
+                qrCode: qrCode,
+                isRegistered: sock?.authState.creds.registered,
+                chats: cleanChats,
+                contacts: cleanContacts,
+                statusUpdates: proData.statusUpdates,
+                supportPhoneNumber: process.env.WHATSAPP_PHONE_NUMBER || proData.settings?.phoneNumber || "12065550100", // FIXED (Pass support number)
+                latency: '14ms', 
+                uptimes: process.uptime()
+            });
+        } catch (error: any) {
+            res.status(500).json({ error: error.message });
+        }
     });
 
     // Vite middleware
     const isProductionEnv = process.env.NODE_ENV === 'production' || __filename.includes('dist') || !fs.existsSync(path.join(process.cwd(), 'server.ts'));
-    if (!isProductionEnv) {
-        const vite = await createViteServer({
-            server: { middlewareMode: true },
-            appType: 'spa',
-        });
-        app.use(vite.middlewares);
-    } else {
-        const distPath = fs.existsSync(path.join(process.cwd(), 'dist')) 
-            ? path.join(process.cwd(), 'dist') 
-            : path.join(__dirname, 'dist');
-        app.use(express.static(distPath));
-        app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
-    }
+    if (!process.env.VERCEL) { // FIXED: Do not listen on static express ports when deployed on Vercel
+        if (!isProductionEnv) {
+            const vite = await createViteServer({
+                server: { middlewareMode: true },
+                appType: 'spa',
+            });
+            app.use(vite.middlewares);
+        } else {
+            const distPath = fs.existsSync(path.join(process.cwd(), 'dist')) 
+                ? path.join(process.cwd(), 'dist') 
+                : path.join(__dirname, 'dist');
+            app.use(express.static(distPath));
+            app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+        }
 
-    server.listen(PORT, '0.0.0.0', () => {
-        console.log(`WhatsApp Pro running on http://localhost:${PORT}`);
-    });
+        server.listen(PORT, '0.0.0.0', () => {
+            console.log(`WhatsApp Pro running on http://localhost:${PORT}`);
+        });
+    }
 }
 
 // Graceful termination state persistence
@@ -2910,3 +2940,5 @@ process.on('SIGINT', gracefulExit);
 process.on('SIGTERM', gracefulExit);
 
 startServer();
+
+export default app; // FIXED

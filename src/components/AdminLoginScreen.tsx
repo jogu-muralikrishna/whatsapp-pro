@@ -82,6 +82,24 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({ onClose, onL
                         <p className="text-[10px] text-white/40">Credential validation via Cloud Gatekeeper</p>
                     </div>
 
+                    {/* Quick Access Sandbox Card // FIXED */}
+                    <div className="p-4 bg-[#00a884]/5 rounded-2xl border border-[#00a884]/20 space-y-2">
+                        <span className="text-[8px] font-black text-[#00a884] uppercase tracking-widest block">
+                            ⚡ QUICK ACCESS DEMO CREDENTIALS
+                        </span>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setEmail('admin@pro.com');
+                                setPassword('admin123');
+                            }}
+                            className="w-full flex justify-between text-[10px] font-mono text-white/60 bg-[#111b21] hover:bg-[#00a884]/20 hover:text-white border border-white/5 p-2.5 rounded-xl transition-all select-none text-left"
+                        >
+                            <span>Email: admin@pro.com</span>
+                            <span>Pass: admin123</span>
+                        </button>
+                    </div>
+
                     {errorMsg && (
                         <div id="admin-login-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-500 text-[11px] text-center font-bold italic leading-relaxed flex flex-col items-center gap-2">
                             <span>{errorMsg}</span>
