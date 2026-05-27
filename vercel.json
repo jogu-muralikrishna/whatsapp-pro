@@ -1,22 +1,16 @@
 {
   "version": 2,
-  "builds": [
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
     {
-      "src": "dist/server.cjs",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "dist/server.cjs"
+      "source": "/api/:path*",
+      "destination": "https://whatsapp-pro-production.up.railway.app/api/:path*"
     },
     {
-      "handle": "filesystem"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "dist/index.html"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }

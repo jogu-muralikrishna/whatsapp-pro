@@ -9,14 +9,18 @@ export interface AuditLogEntry {
 }
 
 export const AdminAuditService = {
+    token: '',
+    setToken(t: string) {
+        this.token = t;
+    },
     async logAction(email: string, targetPhone: string, action: string) {
-        if (!db) {
-            return null;
-        }
         try {
             await fetch('/api/admin/audit-log', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': this.token ? `Bearer ${this.token}` : ''
+                },
                 body: JSON.stringify({
                     email,
                     targetPhone,

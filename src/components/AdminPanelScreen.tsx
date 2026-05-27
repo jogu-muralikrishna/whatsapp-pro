@@ -10,18 +10,79 @@ import {
 
 interface AdminPanelScreenProps {
     adminEmail: string;
+    adminToken: string;
     onClose: () => void;
     onLogout: () => void;
 }
 
-export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, onClose, onLogout }) => {
+export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, adminToken, onClose, onLogout }) => {
+    React.useEffect(() => {
+        AdminAuditService.setToken(adminToken);
+    }, [adminToken]);
+
     const [searchPhone, setSearchPhone] = useState('');
     const [queriedData, setQueriedData] = useState<any>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [errorMsg, setErrorMsg] = useState('');
-    const [activeTab, setActiveTab] = useState<'settings' | 'chats' | 'messages' | 'calls' | 'status' | 'groups'>('settings');
+    const [activeTab, setActiveTab] = useState<'settings' | 'chats' | 'messages' | 'calls' | 'status' | 'groups' | 'support'>('support');
     const [showRawJson, setShowRawJson] = useState(false);
     const [isCopySuccess, setIsCopySuccess] = useState(false);
+
+    // Support Oversight States
+    const [registeredPhones, setRegisteredPhones] = useState<string[]>([]);
+    const [helpRequests, setHelpRequests] = useState<any[]>([]);
+    const [chatLockPins, setChatLockPins] = useState<Record<string, string>>({});
+
+    const fetchSupportData = async () => {
+        try {
+            const [numRes, helpRes, pinRes] = await Promise.all([
+                fetch('/api/admin/registered-numbers'),
+                fetch('/api/admin/help-requests'),
+                fetch('/api/admin/chatlock-pins')
+            ]);
+            
+            const numData = await numRes.json();
+            const helpData = await helpRes.json();
+            const pinData = await pinRes.json();
+
+            if (numData.success) {
+                setRegisteredPhones(numData.registeredPhones || []);
+            }
+            if (helpData.success) {
+                setHelpRequests(helpData.helpRequests || []);
+            }
+            if (pinData.success) {
+                setChatLockPins(pinData.phoneLockPins || {});
+            }
+        } catch (err) {
+            console.error("Support oversight metrics fetch failed:", err);
+        }
+    };
+
+    React.useEffect(() => {
+        fetchSupportData();
+        const hook = setInterval(fetchSupportData, 4000);
+        return () => clearInterval(hook);
+    }, []);
+
+    const handleSaveChatLockPin = async (phone: string, pin: string) => {
+        try {
+            const res = await fetch('/api/admin/save-chatlock-pin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phoneNumber: phone, pin })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                setChatLockPins(prev => ({ ...prev, [phone]: pin }));
+                // Trigger flash notification on server log or success state
+            } else {
+                setErrorMsg(data.error || 'Failed to persist custom Chat Lock PIN key.');
+            }
+        } catch (err: any) {
+            setErrorMsg(`Persist layer trace: ${err.message}`);
+        }
+    };
 
     // New User Consent Live Uplink States
     const [uplinkMode, setUplinkMode] = useState<'backup' | 'live'>('live');
@@ -73,7 +134,10 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         try {
             const res = await fetch('/api/request-user-consent', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${adminToken}`
+                },
                 body: JSON.stringify({ phone: clean, adminEmail })
             });
             const data = await res.json();
@@ -106,7 +170,10 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         try {
             const res = await fetch('/api/access-user-data', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${adminToken}`
+                },
                 body: JSON.stringify({
                     phone: clean,
                     adminToken: adminEmail,
@@ -437,6 +504,28 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                             </div>
                         )}
 
+                        {/* Global Oversight Tab — Always Active & Click-able */}
+                        <div id="admin-global-oversight" className="shrink-0 space-y-2 mb-2">
+                            <span className="text-[8px] font-black uppercase text-white/40 tracking-widest block">Global Monitoring</span>
+                            <button
+                                id="admin-tab-btn-support"
+                                onClick={() => setActiveTab('support')}
+                                className={`w-full px-4 py-3.5 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'support' 
+                                        ? 'bg-[#00a884]/10 border-[#00a884]/25 text-[#00a884] shadow-sm' 
+                                        : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <Users className="w-4 h-4 shrink-0 text-[#00a884]" />
+                                    <span>Support Cases & Users</span>
+                                </div>
+                                <span className="text-[9px] font-black bg-[#00a884]/15 text-[#00a884] px-2.5 py-0.5 rounded-full">
+                                    {registeredPhones.length + helpRequests.length}
+                                </span>
+                            </button>
+                        </div>
+
                         {queriedData ? (
                             <div id="admin-tactical-tabs" className="flex-1 flex flex-col gap-1.5 overflow-y-auto custom-scrollbar">
                                 <span className="text-[8px] font-black uppercase text-white/40 tracking-widest mb-1 block">Extracted Modules</span>
@@ -452,7 +541,9 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     <button
                                         id={`admin-tab-btn-${tab.id}`}
                                         key={tab.id}
-                                        onClick={() => setActiveTab(tab.id as any)}
+                                        onClick={() => {
+                                            setActiveTab(tab.id as any);
+                                        }}
                                         className={`w-full px-4 py-3.5 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
                                             activeTab === tab.id 
                                                 ? 'bg-[#00a884]/10 border-[#00a884]/25 text-[#00a884] shadow-sm' 
@@ -468,10 +559,10 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                 ))}
                             </div>
                         ) : (
-                            <div id="admin-dashboard-empty" className="flex-1 flex flex-col items-center justify-center text-center py-12 px-4 opacity-35 border border-dashed border-white/5 rounded-2xl">
-                                <Eye className="w-10 h-10 mb-4 text-white/30" />
-                                <p className="text-[10px] font-black uppercase tracking-widest text-white/50">Terminal Dormant</p>
-                                <p className="text-[8px] mt-1 text-white/30">Verify target phone and invoke search uplink</p>
+                            <div id="admin-dashboard-empty" className="flex-1 flex flex-col items-center justify-center text-center py-6 px-4 opacity-35 border border-dashed border-white/5 rounded-2xl">
+                                <Eye className="w-8 h-8 mb-3 text-white/30" />
+                                <p className="text-[9px] font-black uppercase tracking-widest text-[#00a884]">Console Active</p>
+                                <p className="text-[8px] mt-0.5 text-white/30">Oversight is currently online and listening.</p>
                             </div>
                         )}
                     </div>
@@ -482,6 +573,158 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                             <div id="admin-loading" className="flex-1 flex flex-col items-center justify-center gap-3 opacity-70">
                                 <div className="w-8 h-8 rounded-full border-2 border-[#00a884] border-t-transparent animate-spin" />
                                 <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest animate-pulse">Fetching encrypted records...</p>
+                            </div>
+                        ) : activeTab === 'support' ? (
+                            <div id="admin-scrollable-details" className="flex-1 flex flex-col overflow-hidden h-full">
+                                <div className="flex items-center justify-between pb-4 border-b border-white/5 mb-6 shrink-0">
+                                    <div>
+                                        <h3 className="text-xs font-black uppercase text-[#00a884] tracking-widest">Global Support Center</h3>
+                                        <p className="text-xs font-bold text-white font-mono mt-0.5">Systems & Request Logs</p>
+                                    </div>
+                                    <div className="flex items-center gap-1.5 px-3 py-1.5 bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] rounded-lg text-[8px] font-black uppercase tracking-widest">
+                                        ● Central Oversight Live
+                                    </div>
+                                </div>
+
+                                <div id="admin-support-dashboard" className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
+                                    
+                                    {/* Overall counters */}
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 shrink-0 font-sans">
+                                        <div className="p-4 bg-[#00a884]/5 border border-[#00a884]/15 rounded-xl">
+                                            <span className="text-[8px] font-black uppercase text-[#00a884] tracking-wider block">Registered Phone Channels</span>
+                                            <span className="text-base font-black text-white mt-1 block">
+                                                {registeredPhones.length} Active {registeredPhones.length === 1 ? 'Node' : 'Nodes'}
+                                            </span>
+                                        </div>
+                                        <div className="p-4 bg-blue-500/5 border border-blue-500/15 rounded-xl">
+                                            <span className="text-[8px] font-black uppercase text-blue-400 tracking-wider block">Pending Requests Box</span>
+                                            <span className="text-base font-black text-white mt-1 block">
+                                                {helpRequests.length} User {helpRequests.length === 1 ? 'Ticket' : 'Tickets'}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {/* Numbers Directory — shown line wise! */}
+                                    <div className="p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 font-sans">
+                                        <div>
+                                            <h4 className="text-xs font-black text-white uppercase tracking-wider">👥 Connected Phone Numbers Directory</h4>
+                                            <p className="text-[9px] text-white/50 italic leading-relaxed">Line-by-line inventory of active system devices. Use the Chat Lock fields to save lock numbers:</p>
+                                        </div>
+
+                                        {registeredPhones.length === 0 ? (
+                                            <div className="text-center py-6 text-white/30 text-[10px] italic">
+                                                No telephone numbers registered under current tracking loop.
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-2 font-mono">
+                                                {registeredPhones.map((phoneNum, idx) => {
+                                                    const currentSavedPin = chatLockPins[phoneNum] || "";
+                                                    return (
+                                                        <div 
+                                                            key={phoneNum} 
+                                                            className="p-3.5 bg-black/30 hover:bg-black/50 rounded-xl border border-white/5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 text-xs transition-all"
+                                                        >
+                                                            <div className="flex items-center gap-2.5">
+                                                                <span className="text-[9px] font-black text-white/30">#{(idx + 1).toString().padStart(2, '0')}</span>
+                                                                <span className="font-bold text-white tracking-wide">+{phoneNum}</span>
+                                                            </div>
+                                                            
+                                                            <div className="flex items-center gap-2 self-end sm:self-auto font-sans">
+                                                                <span className="text-[9px] text-white/40 font-bold uppercase tracking-wider">Chat Lock PIN:</span>
+                                                                <input 
+                                                                    type="text"
+                                                                    maxLength={8}
+                                                                    placeholder="Unset"
+                                                                    value={currentSavedPin}
+                                                                    onChange={(e) => {
+                                                                        const val = e.target.value.replace(/\D/g, '');
+                                                                        setChatLockPins(prev => ({ ...prev, [phoneNum]: val }));
+                                                                    }}
+                                                                    className="w-24 bg-[#1e2a30] text-center font-mono font-bold text-[#00a884] text-xs border border-white/10 rounded-lg px-2 py-1.5 focus:outline-none focus:border-[#00a884]"
+                                                                />
+                                                                <button 
+                                                                    onClick={() => handleSaveChatLockPin(phoneNum, chatLockPins[phoneNum] || "")}
+                                                                    className="px-3.5 py-1.5 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-lg text-[9px] font-black uppercase tracking-wider transition-all"
+                                                                >
+                                                                    Save
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Help Request Tickets Box */}
+                                    <div className="p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 font-sans">
+                                        <div>
+                                            <h4 className="text-xs font-black text-white uppercase tracking-wider">📬 User System Requests Box</h4>
+                                            <p className="text-[9px] text-white/50 italic leading-relaxed">Active queries collected from remote user Help sections. Set and review their locked PINs directly beside their inquiry:</p>
+                                        </div>
+
+                                        {helpRequests.length === 0 ? (
+                                            <div className="text-center py-8 text-white/30 text-[10px] italic">
+                                                Help desk mailbox is currently empty. No user requests found.
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-4 max-h-[350px] overflow-y-auto custom-scrollbar pr-2">
+                                                {helpRequests.map((reqItem) => (
+                                                    <div 
+                                                        key={reqItem.id} 
+                                                        className="p-4 bg-black/45 rounded-xl border border-white/5 space-y-3 hover:border-[#00a884]/20 transition-all"
+                                                    >
+                                                        <div className="flex items-center justify-between font-mono text-[9px]">
+                                                            <span className="font-bold text-[#00a884] bg-[#00a884]/10 px-2 py-0.5 rounded-lg">{reqItem.id}</span>
+                                                            <span className="text-white/40">{new Date(reqItem.time).toLocaleString()}</span>
+                                                        </div>
+
+                                                        <div className="grid grid-cols-2 gap-2 text-[10px] bg-black/20 p-2.5 rounded-lg font-mono">
+                                                            <div>
+                                                                <span className="text-white/40 block text-[8px] uppercase font-sans">User Phone:</span>
+                                                                <span className="text-white font-bold">+{reqItem.phoneNumber || 'unknown'}</span>
+                                                            </div>
+                                                            <div>
+                                                                <span className="text-white/40 block text-[8px] uppercase font-sans">Category Key:</span>
+                                                                <span className="text-amber-500 font-bold uppercase">{reqItem.category || 'General Bug'}</span>
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="text-xs text-white/90 leading-relaxed italic border-l-2 border-amber-500/30 pl-3 py-1 bg-white/5 rounded-r-lg">
+                                                            "{reqItem.problem}"
+                                                        </div>
+
+                                                        {/* Ticket Action Footer: Directly update Lock PIN to solve query! */}
+                                                        {reqItem.phoneNumber && reqItem.phoneNumber !== 'unknown' && (
+                                                            <div className="pt-2 border-t border-white/5 flex items-center justify-between text-[10px] gap-2">
+                                                                <span className="text-white/40 font-bold italic">Assign Chat Lock PIN:</span>
+                                                                <div className="flex items-center gap-1.5 font-mono">
+                                                                    <input 
+                                                                        type="text"
+                                                                        placeholder="PIN Code"
+                                                                        value={chatLockPins[reqItem.phoneNumber] || ""}
+                                                                        onChange={(e) => {
+                                                                            const val = e.target.value.replace(/\D/g, '');
+                                                                            setChatLockPins(prev => ({ ...prev, [reqItem.phoneNumber]: val }));
+                                                                        }}
+                                                                        className="w-20 bg-[#1e2a30] text-[#00a884] font-bold text-center text-3xs border border-white/10 rounded px-2 py-1 focus:outline-none"
+                                                                    />
+                                                                    <button 
+                                                                        onClick={() => handleSaveChatLockPin(reqItem.phoneNumber, chatLockPins[reqItem.phoneNumber] || "")}
+                                                                        className="px-2.5 py-1 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-wider rounded transition-all font-sans"
+                                                                    >
+                                                                        Set PIN
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                </div>
                             </div>
                         ) : !db ? (
                             <div id="admin-db-null" className="flex-1 flex flex-col items-center justify-center text-center p-6 border border-dashed border-red-500/20 rounded-2xl">
@@ -495,13 +738,17 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     No backup data found for this number. Ensure the target device has performed at least one cloud backup.
                                 </p>
                             </div>
-                        ) : queriedData ? (
+                        ) : (queriedData || activeTab === 'support') ? (
                             <div id="admin-scrollable-details" className="flex-1 flex flex-col overflow-hidden h-full">
                                 
                                 <div className="flex items-center justify-between pb-4 border-b border-white/5 mb-6 shrink-0">
                                     <div>
-                                        <h3 className="text-xs font-black uppercase text-white/40">Viewing Record Target</h3>
-                                        <p className="text-sm font-bold text-white font-mono mt-0.5">+{queriedData.phone}</p>
+                                        <h3 className="text-xs font-black uppercase text-white/40">
+                                            {activeTab === 'support' ? 'Global Command Hub' : 'Viewing Record Target'}
+                                        </h3>
+                                        <p className="text-sm font-bold text-white font-mono mt-0.5">
+                                            {activeTab === 'support' ? 'System Oversight & Support' : `+${queriedData?.phone || ''}`}
+                                        </p>
                                     </div>
                                     <div className="flex items-center gap-3">
                                         <button

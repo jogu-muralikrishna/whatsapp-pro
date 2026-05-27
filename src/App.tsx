@@ -13,6 +13,7 @@ import {
   Zap,
   Trash2,
   Lock,
+  Unlock,
   Star,
   Check,
   QrCode as QrCodeIcon,
@@ -97,7 +98,7 @@ interface Message {
   rawMessage?: any;
 }
 
-type Tab = "CHATS" | "STATUS" | "CALLS" | "LOGS" | "SETTINGS";
+type Tab = "CHATS" | "STATUS" | "CALLS" | "RECORDS" | "SETTINGS";
 
 export default function App() {
   const [phoneNumber, setPhoneNumber] = useState("");
@@ -116,6 +117,23 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("CHATS");
   const [engineLogs, setEngineLogs] = useState<any[]>([]);
+  const [callRecords, setCallRecords] = useState<any[]>([]);
+
+  const fetchCallRecords = async () => {
+    try {
+      const res = await fetch("/api/calls/records");
+      if (res.ok) {
+        const data = await res.json();
+        setCallRecords(data);
+      }
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    if (activeTab === "RECORDS") {
+      fetchCallRecords();
+    }
+  }, [activeTab]);
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [contacts, setContacts] = useState<Record<string, any>>({});
   const [lidToPnMap, setLidToPnMap] = useState<Record<string, string>>({});
@@ -353,8 +371,20 @@ export default function App() {
   }>({ messages: [], chats: [] });
   const [showContactInfo, setShowContactInfo] = useState(false);
   const [chatSubTab, setChatSubTab] = useState<
-    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS"
+    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS" | "VERIFIED" | "NEW" | "LOCKED"
   >("ALL");
+  const [userLockPin, setUserLockPin] = useState<string>(() => localStorage.getItem("userLockPin") || "1234");
+  const [showLockSetupModal, setShowLockSetupModal] = useState(false);
+  const [selectedContactsToLock, setSelectedContactsToLock] = useState<string[]>([]);
+  const [newLockPinInput, setNewLockPinInput] = useState("");
+  const [confirmLockPinInput, setConfirmLockPinInput] = useState("");
+  const [showUnlockPinPromptModal, setShowUnlockPinPromptModal] = useState(false);
+  const [unlockPinInput, setUnlockPinInput] = useState("");
+  const [verifiedConstantActive, setVerifiedConstantActive] = useState(false);
+  const [helpProblemText, setHelpProblemText] = useState("");
+  const [helpCategory, setHelpCategory] = useState("Bug Report / Connection Reset");
+  const [isSubmittingHelp, setIsSubmittingHelp] = useState(false);
+  const [helpTicketId, setHelpTicketId] = useState<string | null>(null);
   const [favorites, setFavorites] = useState<string[]>([]);
   const [rowMenuChatId, setRowMenuChatId] = useState<string | null>(null);
   const [pendingLockedChatToLoad, setPendingLockedChatToLoad] = useState<any | null>(null);
@@ -618,6 +648,16 @@ export default function App() {
       const res = await fetch("/api/settings");
       const data = await res.json();
       setProSettings(data);
+      if (data && data.phoneNumber) {
+        try {
+          const pinRes = await fetch(`/api/phone-lock-pin?phone=${encodeURIComponent(data.phoneNumber)}`);
+          const pinData = await pinRes.json();
+          if (pinData.success && pinData.pin) {
+            setUserLockPin(pinData.pin);
+            localStorage.setItem("userLockPin", pinData.pin);
+          }
+        } catch (err) {}
+      }
     } catch (e) {}
   };
 
@@ -700,6 +740,55 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
+  const [previewPhotoUrl, setPreviewPhotoUrl] = useState<string | null>(null);
+  const [selectedPhotoFile, setSelectedPhotoFile] = useState<File | null>(null);
+  const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const profilePhotoInputRef = useRef<HTMLInputElement>(null);
+
+  const handlePhotoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setSelectedPhotoFile(file);
+      const url = URL.createObjectURL(file);
+      setPreviewPhotoUrl(url);
+    }
+  };
+
+  const confirmPhotoUpload = async () => {
+    if (!selectedPhotoFile) return;
+    setIsUploadingPhoto(true);
+    const formData = new FormData();
+    formData.append("image", selectedPhotoFile);
+
+    try {
+      const res = await fetch("/api/profile/picture", {
+        method: "POST",
+        body: formData,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.url) {
+          const ownJid = user?.id ? (user.id.split(":")[0] + "@s.whatsapp.net") : "me@s.whatsapp.net";
+          setProfilePictures((prev) => ({
+            ...prev,
+            [ownJid]: data.url,
+            "me@s.whatsapp.net": data.url,
+          }));
+          
+          setPreviewPhotoUrl(null);
+          setSelectedPhotoFile(null);
+          setError("Profile portrait updated successfully.");
+        }
+      } else {
+        setError("Error transmitting portrait data file.");
+      }
+    } catch (err) {
+      setError("Failed to transmit image file.");
+    } finally {
+      setIsUploadingPhoto(false);
+    }
+  };
+
   const fetchProfilePicture = async (jid: string) => {
     if (profilePictures[jid] || failedPictures.current.has(jid)) return;
     try {
@@ -722,10 +811,37 @@ export default function App() {
     } catch (e) {}
   };
 
+  const [isCallRecording, setIsCallRecording] = useState(false);
+
+  const toggleCallRecording = async () => {
+    if (!activeCallSession) return;
+    const newRecordingState = !isCallRecording;
+    const action = newRecordingState ? "start" : "stop";
+    
+    try {
+      const res = await fetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          from: "me@s.whatsapp.net",
+          to: activeCallSession.jid,
+          type: activeCallSession.isVideo ? "video" : "audio",
+          duration: activeCallSession.duration,
+          contactName: activeCallSession.recipientName
+        })
+      });
+      if (res.ok) {
+        setIsCallRecording(newRecordingState);
+      }
+    } catch (err) {}
+  };
+
   const startInAppCall = (chatId: string, isVideo: boolean = false) => {
     const chat = chats.find((c) => c.id === chatId);
     const recipientName = chat ? getDisplayName(chat) : chatId.split("@")[0];
 
+    setIsCallRecording(false);
     setActiveCallSession({
       jid: chatId,
       recipientName,
@@ -738,6 +854,25 @@ export default function App() {
 
   const endInAppCall = async () => {
     if (!activeCallSession) return;
+    
+    if (isCallRecording) {
+      try {
+        await fetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "stop",
+            from: "me@s.whatsapp.net",
+            to: activeCallSession.jid,
+            type: activeCallSession.isVideo ? "video" : "audio",
+            duration: activeCallSession.duration,
+            contactName: activeCallSession.recipientName
+          })
+        });
+      } catch (err) {}
+      setIsCallRecording(false);
+    }
+
     const finalSession = { ...activeCallSession, status: "ended" };
     setActiveCallSession(finalSession);
 
@@ -1418,7 +1553,8 @@ export default function App() {
     if (chat.name) return chat.name;
 
     const rawNumber = chatJid.split("@")[0];
-    if (proSettings.hideNumbers) {
+    const bypassMask = showContactInfo && activeChat && activeChat.id === chatJid;
+    if (proSettings.hideNumbers && !bypassMask) {
       return `${rawNumber.slice(0, 4)}••••${rawNumber.slice(-2)}`;
     }
     return rawNumber;
@@ -2345,7 +2481,7 @@ export default function App() {
 
         {/* Tab Navigation */}
         <div className="flex border-b border-white/5 bg-[#111b21] h-12">
-          {(["CHATS", "STATUS", "CALLS", "LOGS"] as Tab[]).map((tab) => (
+          {(["CHATS", "STATUS", "CALLS", "RECORDS"] as Tab[]).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -2382,21 +2518,48 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="flex gap-1.5 pb-2 overflow-x-auto no-scrollbar scroll-smooth whitespace-nowrap scrollbar-none max-w-full">
-                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "VERIFIED"] as const).map(
-                    (tab) => (
-                      <button
-                        key={tab}
-                        onClick={() => {
-                          setShowLockedChats(false);
-                          setChatSubTab(tab);
-                        }}
-                        className={`px-3 sm:px-4 py-1.5 rounded-full text-[8px] sm:text-[9px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1 ${chatSubTab === tab ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
-                      >
-                        {tab}
-                      </button>
-                    ),
+                <div className="flex overflow-x-auto whitespace-nowrap scrollbar-none gap-2 pb-2 max-w-full touch-pan-x select-none">
+                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "VERIFIED", "NEW"] as const).map(
+                    (tab) => {
+                      const isActive = chatSubTab === tab || (tab === "VERIFIED" && verifiedConstantActive);
+                      return (
+                        <button
+                          key={tab}
+                          onClick={() => {
+                            if (tab === "VERIFIED") {
+                              setVerifiedConstantActive(!verifiedConstantActive);
+                            } else {
+                              setChatSubTab(tab);
+                            }
+                            setShowLockedChats(false);
+                          }}
+                          className={`px-4 py-2 min-w-[95px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1 ${isActive ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
+                        >
+                          {tab === "VERIFIED" && verifiedConstantActive ? "🛡️ VERIFIED ✓" : tab}
+                        </button>
+                      );
+                    },
                   )}
+                  <button
+                    onClick={() => {
+                      setUnlockPinInput("");
+                      setShowUnlockPinPromptModal(true);
+                    }}
+                    className={`px-4 py-2 min-w-[120px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1.5 ${chatSubTab === "LOCKED" ? "bg-amber-500 text-black border-amber-500 shadow-lg shadow-amber-500/20" : "bg-yellow-500/10 text-yellow-500 border-yellow-500/20 hover:bg-yellow-500/20"}`}
+                  >
+                    🔐 UNLOCK CHATS
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSelectedContactsToLock([]);
+                      setNewLockPinInput("");
+                      setConfirmLockPinInput("");
+                      setShowLockSetupModal(true);
+                    }}
+                    className="px-4 py-2 min-w-[125px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border border-white/5 bg-white/5 text-[#00a884] hover:bg-white/10 flex items-center justify-center gap-1"
+                  >
+                    ➕ LOCK CHATS
+                  </button>
                 </div>
               </div>
 
@@ -2424,12 +2587,21 @@ export default function App() {
 
                   if (!matchesSearch) return false;
 
+                  // Constantly filter to verified fits if active
+                  if (verifiedConstantActive) {
+                    const isVerified = contacts[c.id]?.name && contacts[c.id].name !== c.id.split('@')[0];
+                    if (!isVerified) return false;
+                  }
+
                   if (chatSubTab === "UNREAD") return (c.unreadCount || 0) > 0;
                   if (chatSubTab === "FAVORITES")
                     return favorites.includes(c.id);
                   if (chatSubTab === "GROUPS") return c.id.endsWith("@g.us");
                   if (chatSubTab === "VERIFIED") {
                     return contacts[c.id]?.name && contacts[c.id].name !== c.id.split('@')[0];
+                  }
+                  if (chatSubTab === "NEW") {
+                    return !c.id.endsWith("@g.us") && c.id !== "status@broadcast";
                   }
 
                   return true;
@@ -2468,6 +2640,19 @@ export default function App() {
                           )}
                           {lockedChats.includes(chat.id) && (
                             <Lock className="w-3 h-3 text-yellow-500" />
+                          )}
+                          {chatSubTab === "LOCKED" && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleLockChat(chat.id);
+                              }}
+                              className="px-2 py-1 hover:bg-[#202c33] rounded text-amber-500 hover:text-amber-400 transition-colors shrink-0 flex items-center gap-1 border border-amber-500/20 bg-amber-500/10 mr-1"
+                              title="Unlock this mobile number"
+                            >
+                              <Unlock className="w-3 h-3 text-amber-500" />
+                              <span className="text-[8px] font-black uppercase tracking-tight">UNLOCK</span>
+                            </button>
                           )}
                           <span className="text-[9px] text-[#8696a0] font-black mr-1">
                             {safeFormat(chat.timestamp, "HH:mm")}
@@ -2993,40 +3178,74 @@ export default function App() {
               )}
             </div>
           )}
-          {activeTab === "LOGS" && (
-            <div className="p-4 space-y-1 font-mono text-[9px] h-full flex flex-col">
-              <div className="p-2 mb-4 bg-emerald-500/5 rounded border border-emerald-500/10 space-y-1">
+          {activeTab === "RECORDS" && (
+            <div className="p-4 space-y-4 h-full flex flex-col overflow-hidden bg-[#111b21]">
+              <div className="p-3 bg-[#202c33] rounded-xl border border-white/5 space-y-1">
                 <div className="flex items-center gap-2">
-                  <Lock className="w-3 h-3 text-emerald-500" />
-                  <span className="text-emerald-500 font-black uppercase tracking-widest">
-                    Secured Engine Feedback
+                  <Mic className="w-4 h-4 text-[#00a884]" />
+                  <span className="text-[#00a884] font-black uppercase tracking-wider text-[11px]">
+                    Vault Call Recordings
                   </span>
                 </div>
-                <p className="text-[8px] opacity-40">
-                  Persistence Point:{" "}
-                  <span className="text-white">pro_data.json</span>
-                </p>
-                <p className="text-[8px] opacity-40 uppercase tracking-tighter">
-                  Pro Data is safely isolated in the server root.
+                <p className="text-[9px] text-white/50">
+                  Secure backup and active call log auditing files. Always offline persistent.
                 </p>
               </div>
-              <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1">
-                {engineLogs.map((log, i) => (
-                  <div
-                    key={i}
-                    className="py-1 border-b border-white/[0.02] flex gap-2 overflow-hidden"
-                  >
-                    <span className="text-white/20 shrink-0">
-                      [{safeFormat(log.time, "HH:mm:ss")}]
-                    </span>
-                    <span
-                      className={`font-black shrink-0 ${log.level === "ERROR" ? "text-red-500" : log.level === "WARN" ? "text-yellow-500" : "text-[#00a884]"}`}
-                    >
-                      {log.level}
-                    </span>
-                    <span className="text-white/60 truncate">{log.msg}</span>
+
+              <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
+                {callRecords.length === 0 ? (
+                  <div className="h-44 flex flex-col items-center justify-center space-y-2 opacity-30 text-center">
+                    <Mic className="w-8 h-8 text-white" />
+                    <p className="text-[10px] font-black uppercase tracking-wider">No recordings offline</p>
                   </div>
-                ))}
+                ) : (
+                  callRecords.map((record: any) => (
+                    <div
+                      key={record.id}
+                      className="p-3 bg-[#202c33]/50 border border-white/5 rounded-xl flex flex-col space-y-3 transition-hover hover:bg-[#202c33]"
+                    >
+                      <div className="flex justify-between items-start">
+                        <div className="space-y-0.5">
+                          <p className="text-[11px] font-black text-white truncate max-w-[180px]">
+                            {record.contactName || record.to || "Unknown Call"}
+                          </p>
+                          <p className="text-[9px] font-mono text-white/40">
+                            {record.to}
+                          </p>
+                        </div>
+                        <span className="p-1 px-2 rounded-md bg-white/5 text-white/60 text-[8px] font-bold font-mono">
+                          {record.type === "video" ? "VIDEO" : "AUDIO"}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[9px] text-[#aebac1]">
+                        <span className="flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-[#00a884]" />
+                          {record.duration}s
+                        </span>
+                        <span className="text-white/30 text-[8px]">
+                          {new Date(record.timestamp * 1000).toLocaleString()}
+                        </span>
+                      </div>
+
+                      <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <audio
+                          src={record.recording_url}
+                          controls
+                          className="flex-1 h-7 rounded-lg bg-black/40 text-white [&::-webkit-media-controls-panel]:bg-[#202c33]"
+                        />
+                        <a
+                          href={record.recording_url}
+                          download={`call_${record.id}.mp3`}
+                          className="px-3 py-1.5 h-7 bg-[#00a884] text-white hover:bg-[#00a884]/80 rounded-lg text-[9px] font-black uppercase tracking-wider flex items-center justify-center gap-1 transition-all"
+                        >
+                          <Download className="w-3 h-3" />
+                          Save
+                        </a>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           )}
@@ -3110,14 +3329,22 @@ export default function App() {
             {/* Timer Output */}
             <div className="text-center z-10 space-y-2">
               {activeCallSession.status === "connected" && (
-                <div className="font-mono text-2xl font-black text-[#00a884] tracking-widest bg-white/5 border border-white/5 px-6 py-2 rounded-xl inline-block shadow-inner">
-                  {Math.floor(activeCallSession.duration / 60)
-                    .toString()
-                    .padStart(2, "0")}
-                  :
-                  {(activeCallSession.duration % 60)
-                    .toString()
-                    .padStart(2, "0")}
+                <div className="space-y-2">
+                  <div className="font-mono text-2xl font-black text-[#00a884] tracking-widest bg-white/5 border border-white/5 px-6 py-2 rounded-xl inline-block shadow-inner">
+                    {Math.floor(activeCallSession.duration / 60)
+                      .toString()
+                      .padStart(2, "0")}
+                    :
+                    {(activeCallSession.duration % 60)
+                      .toString()
+                      .padStart(2, "0")}
+                  </div>
+                  {isCallRecording && (
+                    <div className="flex items-center justify-center gap-1.5 text-red-500 font-bold uppercase tracking-widest text-[9px] animate-pulse">
+                      <span className="w-2 h-2 rounded-full bg-red-500" />
+                      <span>Recording...</span>
+                    </div>
+                  )}
                 </div>
               )}
               <p className="text-[9px] text-[#8696af] uppercase tracking-[0.2em] font-black opacity-60">
@@ -3126,7 +3353,7 @@ export default function App() {
             </div>
 
             {/* Dashboard Call Actions */}
-            <div className="flex items-center gap-6 z-10 mb-8">
+            <div className="flex items-center gap-4 z-10 mb-8">
               <button
                 onClick={() =>
                   setActiveCallSession((prev) =>
@@ -3143,8 +3370,19 @@ export default function App() {
               </button>
 
               <button
+                onClick={toggleCallRecording}
+                className={`w-14 h-14 rounded-2xl flex flex-col items-center justify-center border transition-all ${isCallRecording ? "bg-red-500/20 text-red-500 border-red-500/40 animate-pulse" : "bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15"}`}
+                title="Toggle Call Recording"
+              >
+                <Mic className="w-5 h-5 mb-0.5" />
+                <span className="text-[8px] font-black uppercase text-center block leading-none">
+                  {isCallRecording ? "REC ON" : "RECORD"}
+                </span>
+              </button>
+
+              <button
                 onClick={endInAppCall}
-                className="w-20 h-14 rounded-2xl bg-red-600 hover:bg-red-700 text-white flex items-center justify-center transition-all shadow-lg shadow-red-600/30 font-black hover:scale-105 active:scale-95"
+                className="w-20 h-14 rounded-2xl bg-red-600 hover:bg-red-700 text-white flex items-center justify-center transition-all shadow-lg shadow-red-600/30 font-black hover:scale-105 active:scale-95 animate-pulse"
               >
                 <PhoneOff className="w-6 h-6" />
               </button>
@@ -4430,7 +4668,7 @@ export default function App() {
                   onChange={(e) => setEnteredPasscode(e.target.value)}
                   onKeyPress={(e) => {
                     if (e.key === "Enter") {
-                      if (enteredPasscode === "1234") {
+                      if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
                         setShowLockedChats(true);
                         setChatSubTab("LOCKED");
                         setShowPasscodeModal(false);
@@ -4460,7 +4698,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => {
-                      if (enteredPasscode === "1234") {
+                      if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
                         setShowLockedChats(true);
                         setChatSubTab("LOCKED");
                         setShowPasscodeModal(false);
@@ -4481,7 +4719,7 @@ export default function App() {
 
                 <button
                   onClick={() => {
-                    if (enteredPasscode === "1234") {
+                    if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
                       toggleLockChat(pendingLockedChatToLoad?.id || "");
                       setShowPasscodeModal(false);
                       setPendingLockedChatToLoad(null);
@@ -5237,6 +5475,21 @@ export default function App() {
                                 desc: "Invisible presence on the signal",
                               },
                               {
+                                key: "antiDelete",
+                                label: "Anti-Delete Messages",
+                                desc: "Prevent recipients from revoking sent message footprints",
+                              },
+                              {
+                                key: "hideNumbers",
+                                label: "Mask Contact Numbers",
+                                desc: "Hide JID phone numbers to secure conversations on-screen",
+                              },
+                              {
+                                key: "autoReply",
+                                label: "Auto Reply Engine",
+                                desc: "Toggle automatic scripted reply module triggers",
+                              },
+                              {
                                 key: "hideBlueTicks",
                                 label: "Hide Blue Ticks",
                                 desc: "Suppress read receipt transmission",
@@ -5524,6 +5777,11 @@ export default function App() {
                                             throw new Error("Restore failed");
                                           await fetchBackupStatus();
                                           await fetchSettings(); // reload settings
+                                           await fetchBackupStatus();
+                                           await fetchFavorites();
+                                           await fetchLockedChats();
+                                           await checkConnectionStatus();
+                                           setError("Cloud Restore Complete! Decrypted and synced database successfully with active cloud backup.");
                                         } catch (e: any) {
                                           setBackupError(
                                             "Restore failed. No active backup available.",
@@ -5580,13 +5838,101 @@ export default function App() {
                       </p>
                     </div>
                     {settingsView === "help" && (
-                      <div className="space-y-3 mt-4">
-                        <button className="w-full py-4 bg-[#00a884] text-white rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-xl shadow-[#00a884]/20">
-                          Contact Neural Support
-                        </button>
-                        <button className="w-full py-4 bg-white/5 text-white/40 rounded-2xl font-black text-[10px] uppercase tracking-widest">
-                          Privacy Protocol Document
-                        </button>
+                      <div className="space-y-4 mt-4">
+                        <div className="p-4 rounded-2xl bg-black/40 border border-white/5 space-y-3">
+                          <span className="text-[9px] text-[#00a884] font-black uppercase tracking-widest block font-sans">Submit System Request Ticket</span>
+                          
+                          <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase text-[#aebac1]/50 tracking-wider">Select Request Category</label>
+                            <select
+                              value={helpCategory}
+                              onChange={(e) => setHelpCategory(e.target.value)}
+                              className="w-full bg-[#1e2a30] text-[10px] font-bold p-3 rounded-xl text-white outline-none focus:border-[#00a884]/40 border border-transparent font-sans"
+                            >
+                              <option>Bug Report / Connection Reset</option>
+                              <option>Core Connection State Assistance</option>
+                              <option>Interactive Security Locking & PIN Issues</option>
+                              <option>Backup Integrity & Cloud Restore Request</option>
+                              <option>Feature Recommendation Request</option>
+                            </select>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase text-[#aebac1]/50 tracking-wider">Detail your Problem / Update Request</label>
+                            <textarea
+                              rows={4}
+                              placeholder="Please describe your current query, exact error message, or feature requests in complete detail so our network review panel can replicate it..."
+                              className="w-full bg-[#1e2a30] text-xs p-3 rounded-xl text-white outline-none focus:border-[#00a884]/40 border border-transparent placeholder:text-white/20 leading-relaxed font-sans font-medium"
+                              value={helpProblemText}
+                              onChange={(e) => setHelpProblemText(e.target.value)}
+                            />
+                          </div>
+
+                          <button
+                            disabled={isSubmittingHelp || !helpProblemText.trim()}
+                            onClick={async () => {
+                              setIsSubmittingHelp(true);
+                              try {
+                                const res = await fetch("/api/help-request", {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({
+                                    problem: helpProblemText,
+                                    category: helpCategory
+                                  }),
+                                });
+                                if (res.ok) {
+                                  const raw = await res.json();
+                                  setHelpTicketId(raw.ticketId);
+                                  setHelpProblemText("");
+                                  setError(`Ticket ${raw.ticketId} successfully submitted! Category: ${helpCategory}. Our technical staff is reviewing this request.`);
+                                } else {
+                                  throw new Error("API post error");
+                                }
+                              } catch (e) {
+                                setError("Failed to submit request. Please try again.");
+                              } finally {
+                                setIsSubmittingHelp(false);
+                              }
+                            }}
+                            className={`w-full py-3 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all font-sans ${
+                              helpProblemText.trim() && !isSubmittingHelp
+                                ? "bg-[#00a884] text-white hover:bg-[#00bc95] shadow-lg shadow-[#00a884]/20 cursor-pointer"
+                                : "bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-50"
+                            }`}
+                          >
+                            {isSubmittingHelp ? "Registering..." : "Submit Server Request"}
+                          </button>
+                        </div>
+
+                        {helpTicketId && (
+                          <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-[10px] space-y-1 font-sans">
+                            <p className="font-black uppercase tracking-wider">🟢 ACTIVE TICKET REGISTERED</p>
+                            <p className="font-mono text-white text-xs select-all bg-black/20 p-2.5 rounded-lg border border-white/5 font-bold">{helpTicketId}</p>
+                            <p className="italic text-[9px] text-white/50">Keep reference of this ticket hash for support correspondence.</p>
+                          </div>
+                        )}
+
+                        <div className="flex gap-2 font-sans">
+                          <button 
+                            onClick={() => {
+                              setHelpProblemText("Feature Request: Please integrate automated media compression protocol so uploads are extremely fast on low and congested bandwidth chains!");
+                              setHelpCategory("Feature Recommendation Request");
+                            }}
+                            className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-[8px] text-[#aebac1] font-black uppercase tracking-widest border border-white/5"
+                          >
+                            📝 Suggest Upgrade
+                          </button>
+                          <button 
+                            onClick={() => {
+                              setHelpProblemText("Bug report: Local session is resetting when switching networks under dual-mode standby mode. Resync requested!");
+                              setHelpCategory("Bug Report / Connection Reset");
+                            }}
+                            className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-[8px] text-[#aebac1] font-black uppercase tracking-widest border border-white/5"
+                          >
+                            ⚠️ Reset Bug
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -5896,10 +6242,23 @@ export default function App() {
                 <div className="flex flex-col items-center gap-4">
                   <div className="relative group">
                     <div className="w-24 h-24 rounded-3xl bg-[#00a884] flex items-center justify-center shadow-2xl overflow-hidden border border-white/10 text-white text-3xl font-black">
-                      {user?.id &&
-                      profilePictures[
-                        user.id.split(":")[0] + "@s.whatsapp.net"
-                      ] ? (
+                      {previewPhotoUrl ? (
+                        <div className="relative w-full h-full">
+                          <img
+                            src={previewPhotoUrl}
+                            alt="Selected visual preview"
+                            className="w-full h-full object-cover"
+                          />
+                          <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
+                            <span className="text-[9px] font-black uppercase text-[#00a884] bg-[#111b21] px-1.5 py-0.5 rounded-md animate-pulse">
+                              PREVIEW
+                            </span>
+                          </div>
+                        </div>
+                      ) : (user?.id &&
+                       profilePictures[
+                         user.id.split(":")[0] + "@s.whatsapp.net"
+                       ] ? (
                         <img
                           src={
                             profilePictures[
@@ -5913,18 +6272,52 @@ export default function App() {
                         />
                       ) : (
                         user?.name?.[0] || <Zap />
-                      )}
+                      ))}
                     </div>
-                    <label className="absolute -bottom-2 -right-2 bg-[#00a884] p-2 rounded-xl border border-white/20 cursor-pointer shadow-xl hover:scale-110 transition-all">
-                      <Camera className="w-4 h-4 text-white" />
+                  </div>
+
+                  {previewPhotoUrl ? (
+                    <div className="flex gap-2 w-full animate-in fade-in slide-in-from-top-2 duration-300">
+                      <button
+                        onClick={confirmPhotoUpload}
+                        disabled={isUploadingPhoto}
+                        className="flex-1 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-wider py-2 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5"
+                      >
+                        {isUploadingPhoto ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Check className="w-3.5 h-3.5" />
+                        )}
+                        Confirm Upload
+                      </button>
+                      <button
+                        onClick={() => {
+                          setPreviewPhotoUrl(null);
+                          setSelectedPhotoFile(null);
+                        }}
+                        className="flex-1 bg-white/5 hover:bg-white/10 text-white/60 text-[9px] font-black uppercase tracking-wider py-2 rounded-xl transition-all border border-white/5"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <div>
+                      <button
+                        onClick={() => profilePhotoInputRef.current?.click()}
+                        className="px-4 py-2 bg-[#00a884]/15 hover:bg-[#00a884]/25 text-[#00a884] text-[10px] font-black uppercase tracking-widest rounded-xl transition-all border border-[#00a884]/30 flex items-center gap-1.5 shadow-md shadow-[#00a884]/5"
+                      >
+                        <Camera className="w-3.5 h-3.5" />
+                        Update Profile Picture
+                      </button>
                       <input
                         type="file"
-                        accept="image/*"
-                        onChange={uploadProfilePicture}
+                        ref={profilePhotoInputRef}
+                        accept="image/jpg,image/jpeg,image/png,image/webp"
+                        onChange={handlePhotoSelect}
                         className="hidden"
                       />
-                    </label>
-                  </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-4">
@@ -6048,7 +6441,10 @@ export default function App() {
 
       <AnimatePresence>
         {showAdminConsole && (
-          <SecretAdminPanel onClose={() => setShowAdminConsole(false)} />
+          <SecretAdminPanel 
+            onClose={() => setShowAdminConsole(false)} 
+            currentPhoneNumber={user?.id ? (user.id.split(":")[0]) : waLinkPhone}
+          />
         )}
       </AnimatePresence>
 
@@ -6151,6 +6547,239 @@ export default function App() {
                   className="flex-1 py-3 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all shadow-lg shadow-[#00a884]/25"
                 >
                   I Agree & Confirm Compliance
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* SETUP LOCK CHATS WIZARD */}
+      <AnimatePresence>
+        {showLockSetupModal && (
+          <motion.div
+            key="lock-setup-modal"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[120] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 font-sans"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="w-full max-w-md bg-[#11232c] border border-emerald-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(16,185,129,0.15)] space-y-6"
+            >
+              <div className="flex justify-between items-center border-b border-white/5 pb-3">
+                <div className="flex items-center gap-2">
+                  <Lock className="w-5 h-5 text-[#00a884]" />
+                  <h3 className="text-sm font-black text-white uppercase tracking-wider">Secure Chat Wizard</h3>
+                </div>
+                <button 
+                  onClick={() => setShowLockSetupModal(false)}
+                  className="p-1 hover:bg-white/5 rounded-full text-white/50 hover:text-white transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Step 1: Select Contacts to Lock */}
+              <div className="space-y-4">
+                <div className="space-y-1">
+                  <span className="text-[10px] uppercase font-black tracking-widest text-[#00a884]">Step 1: Select Contacts</span>
+                  <p className="text-[11px] text-white/50 italic">Choose the mobile number/chats you wish to isolate into the secure vault:</p>
+                </div>
+
+                <div className="max-h-48 overflow-y-auto space-y-1.5 p-2 bg-black/40 rounded-2xl border border-white/5 custom-scrollbar">
+                  {Object.keys(contacts).length === 0 ? (
+                    <div className="text-[10px] italic text-white/30 text-center py-4">No active connection contacts found.</div>
+                  ) : (
+                    Object.keys(contacts).map((jid) => {
+                      const isSelected = selectedContactsToLock.includes(jid);
+                      return (
+                        <div
+                          key={jid}
+                          onClick={() => {
+                            if (isSelected) {
+                              setSelectedContactsToLock(selectedContactsToLock.filter(id => id !== jid));
+                            } else {
+                              setSelectedContactsToLock([...selectedContactsToLock, jid]);
+                            }
+                          }}
+                          className={`flex items-center justify-between p-2.5 rounded-xl cursor-pointer transition-colors ${isSelected ? 'bg-[#00a884]/10 border border-[#00a884]/30 text-white' : 'bg-white/5 hover:bg-white/10 text-white/70 border border-transparent'}`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="w-3 h-3 rounded-md border border-white/20 flex items-center justify-center">
+                              {isSelected && <div className="w-1.5 h-1.5 bg-[#00a884] rounded" />}
+                            </div>
+                            <span className="text-xs truncate font-bold">{contacts[jid].name || jid.split("@")[0]}</span>
+                          </div>
+                          <span className="text-[9px] font-mono text-white/30 truncate select-none">{jid.split("@")[0]}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* Step 2: Set secure PIN */}
+                <div className="space-y-3 pt-2 border-t border-white/5">
+                  <div className="space-y-1">
+                    <span className="text-[10px] uppercase font-black tracking-widest text-amber-400">Step 2: Set Security PIN</span>
+                    <p className="text-[11px] text-white/50 italic">Both PIN entries must match to complete lock authorization:</p>
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-[9px] text-[#aebac1]/60 uppercase font-black">Secure PIN</label>
+                      <input
+                        type="password"
+                        maxLength={6}
+                        placeholder="••••"
+                        className="w-full bg-[#1e2a30] text-white text-center rounded-xl p-2.5 outline-none border border-white/5 focus:border-[#00a884]/40 font-mono tracking-widest"
+                        value={newLockPinInput}
+                        onChange={(e) => setNewLockPinInput(e.target.value.replace(/\D/g, ""))}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[9px] text-[#aebac1]/60 uppercase font-black">Confirm PIN</label>
+                      <input
+                        type="password"
+                        maxLength={6}
+                        placeholder="••••"
+                        className="w-full bg-[#1e2a30] text-white text-center rounded-xl p-2.5 outline-none border border-white/5 focus:border-[#00a884]/40 font-mono tracking-widest"
+                        value={confirmLockPinInput}
+                        onChange={(e) => setConfirmLockPinInput(e.target.value.replace(/\D/g, ""))}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex gap-3 pt-3">
+                  <button
+                    onClick={() => setShowLockSetupModal(false)}
+                    className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    disabled={selectedContactsToLock.length === 0 || !newLockPinInput || newLockPinInput !== confirmLockPinInput}
+                    onClick={async () => {
+                      if (newLockPinInput !== confirmLockPinInput) {
+                        setError("Verification Failure: Pins do not match!");
+                        return;
+                      }
+                      
+                      setUserLockPin(newLockPinInput);
+                      localStorage.setItem("userLockPin", newLockPinInput);
+                      
+                      // Lock selected contacts
+                      const nextLocked = [...lockedChats];
+                      for (const jid of selectedContactsToLock) {
+                        if (!nextLocked.includes(jid)) {
+                          nextLocked.push(jid);
+                          try {
+                            await fetch("/api/lock-chat", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ chatId: jid })
+                            });
+                          } catch (e) {}
+                        }
+                      }
+                      setLockedChats(nextLocked);
+                      setError(`Locked Vault Activated! ${selectedContactsToLock.length} contacts successfully isolated under secure PIN.`);
+                      setShowLockSetupModal(false);
+                    }}
+                    className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-all text-white shadow-lg ${
+                      selectedContactsToLock.length > 0 && newLockPinInput && newLockPinInput === confirmLockPinInput
+                        ? 'bg-[#00a884] hover:bg-[#00bc95] shadow-[#00a884]/20 font-bold'
+                        : 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-55'
+                    }`}
+                  >
+                    Activate Locked Vault
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* PIN UNLOCK VERIFICATION MODAL */}
+      <AnimatePresence>
+        {showUnlockPinPromptModal && (
+          <motion.div
+            key="unlock-pin-modal"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[120] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 font-sans"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="w-full max-w-sm bg-[#11232c] border border-amber-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(245,158,11,0.15)] text-center space-y-6"
+            >
+              <div className="w-14 h-14 bg-amber-500/10 text-amber-500 rounded-full flex items-center justify-center mx-auto shadow-inner">
+                <Lock className="w-7 h-7" />
+              </div>
+
+              <div className="space-y-1.5">
+                <h3 className="text-sm font-black text-white uppercase tracking-wider">Unseal Vault Authorization</h3>
+                <p className="text-[10px] text-white/50 leading-relaxed italic">
+                  Provide your credential verification PIN to unlock persistent secure conversations:
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <input
+                  type="password"
+                  maxLength={6}
+                  placeholder="••••"
+                  autoFocus
+                  className="w-32 bg-[#1e2a30] text-white text-center text-xl rounded-xl p-3 outline-none border border-white/10 focus:border-amber-500/40 font-mono tracking-widest mx-auto block"
+                  value={unlockPinInput}
+                  onChange={(e) => setUnlockPinInput(e.target.value.replace(/\D/g, ""))}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && unlockPinInput) {
+                      if (unlockPinInput === userLockPin) {
+                        setChatSubTab("LOCKED");
+                        setShowUnlockPinPromptModal(false);
+                        setError("Access Granted! SECURED locked vault unsealed successfully.");
+                      } else {
+                        setError("Security Failure: Incorrect Verification PIN!");
+                      }
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  onClick={() => setShowUnlockPinPromptModal(false)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={!unlockPinInput}
+                  onClick={() => {
+                    if (unlockPinInput === userLockPin) {
+                      setChatSubTab("LOCKED");
+                      setShowUnlockPinPromptModal(false);
+                      setError("Access Granted! SECURED locked vault unsealed successfully.");
+                    } else {
+                      setError("Security Failure: Incorrect Verification PIN!");
+                    }
+                  }}
+                  className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-all text-white shadow-lg ${
+                    unlockPinInput
+                      ? 'bg-amber-500 text-black hover:bg-[#00a884] shadow-amber-500/25 font-bold'
+                      : 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-55'
+                  }`}
+                >
+                  Decrypt Vault
                 </button>
               </div>
             </motion.div>

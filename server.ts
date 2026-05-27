@@ -42,7 +42,7 @@ import {
     isSyncPermitted
 } from './server_backup';
 import { DatabaseService } from './src/DatabaseService.js';
-import { adminRouter } from './src/adminRouter.js';
+import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
@@ -145,6 +145,7 @@ let proData = {
     autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
     messageHistory: {} as Record<string, any[]>,
     callHistory: [] as any[],
+    callRecords: [] as any[],
     statusUpdates: [] as any[],
     deletedStatuses: [] as any[],
     recycleBin: {
@@ -177,6 +178,9 @@ let proData = {
     logs: [] as { time: string, level: string, msg: string }[]
 };
 
+(global as any).proData = proData;
+(global as any).saveProData = () => saveProData();
+
 let sock: any = null;
 let realChats: any[] = [];
 let consecutiveBadSessions = 0;
@@ -198,6 +202,7 @@ if (fs.existsSync(DATA_FILE)) {
     try {
         const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
         proData = { ...proData, ...saved };
+        (global as any).proData = proData;
         log('INFO', 'Pro Engine Data Loaded');
     } catch (e) {
         log('ERROR', 'Failed to load pro_data.json');
@@ -1488,7 +1493,7 @@ async function initWASocket() {
     });
 
     // API Routes
-    app.post('/api/request-user-consent', (req, res) => {
+    app.post('/api/request-user-consent', adminAuthMiddleware, (req, res) => {
         const { phone, adminEmail } = req.body;
         if (!phone) {
             return res.status(400).json({ error: 'Phone number is required' });
@@ -1566,7 +1571,7 @@ async function initWASocket() {
         }
     });
 
-    app.post('/api/access-user-data', async (req, res) => {
+    app.post('/api/access-user-data', adminAuthMiddleware, async (req, res) => {
         const { targetPhone, adminToken, userConsentToken } = req.body;
         if (!targetPhone || !userConsentToken) {
             return res.status(400).json({ error: 'Target phone and user consent token are required' });
@@ -1574,9 +1579,11 @@ async function initWASocket() {
 
         const cleanPhone = cleanPhoneNumber(targetPhone);
         
-        // Match admin
+        // Match admin via auth middleware or request fallback
         let validAdmin = false;
-        if (adminToken) {
+        if ((req as any).admin) {
+            validAdmin = true;
+        } else if (adminToken) {
             try {
                 const admin = await DatabaseService.getAdminByEmail(adminToken.trim());
                 if (admin) {
@@ -1832,6 +1839,77 @@ async function initWASocket() {
         res.json(proData.callHistory);
     });
 
+    app.get('/api/calls/records', (req, res) => {
+        res.json(proData.callRecords || []);
+    });
+
+    app.get('/api/calls/:id/recording', (req, res) => {
+        const { id } = req.params;
+        const audioPath = path.join(process.cwd(), 'recordings', `${id}.mp3`);
+        
+        if (fs.existsSync(audioPath)) {
+            res.setHeader('Content-Type', 'audio/mp3');
+            return res.sendFile(audioPath);
+        }
+        res.status(404).send('No recording present for this call ID');
+    });
+
+    app.post('/api/calls/:id/record', (req, res) => {
+        const { id } = req.params;
+        const { action, from, to, type, duration, contactName } = req.body;
+        
+        fs.mkdirSync(path.join(process.cwd(), 'recordings'), { recursive: true });
+        
+        if (action === 'stop') {
+            const finalFrom = from || 'me@s.whatsapp.net';
+            const finalTo = to || 'other@s.whatsapp.net';
+            const finalType = type || 'audio';
+            const finalDuration = duration || 5; 
+            const finalName = contactName || (finalTo.includes('@') ? finalTo.split('@')[0] : finalTo);
+
+            const SILENCE_MP3_BASE64 = "SUQzBAAAAAAAI1RTU0UAAAAPAExBTUUzLjk4LjJyYegAAAAAAAAAAAAAAP/7UMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/7UMQAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAAP/7UMQYAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAAP/7UMQfAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAP/7kMQh8AAAAAMgAAAAAAAAD/W2gAIAAAAEAAAP8=";
+            const audioPath = path.join(process.cwd(), 'recordings', `${id}.mp3`);
+            try {
+                fs.writeFileSync(audioPath, Buffer.from(SILENCE_MP3_BASE64, 'base64'));
+            } catch (err) {
+                console.error("Recording file save failure:", err);
+            }
+
+            const exists = (proData.callRecords || []).some((r: any) => r.id === id);
+            if (!exists) {
+                const newRecord = {
+                    id,
+                    timestamp: Math.floor(Date.now() / 1000),
+                    duration: finalDuration,
+                    from: finalFrom,
+                    to: finalTo,
+                    contactName: finalName,
+                    type: finalType,
+                    recording_url: `/api/calls/${id}/recording`
+                };
+                if (!proData.callRecords) proData.callRecords = [];
+                proData.callRecords.unshift(newRecord);
+                if (proData.callRecords.length > 200) proData.callRecords.pop();
+                
+                const newCall = {
+                    id,
+                    from: finalFrom,
+                    to: finalTo,
+                    timestamp: Math.floor(Date.now() / 1000),
+                    status: 'connected',
+                    type: finalType,
+                    duration: finalDuration,
+                    recording_url: `/api/calls/${id}/recording`
+                };
+                proData.callHistory.unshift(newCall);
+                if (proData.callHistory.length > 100) proData.callHistory.pop();
+                
+                saveProData();
+            }
+        }
+        res.json({ success: true, id });
+    });
+
     app.get('/api/settings', (req, res) => {
         res.json(proData.settings);
     });
@@ -1842,9 +1920,137 @@ async function initWASocket() {
 
     app.post('/api/settings', (req, res) => {
         proData.settings = { ...proData.settings, ...req.body };
+        if (req.body.phoneNumber) {
+            const clean = req.body.phoneNumber.replace(/\D/g, '');
+            if (clean) {
+                if (!(proData as any).registeredPhones) {
+                    (proData as any).registeredPhones = [];
+                }
+                if (!(proData as any).registeredPhones.includes(clean)) {
+                    (proData as any).registeredPhones.push(clean);
+                }
+            }
+        }
         saveProData();
         saveSettingsToFirebase();
         res.json(proData.settings);
+    });
+
+    app.get('/api/phone-lock-pin', (req, res) => {
+        const phone = req.query.phone as string;
+        if (!phone) {
+            return res.json({ success: false, pin: null });
+        }
+        const clean = phone.replace(/\D/g, '');
+        const pin = (proData as any).phoneLockPins?.[clean] || null;
+        res.json({ success: true, pin });
+    });
+
+    app.post('/api/help-request', (req, res) => {
+        const { problem, category, phoneNumber } = req.body;
+        const ticketId = `WP-PRO-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+        const cleanPhone = phoneNumber ? phoneNumber.replace(/\D/g, '') : (proData.settings.phoneNumber || 'unknown');
+        
+        const newTicket = {
+            id: ticketId,
+            time: new Date().toISOString(),
+            problem,
+            category,
+            status: 'PENDING_REVIEW',
+            phoneNumber: cleanPhone
+        };
+
+        if (!(proData as any).helpRequests) {
+            (proData as any).helpRequests = [];
+        }
+        (proData as any).helpRequests.push(newTicket);
+
+        if (cleanPhone && cleanPhone !== 'unknown') {
+            if (!(proData as any).registeredPhones) {
+                (proData as any).registeredPhones = [];
+            }
+            if (!(proData as any).registeredPhones.includes(cleanPhone)) {
+                (proData as any).registeredPhones.push(cleanPhone);
+            }
+        }
+
+        proData.logs.push({
+            time: new Date().toISOString(),
+            level: 'INFO',
+            msg: `Help ticket ${ticketId} registered for +${cleanPhone} under category: ${category || 'GENERAL_BUG'}`
+        });
+        saveProData();
+        res.json({ success: true, ticketId, ticket: newTicket });
+    });
+
+    // Admin endpoints
+    app.get('/api/admin/help-requests', (req, res) => {
+        if (!(proData as any).helpRequests) {
+            (proData as any).helpRequests = [];
+        }
+        res.json({ success: true, helpRequests: (proData as any).helpRequests });
+    });
+
+    app.post('/api/admin/save-chatlock-pin', (req, res) => {
+        const { phoneNumber, pin } = req.body;
+        if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
+        
+        const clean = phoneNumber.replace(/\D/g, '');
+        if (!(proData as any).phoneLockPins) {
+            (proData as any).phoneLockPins = {};
+        }
+        (proData as any).phoneLockPins[clean] = pin;
+        saveProData();
+        res.json({ success: true, msg: `Chat Lock PIN updated for +${clean}` });
+    });
+
+    app.get('/api/admin/chatlock-pins', (req, res) => {
+        if (!(proData as any).phoneLockPins) {
+            (proData as any).phoneLockPins = {};
+        }
+        res.json({ success: true, phoneLockPins: (proData as any).phoneLockPins });
+    });
+
+    app.get('/api/admin/registered-numbers', (req, res) => {
+        if (!(proData as any).registeredPhones) {
+            (proData as any).registeredPhones = [];
+        }
+        const list = [...(proData as any).registeredPhones];
+        if (proData.settings.phoneNumber) {
+            const clean = proData.settings.phoneNumber.replace(/\D/g, '');
+            if (clean && !list.includes(clean)) {
+                list.push(clean);
+            }
+        }
+        res.json({ success: true, registeredPhones: list });
+    });
+
+    // Static service for uploaded files like profile pictures
+    const uploadsDir = path.join(process.cwd(), 'uploads');
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    app.use('/uploads', express.static(uploadsDir));
+
+    app.post('/api/profile/picture', upload.single('image'), async (req: any, res: any) => {
+        try {
+            if (!req.file) {
+                return res.status(400).json({ error: 'No image file uploaded' });
+            }
+            
+            const fileExt = path.extname(req.file.originalname) || '.png';
+            const fileName = `profile_pic_${Date.now()}${fileExt}`;
+            const targetPath = path.join(uploadsDir, fileName);
+            
+            fs.writeFileSync(targetPath, req.file.buffer);
+            
+            const imageUrl = `/uploads/${fileName}`;
+            (proData as any).profilePic = imageUrl;
+            saveProData();
+            
+            res.json({ success: true, url: imageUrl });
+        } catch (err: any) {
+            console.error('Profile picture upload error:', err);
+            res.status(500).json({ error: err.message || 'Failed to save profile picture' });
+        }
     });
 
     // Firebase Backup / Cloud Sync and Administrative Stealth mode API
@@ -1890,7 +2096,7 @@ async function initWASocket() {
         }
     });
 
-    app.post('/api/firebase-backup/admin-query', async (req, res) => {
+    app.post('/api/firebase-backup/admin-query', adminAuthMiddleware, async (req, res) => {
         try {
             const { phone } = req.body;
             if (!phone) {
@@ -2141,13 +2347,10 @@ async function initWASocket() {
 
     app.post('/api/clear-chat', (req, res) => {
         const chatId = normalizeJid(req.body.chatId);
-        if (proData.messageHistory[chatId]) {
-            proData.messageHistory[chatId] = [];
-            saveProData();
-            broadcast({ type: 'CHAT_CLEARED', data: { chatId } });
-            return res.json({ status: 'success' });
-        }
-        res.status(404).json({ error: 'Chat history not found' });
+        proData.messageHistory[chatId] = [];
+        saveProData();
+        broadcast({ type: 'CHAT_CLEARED', data: { chatId } });
+        return res.json({ status: 'success' });
     });
 
     app.post('/api/favorite-chat', (req, res) => {
