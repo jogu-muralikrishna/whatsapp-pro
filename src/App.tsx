@@ -1255,7 +1255,7 @@ export default function App() {
 
   const connectWebSocket = () => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    const railwayHost = "whatsapp-pro-production.up.railway.app"; const socket = new WebSocket(`${protocol}//${railwayHost}`);
     ws.current = socket;
 
     socket.onclose = () => {
