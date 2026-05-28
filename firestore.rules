@@ -29,5 +29,10 @@ service cloud.firestore {
       allow create, write: if true;
       allow read: if false; // no reading by anyone
     }
+
+    // test_connection_dummy collection for health availability checks
+    match /test_connection_dummy/{docId} {
+      allow read, write: if true;
+    }
   }
 }

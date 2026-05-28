@@ -54,7 +54,11 @@ import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db as clientDb } from "./lib/firebaseClient";
 
 const API_BASE = "";
-const WS_BASE = "";
+// VERCEL FIX: WebSocket must connect directly to Railway backend.
+// Vercel cannot proxy WebSocket connections via its rewrite rules.
+// Add VITE_RAILWAY_WS_URL = wss://whatsapp-pro-production.up.railway.app
+// in your Vercel project → Settings → Environment Variables
+const WS_BASE = (import.meta as any).env?.VITE_RAILWAY_WS_URL || "";
 
 function safeFormat(
   dateVal: any,
@@ -1254,8 +1258,19 @@ export default function App() {
   };
 
   const connectWebSocket = () => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const railwayHost = "whatsapp-pro-production.up.railway.app"; const socket = new WebSocket(`${protocol}//${railwayHost}`);
+    // VERCEL FIX: If VITE_RAILWAY_WS_URL is set, connect WebSocket directly to Railway.
+    // This is required because Vercel cannot proxy WebSocket upgrade requests.
+    // Falls back to same-host for local dev and Railway direct-access.
+    let wsUrl: string;
+    if (WS_BASE && WS_BASE.startsWith("wss://")) {
+      wsUrl = WS_BASE;
+    } else if (WS_BASE && WS_BASE.startsWith("ws://")) {
+      wsUrl = WS_BASE;
+    } else {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${protocol}//${window.location.host}`;
+    }
+    const socket = new WebSocket(wsUrl);
     ws.current = socket;
 
     socket.onclose = () => {
