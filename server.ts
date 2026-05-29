@@ -53,12 +53,7 @@ const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
 const app = express(); // FIXED (Move globally)
 const server = createServer(app); // FIXED (Move globally)
-const wss = new WebSocketServer({ 
-  server,
-  // VERCEL FIX: Accept WebSocket upgrade requests from any origin.
-  // The frontend on Vercel connects from a different domain than Railway.
-  verifyClient: (info: any) => true,
-}); // FIXED (Move globally)
+const wss = new WebSocketServer({ server }); // FIXED (Move globally)
 
 const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
 const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
@@ -502,21 +497,6 @@ async function loadProDataFromFirestore() {
 
 async function startServer() {
     app.use(express.json());
-
-    // VERCEL FIX: Add CORS headers so the Vercel frontend can call Railway APIs.
-    // Without this, the browser blocks all cross-origin requests.
-    app.use((req: any, res: any, next: any) => {
-        const origin = req.headers.origin || '*';
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-        if (req.method === 'OPTIONS') {
-            return res.sendStatus(204);
-        }
-        next();
-    });
-
     app.use('/api/admin', adminRouter);
     
     // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
@@ -774,6 +754,7 @@ async function startServer() {
             }
         });
     }
+    (global as any).broadcast = broadcast;
 
     function registerJidMapping(lid: string, pn: string) {
         if (!lid || !pn || lid === pn) return;

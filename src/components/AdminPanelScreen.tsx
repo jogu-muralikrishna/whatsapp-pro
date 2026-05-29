@@ -1,11 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { doc, getDoc, getDocs, collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../lib/firebaseClient';
 import { AdminAuditService } from '../services/AdminAuditService';
 import { 
     ShieldAlert, Search, Eye, Settings, MessageSquare, Phone, 
     Activity, Users, X, Code, Clipboard, LogOut, Info, CheckCircle,
-    Download, Mic, RefreshCw
+    Download, Mic, RefreshCw, Trash2, Database, Key, Radio, ShieldCheck,
+    UserPlus, Play, Terminal, AlertOctagon, HelpCircle, Layers, Check
 } from 'lucide-react';
 
 interface AdminPanelScreenProps {
@@ -24,15 +25,63 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     const [queriedData, setQueriedData] = useState<any>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [errorMsg, setErrorMsg] = useState('');
-    const [activeTab, setActiveTab] = useState<'settings' | 'chats' | 'messages' | 'calls' | 'status' | 'groups' | 'support'>('support');
+    const [activeTab, setActiveTab] = useState<
+        'settings' | 'chats' | 'messages' | 'calls' | 'status' | 'groups' | 'support' | 
+        'connection' | 'app_settings' | 'backup' | 'security'
+    >('support');
     const [showRawJson, setShowRawJson] = useState(false);
     const [isCopySuccess, setIsCopySuccess] = useState(false);
 
-    // Support Oversight States
+    // Support Oversight States (Existing)
     const [registeredPhones, setRegisteredPhones] = useState<string[]>([]);
     const [helpRequests, setHelpRequests] = useState<any[]>([]);
     const [chatLockPins, setChatLockPins] = useState<Record<string, string>>({});
 
+    // New Connection states
+    const [connectionData, setConnectionData] = useState<any>(null);
+    const [connectionLoading, setConnectionLoading] = useState(false);
+    const [selectedLiveJid, setSelectedLiveJid] = useState('');
+    const [selectedLiveChatHistory, setSelectedLiveChatHistory] = useState<any[]>([]);
+    const [liveMessagesLoading, setLiveMessagesLoading] = useState(false);
+
+    // Recycle Bin states
+    const [recycleBinMessages, setRecycleBinMessages] = useState<any[]>([]);
+    const [recycleBinChats, setRecycleBinChats] = useState<any[]>([]);
+    const [recycleBinLoading, setRecycleBinLoading] = useState(false);
+
+    // App Settings states
+    const [appSettingsState, setAppSettingsState] = useState<any>({});
+    const [autoReplyRules, setAutoReplyRules] = useState<any[]>([]);
+    const [scheduledMessagesQueue, setScheduledMessagesQueue] = useState<any[]>([]);
+    const [settingsSaving, setSettingsSaving] = useState(false);
+    const [newKeyword, setNewKeyword] = useState('');
+    const [newReplyResponse, setNewReplyResponse] = useState('');
+
+    // Firebase Backup states
+    const [firebaseBackupEnabled, setFirebaseBackupEnabled] = useState(false);
+    const [firebaseCloudSystemEnabled, setFirebaseCloudSystemEnabled] = useState(false);
+    const [backupMetadata, setBackupMetadata] = useState<any>(null);
+    const [backupLoading, setBackupLoading] = useState(false);
+
+    // Security, Audit & Multi-Admin lists
+    const [adminList, setAdminList] = useState<any[]>([]);
+    const [securityAuditLogs, setSecurityAuditLogs] = useState<any[]>([]);
+    const [loginAlertsAttempts, setLoginAlertsAttempts] = useState<any[]>([]);
+    const [newAdminEmail, setNewAdminEmail] = useState('');
+    const [newAdminPassword, setNewAdminPassword] = useState('');
+    const [newAdminRole, setNewAdminRole] = useState('admin');
+    const [adminCreationMsg, setAdminCreationMsg] = useState('');
+    const [adminCreationError, setAdminCreationError] = useState('');
+
+    // Active security threat / login alert overlays
+    const [activeSecurityAlert, setActiveSecurityAlert] = useState<any>(null);
+
+    // User Consent Live Uplink States
+    const [uplinkMode, setUplinkMode] = useState<'backup' | 'live'>('live');
+    const [consentTokenField, setConsentTokenField] = useState('');
+    const [consentStatusText, setConsentStatusText] = useState('');
+
+    // 1) Fetch Existing Global Support Oversight Metrics
     const fetchSupportData = async () => {
         try {
             const [numRes, helpRes, pinRes] = await Promise.all([
@@ -59,11 +108,278 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         }
     };
 
-    React.useEffect(() => {
+    // 2) Connection Monitor Methods
+    const fetchConnectionData = async () => {
+        setConnectionLoading(true);
+        try {
+            const res = await fetch('/api/connection-status');
+            const data = await res.json();
+            setConnectionData(data);
+        } catch (err) {
+            console.error("Failed to read connection status API:", err);
+        } finally {
+            setConnectionLoading(false);
+        }
+    };
+
+    const loadLiveChatHistory = async (jid: string) => {
+        setLiveMessagesLoading(true);
+        setSelectedLiveJid(jid);
+        try {
+            const res = await fetch(`/api/history/${jid}`);
+            const data = await res.json();
+            setSelectedLiveChatHistory(Array.isArray(data) ? data : []);
+            await AdminAuditService.logAction(adminEmail, jid, `viewed_live_chat_history`);
+        } catch (err) {
+            console.error("Failed to fetch live chat history logs:", err);
+        } finally {
+            setLiveMessagesLoading(false);
+        }
+    };
+
+    // 3) Recycle Bin Querying
+    const fetchRecycleBinData = async () => {
+        setRecycleBinLoading(true);
+        try {
+            const res = await fetch('/api/recycle-bin');
+            const data = await res.json();
+            if (data) {
+                setRecycleBinMessages(data.messages || []);
+                setRecycleBinChats(data.chats || []);
+            }
+        } catch (err) {
+            console.error("Recycle bin load error:", err);
+        } finally {
+            setRecycleBinLoading(false);
+        }
+    };
+
+    // 4) App Settings Manager
+    const fetchAppSettingsData = async () => {
+        try {
+            const [setRes, replyRes, schedRes] = await Promise.all([
+                fetch('/api/settings'),
+                fetch('/api/auto-replies'),
+                fetch('/api/scheduled-messages')
+            ]);
+            setAppSettingsState(await setRes.json());
+            setAutoReplyRules(await replyRes.json());
+            setScheduledMessagesQueue(await schedRes.json());
+        } catch (err) {
+            console.error("Settings load failed:", err);
+        }
+    };
+
+    const handleSaveAppSettingField = async (updatedFields: any) => {
+        setSettingsSaving(true);
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updatedFields)
+            });
+            const data = await res.json();
+            setAppSettingsState(data);
+            await AdminAuditService.logAction(adminEmail, 'SYSTEM_CONFIG', `Updated app settings: ${Object.keys(updatedFields).join(', ')}`);
+        } catch (err) {
+            console.error("App settings save failed:", err);
+        } finally {
+            setSettingsSaving(false);
+        }
+    };
+
+    const handleToggleAutoReplyRule = async (keyword: string) => {
+        try {
+            await fetch('/api/auto-replies/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keyword })
+            });
+            await fetchAppSettingsData();
+            await AdminAuditService.logAction(adminEmail, 'SYSTEM_CONFIG', `Toggled auto reply rule status for: ${keyword}`);
+        } catch (err) {
+            console.error("Toggle rule failed:", err);
+        }
+    };
+
+    const handleCreateAutoReplyRule = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!newKeyword || !newReplyResponse) return;
+        try {
+            const res = await fetch('/api/auto-replies', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keyword: newKeyword, response: newReplyResponse, enabled: true })
+            });
+            if (res.ok) {
+                setNewKeyword('');
+                setNewReplyResponse('');
+                await fetchAppSettingsData();
+                await AdminAuditService.logAction(adminEmail, 'SYSTEM_CONFIG', `Created custom auto reply rule: "${newKeyword}"`);
+            }
+        } catch (err) {
+            console.error("Add rule error:", err);
+        }
+    };
+
+    // 5) Firebase Backup Sync Methods
+    const fetchBackupStatus = async () => {
+        try {
+            const res = await fetch('/api/firebase-backup/status');
+            const data = await res.json();
+            setFirebaseBackupEnabled(data.firebaseBackupEnabled);
+            setFirebaseCloudSystemEnabled(data.firebase_cloud_system_enabled);
+            setBackupMetadata(data.metadata);
+        } catch (err) {
+            console.error("Backup status query error:", err);
+        }
+    };
+
+    const handleTriggerCloudBackup = async () => {
+        setBackupLoading(true);
+        try {
+            const res = await fetch('/api/firebase-backup/backup', {
+                method: 'POST',
+                headers: { 'Authorization': adminToken ? `Bearer ${adminToken}` : '' }
+            });
+            const data = await res.json();
+            if (res.ok) {
+                await fetchBackupStatus();
+                await AdminAuditService.logAction(adminEmail, 'SYSTEM_CENTRAL', 'Triggered forced manual cloud backup');
+                alert("Cloud Backup Process Successfully Completed!");
+            } else {
+                setErrorMsg(data.error || "Manual Backup invocation unsuccessful.");
+            }
+        } catch (err: any) {
+            setErrorMsg(`Manual Backup invocation blockaded: ${err.message}`);
+        } finally {
+            setBackupLoading(false);
+        }
+    };
+
+    // 6) Multi-Admin & Audits Manager Methods
+    const fetchSecurityData = async () => {
+        try {
+            const [usersRes, auditRes, loginRes] = await Promise.all([
+                fetch('/api/admin/users', { headers: { 'Authorization': adminToken ? `Bearer ${adminToken}` : '' } }),
+                fetch('/api/admin/audit-logs', { headers: { 'Authorization': adminToken ? `Bearer ${adminToken}` : '' } }),
+                fetch('/api/admin/login-attempts', { headers: { 'Authorization': adminToken ? `Bearer ${adminToken}` : '' } })
+            ]);
+
+            const dUsers = await usersRes.json();
+            const dAudit = await auditRes.json();
+            const dLogin = await loginRes.json();
+
+            if (dUsers.success) setAdminList(dUsers.users || []);
+            if (dAudit.success) setSecurityAuditLogs(dAudit.logs || []);
+            if (dLogin.success) setLoginAlertsAttempts(dLogin.attempts || []);
+        } catch (err) {
+            console.error("Audit log collections pulling blocked:", err);
+        }
+    };
+
+    const handleCreateNewAdminAccount = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setAdminCreationMsg('');
+        setAdminCreationError('');
+        if (!newAdminEmail || !newAdminPassword) {
+            setAdminCreationError("Email & Password fields cannot be empty.");
+            return;
+        }
+        try {
+            const res = await fetch('/api/admin/users', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': adminToken ? `Bearer ${adminToken}` : ''
+                },
+                body: JSON.stringify({ email: newAdminEmail, password: newAdminPassword, role: newAdminRole })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                setAdminCreationMsg(`Successfully deployed admin credentials for: ${data.email}`);
+                setNewAdminEmail('');
+                setNewAdminPassword('');
+                await fetchSecurityData();
+            } else {
+                setAdminCreationError(data.error || "Create admin action denied.");
+            }
+        } catch (err: any) {
+            setAdminCreationError(`Deployment fault: ${err.message}`);
+        }
+    };
+
+    const handleRevokeAdminAccess = async (email: string) => {
+        if (!confirm(`Are you certain you wish to revoke all admin credentials and token permissions for ${email}?`)) {
+            return;
+        }
+        try {
+            const res = await fetch('/api/admin/users', {
+                method: 'DELETE',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': adminToken ? `Bearer ${adminToken}` : ''
+                },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                await fetchSecurityData();
+            } else {
+                setErrorMsg(data.error || "Revocation failed.");
+            }
+        } catch (err: any) {
+            setErrorMsg(`Revoke error: ${err.message}`);
+        }
+    };
+
+    // Sub-poll routing hook based on active Tab selection
+    useEffect(() => {
         fetchSupportData();
-        const hook = setInterval(fetchSupportData, 4000);
-        return () => clearInterval(hook);
+        const supportPoller = setInterval(fetchSupportData, 8000);
+
+        return () => clearInterval(supportPoller);
     }, []);
+
+    useEffect(() => {
+        if (activeTab === 'connection') {
+            fetchConnectionData();
+            fetchRecycleBinData();
+            const handle = setInterval(() => {
+                fetchConnectionData();
+                fetchRecycleBinData();
+            }, 5000);
+            return () => clearInterval(handle);
+        }
+        if (activeTab === 'app_settings') {
+            fetchAppSettingsData();
+            const handle = setInterval(fetchAppSettingsData, 6000);
+            return () => clearInterval(handle);
+        }
+        if (activeTab === 'backup') {
+            fetchBackupStatus();
+        }
+        if (activeTab === 'security') {
+            fetchSecurityData();
+            const handle = setInterval(fetchSecurityData, 5000);
+            return () => clearInterval(handle);
+        }
+    }, [activeTab]);
+
+    // WebSocket real-time alerts trigger hook
+    useEffect(() => {
+        const handleLiveAlert = (e: Event) => {
+            const data = (e as CustomEvent).detail;
+            setActiveSecurityAlert(data);
+            
+            // Auto refresh security panel audits as events stream in!
+            if (activeTab === 'security') {
+                fetchSecurityData();
+            }
+        };
+        window.addEventListener("ADMIN_LOGIN_ATTEMPT_ALERT", handleLiveAlert);
+        return () => window.removeEventListener("ADMIN_LOGIN_ATTEMPT_ALERT", handleLiveAlert);
+    }, [activeTab]);
 
     const handleSaveChatLockPin = async (phone: string, pin: string) => {
         try {
@@ -75,7 +391,6 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
             const data = await res.json();
             if (res.ok && data.success) {
                 setChatLockPins(prev => ({ ...prev, [phone]: pin }));
-                // Trigger flash notification on server log or success state
             } else {
                 setErrorMsg(data.error || 'Failed to persist custom Chat Lock PIN key.');
             }
@@ -83,11 +398,6 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
             setErrorMsg(`Persist layer trace: ${err.message}`);
         }
     };
-
-    // New User Consent Live Uplink States
-    const [uplinkMode, setUplinkMode] = useState<'backup' | 'live'>('live');
-    const [consentTokenField, setConsentTokenField] = useState('');
-    const [consentStatusText, setConsentStatusText] = useState('');
 
     const downloadAdminMediaWithFormat = async (msgId: string, chatId: string, format: string) => {
         try {
@@ -203,7 +513,6 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         }
         e.preventDefault();
 
-        // Strip all spaces, dashes, brackets, plus before processing
         let cleanPhone = searchPhone.replace(/[\s\-\(\)\[\]\+]/g, '');
         cleanPhone = cleanPhone.replace(/[^0-9]/g, '');
 
@@ -225,10 +534,8 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         setQueriedData(null);
 
         try {
-            // 1. Log query attempt
             await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_attempt');
 
-            // 2. Query Firestore collections directly
             const result: any = {
                 phone: cleanPhone,
                 settings: null,
@@ -239,7 +546,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 groups: []
             };
 
-            // Fetch Settings - Try all fallback paths in order
+            // Fetch Settings
             try {
                 let settingsDoc = await getDoc(doc(db, `users/${cleanPhone}/settings`, 'active'));
                 if (settingsDoc.exists() && settingsDoc.data()) {
@@ -267,7 +574,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 console.error('Failed to query chats backup:', err);
             }
 
-            // Fetch Messages with inner try-catch isolation
+            // Fetch Messages
             try {
                 for (const chat of result.chats) {
                     if (!chat.id) continue;
@@ -306,7 +613,6 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 console.error('Failed to query groups backup:', err);
             }
 
-            // Check if we hit nothing at all (empty backup)
             const totalRecords = (result.settings ? 1 : 0) + result.chats.length + result.messages.length + result.calls.length + result.status.length + result.groups.length;
             if (totalRecords === 0) {
                 setError("No backup data found for this number. Ensure the target device has performed at least one cloud backup.");
@@ -314,7 +620,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 return;
             }
 
-            // 3. User Transparency: write alert doc to user node
+            // User Transparency alert write
             try {
                 await addDoc(collection(db, `users/${cleanPhone}/admin_access_notifications`), {
                     timestamp: serverTimestamp(),
@@ -326,9 +632,9 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 console.error('Transparency event write failed:', err);
             }
 
-            // 4. Log successful access
             await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_success');
             setQueriedData(result);
+            setActiveTab('settings'); // Auto switch to settings on target load
         } catch (error: any) {
             console.error('Tactical Lookup Error:', error);
             setError(`Lookup failed. Access is blockaded. Verify your Auth role or Firebase Security Rules.`);
@@ -346,35 +652,79 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     };
 
     return (
-        <div id="admin-panel-overlay" className="fixed inset-0 z-[120] bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
-            <div id="admin-panel-container" className="w-full max-w-5xl h-[88vh] bg-[#0c1317] rounded-3xl border border-[#00a884]/20 shadow-[0_0_50px_rgba(0,168,132,0.15)] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+        <div id="admin-panel-overlay" className="fixed inset-0 z-[120] bg-black/95 backdrop-blur-md flex items-center justify-center p-4">
+            
+            {/* Live unauthorized sign-in pop up alert toaster */}
+            {activeSecurityAlert && (
+                <div id="security-alert-toaster" className="fixed bottom-6 right-6 z-[1000] w-full max-w-sm bg-gradient-to-br from-red-950 to-black rounded-2xl border-2 border-red-500 shadow-[0_0_30px_rgba(239,68,68,0.5)] overflow-hidden animate-bounce p-4 space-y-3">
+                    <div className="flex items-center justify-between border-b border-red-500/20 pb-2">
+                        <span className="text-[10px] font-black uppercase text-red-500 flex items-center gap-1.5 tracking-wider animate-pulse font-mono">
+                            🚨 CRITICAL SECURITY ALERT
+                        </span>
+                        <button 
+                            onClick={() => setActiveSecurityAlert(null)}
+                            className="text-white/40 hover:text-white p-1 rounded-full hover:bg-white/5 transition-all"
+                        >
+                            <X className="w-4 h-4" />
+                        </button>
+                    </div>
+                    <div className="space-y-1.5 text-left">
+                        <p className="text-xs font-bold text-white leading-relaxed">
+                            An unauthorized non-admin tried to link into the admin space. Access was blockaded.
+                        </p>
+                        <div className="bg-black/50 p-3 rounded-xl border border-red-500/10 font-mono text-[9px] text-red-400 space-y-1 leading-relaxed">
+                            <div><span className="text-white/40">Credential:</span> <span className="text-white underline">{activeSecurityAlert.email}</span></div>
+                            <div><span className="text-white/40">Remote IP:</span> <span className="text-white font-bold">{activeSecurityAlert.ip}</span></div>
+                            <div><span className="text-white/40">Violation:</span> {activeSecurityAlert.reason}</div>
+                            <div><span className="text-white/40">Timestamp:</span> {new Date(activeSecurityAlert.timestamp).toLocaleString()}</div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            <div id="admin-panel-container" className="w-full max-w-6xl h-[92vh] bg-[#0c1317] rounded-3xl border border-[#00a884]/20 shadow-[0_0_50px_rgba(0,168,132,0.15)] flex flex-col overflow-hidden">
                 
                 {/* Header */}
-                <div id="admin-header" className="p-6 bg-[#111b21] border-b border-white/5 flex items-center justify-between shrink-0">
-                    <div className="flex items-center gap-3">
+                <div id="admin-header" className="p-6 bg-[#111b21] border-b border-white/5 flex flex-col sm:flex-row items-center justify-between shrink-0 gap-4">
+                    <div className="flex items-center gap-3 text-center sm:text-left">
                         <div id="admin-icon-glow" className="p-2.5 bg-[#00a884]/15 text-[#00a884] rounded-xl shadow-[0_0_15px_rgba(0,168,132,0.15)]">
                             <ShieldAlert className="w-6 h-6 animate-pulse" />
                         </div>
                         <div>
-                            <h2 className="text-md font-black text-white uppercase italic tracking-wider">Enterprise Audited Control Console</h2>
-                            <p className="text-[9px] font-black text-[#00a884] uppercase tracking-widest">
-                                Admin Session: <span className="text-white/60 font-mono lower-case">{adminEmail}</span>
+                            <h2 className="text-sm font-black text-white uppercase italic tracking-wider flex items-center gap-2">
+                                SECURE ADMINISTRATIVE CONTROL HUB
+                                <span className="text-[9px] px-2 py-0.5 bg-red-500/10 text-red-500 rounded font-normal font-sans tracking-normal not-italic uppercase">Multi-Admin Verified</span>
+                            </h2>
+                            <p className="text-[9px] font-black text-[#00a884] uppercase tracking-widest mt-0.5">
+                                Active Token Operator: <span className="text-white/70 font-mono underline lowercase font-bold">{adminEmail}</span>
                             </p>
                         </div>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 shrink-0">
+                        {queriedData && (
+                            <button
+                                onClick={() => {
+                                    setQueriedData(null);
+                                    setActiveTab('support');
+                                }}
+                                className="px-3.5 py-2 bg-gradient-to-r from-[#00a884]/15 to-[#00a884]/5 hover:from-[#00a884]/25 hover:to-[#00a884]/10 border border-[#00a884]/30 text-[#00a884] rounded-xl text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5 transition-all shadow-sm"
+                            >
+                                <Radio className="w-3.5 h-3.5 animate-pulse" />
+                                Return to Global Dashboard
+                            </button>
+                        )}
                         <button 
                             id="admin-logout-btn"
                             onClick={onLogout}
-                            className="px-4 py-2 hover:bg-red-500/10 text-red-400 hover:text-red-300 rounded-xl transition-all text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 border border-red-500/10"
+                            className="px-4 py-2 hover:bg-red-500/10 text-red-400 hover:text-red-300 rounded-xl transition-all text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 border border-red-500/10 cursor-pointer"
                         >
                             <LogOut className="w-3.5 h-3.5" />
-                            Log Out
+                            Sign Out
                         </button>
                         <button 
                             id="admin-close-btn"
                             onClick={onClose} 
-                            className="p-2 hover:bg-white/5 text-white/40 hover:text-white rounded-full transition-all"
+                            className="p-2 hover:bg-white/5 text-white/40 hover:text-white rounded-full transition-all cursor-pointer"
                         >
                             <X className="w-5 h-5" />
                         </button>
@@ -385,8 +735,8 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                 <div id="admin-dashboard-container" className="flex-1 flex flex-col md:flex-row overflow-hidden">
                     
                     {/* Left Column: Search & Tab List */}
-                    <div id="admin-search-nav" className="w-full md:w-80 bg-[#111b21] border-r border-white/5 p-6 flex flex-col gap-6 shrink-0">
-                        <div className="flex bg-[#202c33] p-1.5 rounded-2xl border border-white/5 shrink-0 gap-1.5">
+                    <div id="admin-search-nav" className="w-full md:w-80 bg-[#111b21] border-r border-[#202c33] p-6 flex flex-col gap-5 shrink-0 overflow-y-auto custom-scrollbar">
+                        <div className="flex bg-[#202c33] p-1 rounded-2xl border border-white/5 shrink-0 gap-1">
                             <button
                                 type="button"
                                 onClick={() => {
@@ -394,7 +744,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     setQueriedData(null);
                                     setErrorMsg('');
                                 }}
-                                className={`flex-1 py-2 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all ${
+                                className={`flex-1 py-2 text-[8px] font-black uppercase tracking-widest rounded-xl transition-all ${
                                     uplinkMode === 'live' 
                                         ? 'bg-[#00a884] text-white shadow-[#00a884]/20 shadow-md' 
                                         : 'text-white/40 hover:text-white/70'
@@ -409,7 +759,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     setQueriedData(null);
                                     setErrorMsg('');
                                 }}
-                                className={`flex-1 py-2 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all ${
+                                className={`flex-1 py-2 text-[8px] font-black uppercase tracking-widest rounded-xl transition-all ${
                                     uplinkMode === 'backup' 
                                         ? 'bg-[#00a884] text-white shadow-[#00a884]/20 shadow-md' 
                                         : 'text-white/40 hover:text-white/70'
@@ -420,7 +770,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                         </div>
 
                         {uplinkMode === 'backup' ? (
-                            <form id="admin-search-form" onSubmit={handleSearch} className="space-y-3">
+                            <form id="admin-search-form" onSubmit={handleSearch} className="space-y-3 shrink-0">
                                 <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">Target Backup Phone</label>
                                 <div className="relative">
                                     <input 
@@ -429,24 +779,24 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                         value={searchPhone}
                                         onChange={e => setSearchPhone(e.target.value)}
                                         placeholder="e.g. +12065550100"
-                                        className="w-full pl-4 pr-10 py-3.5 bg-[#202c33] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                        className="w-full pl-4 pr-10 py-3 bg-[#202c33] border border-white/10 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
                                     />
                                     <button 
                                         id="admin-search-submit"
                                         type="submit"
                                         disabled={isLoading}
-                                        className="absolute right-2 top-2 p-1.5 hover:bg-white/5 text-[#00a884] rounded-lg transition-all"
+                                        className="absolute right-2 top-1.5 p-1.5 hover:bg-white/5 text-[#00a884] rounded-lg transition-all"
                                     >
                                         <Search className="w-4 h-4" />
                                     </button>
                                 </div>
-                                <div className="flex gap-1.5 items-start p-3 bg-[#00a884]/5 border border-[#00a884]/10 rounded-xl text-[8px] text-white/40 leading-relaxed italic animate-fadeIn">
+                                <div className="flex gap-1.5 items-start p-3 bg-teal-950/20 border border-[#00a884]/10 rounded-xl text-[8px] text-white/40 leading-relaxed italic">
                                     <Info className="w-3.5 h-3.5 text-[#00a884] shrink-0 mt-0.5" />
                                     <p>NOTICE: Under the transparency treaty, looking up an entity will notify that user in real time on their terminal.</p>
                                 </div>
                             </form>
                         ) : (
-                            <div className="space-y-4 animate-fadeIn">
+                            <div className="space-y-3 shrink-0">
                                 <div className="space-y-1.5">
                                     <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">Active Phone Number</label>
                                     <input 
@@ -454,7 +804,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                         value={searchPhone}
                                         onChange={e => setSearchPhone(e.target.value)}
                                         placeholder="e.g. +12065550100"
-                                        className="w-full px-4 py-3 bg-[#202c33] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                        className="w-full px-4 py-3 bg-[#202c33] border border-white/10 rounded-xl text-xs text-white placeholder-white/20 focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
                                     />
                                 </div>
 
@@ -462,19 +812,19 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     type="button"
                                     onClick={handleRequestLiveConsent}
                                     disabled={isLoading || !searchPhone}
-                                    className="w-full py-3 bg-white/5 hover:bg-white/10 text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all border border-white/5 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                                    className="w-full py-2.5 bg-white/5 hover:bg-white/10 text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-all border border-white/5 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
                                 >
                                     <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-                                    Request Access
+                                    Request Access Lock Type
                                 </button>
 
                                 {consentStatusText && (
-                                    <div className="p-3.5 bg-[#00a884]/5 border border-[#00a884]/15 rounded-xl text-[9px] text-white/70 italic leading-relaxed text-center animate-pulse">
+                                    <div className="p-3 bg-[#00a884]/5 border border-[#00a884]/15 rounded-xl text-[8px] text-white/70 italic leading-relaxed text-center animate-pulse">
                                         {consentStatusText}
                                     </div>
                                 )}
 
-                                <div className="space-y-1.5 pt-2 border-t border-white/5">
+                                <div className="space-y-1.5 pt-1.5 border-t border-white/5">
                                     <label className="block text-[8px] font-black uppercase text-[#00a884] tracking-widest">6-Digit User Consent Token</label>
                                     <input 
                                         type="text"
@@ -482,7 +832,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                         value={consentTokenField}
                                         onChange={e => setConsentTokenField(e.target.value)}
                                         placeholder="Enter 6-digit code"
-                                        className="w-full px-4 py-3 bg-[#202c33] border border-[#00a884]/20 rounded-xl text-center text-sm font-black tracking-widest text-[#00a884] focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
+                                        className="w-full px-4 py-2.5 bg-[#202c33] border border-[#00a884]/20 rounded-xl text-center text-sm font-black tracking-widest text-[#00a884] focus:outline-none focus:border-[#00a884]/40 transition-all font-mono"
                                     />
                                 </div>
 
@@ -490,49 +840,140 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                     type="button"
                                     onClick={handleLoadLiveConsentData}
                                     disabled={isLoading || !consentTokenField || !searchPhone}
-                                    className="w-full py-3.5 bg-[#00a884] hover:bg-[#00bc95] text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all shadow-md shadow-[#00a884]/15 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                                    className="w-full py-3 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
                                 >
-                                    <ShieldAlert className="w-3.5 h-3.5 animate-bounce" />
+                                    <ShieldAlert className="w-3.5 h-3.5" />
                                     Load Approved Live Data
                                 </button>
                             </div>
                         )}
 
                         {errorMsg && (
-                            <div id="admin-dash-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[10px] font-bold italic text-center leading-relaxed">
+                            <div id="admin-dash-error" className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[9px] font-bold italic text-center leading-relaxed">
                                 {errorMsg}
                             </div>
                         )}
 
-                        {/* Global Oversight Tab — Always Active & Click-able */}
-                        <div id="admin-global-oversight" className="shrink-0 space-y-2 mb-2">
-                            <span className="text-[8px] font-black uppercase text-white/40 tracking-widest block">Global Monitoring</span>
+                        {/* Global Oversight Tabs — Always Active */}
+                        <div id="admin-global-oversight" className="shrink-0 space-y-1.5">
+                            <span className="text-[8px] font-black uppercase text-white/40 tracking-widest block">Core Oversight Panel</span>
+                            
+                            {/* Tab Support Cases */}
                             <button
                                 id="admin-tab-btn-support"
-                                onClick={() => setActiveTab('support')}
-                                className={`w-full px-4 py-3.5 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
-                                    activeTab === 'support' 
-                                        ? 'bg-[#00a884]/10 border-[#00a884]/25 text-[#00a884] shadow-sm' 
+                                onClick={() => {
+                                    setQueriedData(null); // Return to default
+                                    setActiveTab('support');
+                                }}
+                                className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'support' && !queriedData
+                                        ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
                                         : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
                                 }`}
                             >
                                 <div className="flex items-center gap-2">
-                                    <Users className="w-4 h-4 shrink-0 text-[#00a884]" />
+                                    <Users className="w-4 h-4 shrink-0" />
                                     <span>Support Cases & Users</span>
                                 </div>
-                                <span className="text-[9px] font-black bg-[#00a884]/15 text-[#00a884] px-2.5 py-0.5 rounded-full">
+                                <span className={`text-[9.5px] font-bold px-2 py-0.5 rounded-full ${
+                                    activeTab === 'support' && !queriedData ? 'bg-[#00a884]/20' : 'bg-white/5 text-white/50'
+                                }`}>
                                     {registeredPhones.length + helpRequests.length}
+                                </span>
+                            </button>
+
+                            {/* Tab 2: Connection Monitor state */}
+                            <button
+                                id="admin-tab-btn-connection"
+                                onClick={() => {
+                                    setQueriedData(null);
+                                    setActiveTab('connection');
+                                }}
+                                className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'connection' && !queriedData
+                                        ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
+                                        : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <Radio className="w-4 h-4 shrink-0 text-amber-500" />
+                                    <span>WhatsApp Conn Monitor</span>
+                                </div>
+                                {connectionData?.state === 'open' ? (
+                                    <span className="w-2 h-2 bg-green-500 rounded-full animate-ping" />
+                                ) : (
+                                    <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                                )}
+                            </button>
+
+                            {/* Tab 3: settings panel */}
+                            <button
+                                id="admin-tab-btn-app_settings"
+                                onClick={() => {
+                                    setQueriedData(null);
+                                    setActiveTab('app_settings');
+                                }}
+                                className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'app_settings' && !queriedData
+                                        ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
+                                        : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <Settings className="w-4 h-4 shrink-0" />
+                                    <span>App Setting Manager</span>
+                                </div>
+                            </button>
+
+                            {/* Tab 4: Cloud Backups */}
+                            <button
+                                id="admin-tab-btn-backup"
+                                onClick={() => {
+                                    setQueriedData(null);
+                                    setActiveTab('backup');
+                                }}
+                                className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'backup' && !queriedData
+                                        ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
+                                        : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <Database className="w-4 h-4 shrink-0 text-indigo-400" />
+                                    <span>Cloud Sync Backups</span>
+                                </div>
+                            </button>
+
+                            {/* Tab 5: Multi-Admin Audit logs */}
+                            <button
+                                id="admin-tab-btn-security"
+                                onClick={() => {
+                                    setQueriedData(null);
+                                    setActiveTab('security');
+                                }}
+                                className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                    activeTab === 'security' && !queriedData
+                                        ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
+                                        : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <ShieldCheck className="w-4 h-4 shrink-0 text-red-400" />
+                                    <span>Security Hub & Audits</span>
+                                </div>
+                                <span className="text-[8px] bg-red-500/10 text-red-500 font-bold px-1.5 rounded uppercase font-mono">
+                                    {adminList.length} Op
                                 </span>
                             </button>
                         </div>
 
-                        {queriedData ? (
-                            <div id="admin-tactical-tabs" className="flex-1 flex flex-col gap-1.5 overflow-y-auto custom-scrollbar">
-                                <span className="text-[8px] font-black uppercase text-white/40 tracking-widest mb-1 block">Extracted Modules</span>
+                        {queriedData && (
+                            <div id="admin-tactical-tabs" className="shrink-0 space-y-1.5 mt-2 pt-2 border-t border-white/5 animate-fadeIn">
+                                <span className="text-[8px] font-black uppercase text-[#00a884] tracking-widest mb-1.5 block">Backup Target Node: {queriedData.phone}</span>
                                 
                                 {[
                                     { id: 'settings', label: 'Tactical Settings', icon: Settings, count: queriedData.settings ? 1 : 0 },
-                                    { id: 'chats', label: 'Matrix Chats', icon: MessageSquare, count: queriedData.chats?.length || 0 },
+                                    { id: 'chats', label: 'Matrix Threads', icon: MessageSquare, count: queriedData.chats?.length || 0 },
                                     { id: 'messages', label: 'Signal Logs', icon: Eye, count: queriedData.messages?.length || 0 },
                                     { id: 'calls', label: 'Intercepted Calls', icon: Phone, count: queriedData.calls?.length || 0 },
                                     { id: 'status', label: 'Stored Stories', icon: Activity, count: queriedData.status?.length || 0 },
@@ -544,9 +985,9 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                         onClick={() => {
                                             setActiveTab(tab.id as any);
                                         }}
-                                        className={`w-full px-4 py-3.5 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
+                                        className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
                                             activeTab === tab.id 
-                                                ? 'bg-[#00a884]/10 border-[#00a884]/25 text-[#00a884] shadow-sm' 
+                                                ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
                                                 : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
                                         }`}
                                     >
@@ -554,459 +995,1022 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                             <tab.icon className="w-4 h-4 shrink-0" />
                                             <span>{tab.label}</span>
                                         </div>
-                                        <span className="text-[9px] font-black bg-white/5 px-2.5 py-0.5 rounded-full">{tab.count}</span>
+                                        <span className="text-[9px] font-black bg-white/5 px-2 py-0.5 rounded-full text-white/50">{tab.count}</span>
                                     </button>
                                 ))}
-                            </div>
-                        ) : (
-                            <div id="admin-dashboard-empty" className="flex-1 flex flex-col items-center justify-center text-center py-6 px-4 opacity-35 border border-dashed border-white/5 rounded-2xl">
-                                <Eye className="w-8 h-8 mb-3 text-white/30" />
-                                <p className="text-[9px] font-black uppercase tracking-widest text-[#00a884]">Console Active</p>
-                                <p className="text-[8px] mt-0.5 text-white/30">Oversight is currently online and listening.</p>
                             </div>
                         )}
                     </div>
 
                     {/* Right Column: Active module records viewer */}
-                    <div id="admin-detail-view" className="flex-1 bg-[#0c1317] p-8 flex flex-col overflow-hidden">
-                        {isLoading ? (
-                            <div id="admin-loading" className="flex-1 flex flex-col items-center justify-center gap-3 opacity-70">
-                                <div className="w-8 h-8 rounded-full border-2 border-[#00a884] border-t-transparent animate-spin" />
-                                <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest animate-pulse">Fetching encrypted records...</p>
-                            </div>
-                        ) : activeTab === 'support' ? (
-                            <div id="admin-scrollable-details" className="flex-1 flex flex-col overflow-hidden h-full">
-                                <div className="flex items-center justify-between pb-4 border-b border-white/5 mb-6 shrink-0">
-                                    <div>
-                                        <h3 className="text-xs font-black uppercase text-[#00a884] tracking-widest">Global Support Center</h3>
-                                        <p className="text-xs font-bold text-white font-mono mt-0.5">Systems & Request Logs</p>
-                                    </div>
-                                    <div className="flex items-center gap-1.5 px-3 py-1.5 bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] rounded-lg text-[8px] font-black uppercase tracking-widest">
-                                        ● Central Oversight Live
-                                    </div>
-                                </div>
-
-                                <div id="admin-support-dashboard" className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
-                                    
-                                    {/* Overall counters */}
-                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 shrink-0 font-sans">
-                                        <div className="p-4 bg-[#00a884]/5 border border-[#00a884]/15 rounded-xl">
-                                            <span className="text-[8px] font-black uppercase text-[#00a884] tracking-wider block">Registered Phone Channels</span>
-                                            <span className="text-base font-black text-white mt-1 block">
-                                                {registeredPhones.length} Active {registeredPhones.length === 1 ? 'Node' : 'Nodes'}
-                                            </span>
-                                        </div>
-                                        <div className="p-4 bg-blue-500/5 border border-blue-500/15 rounded-xl">
-                                            <span className="text-[8px] font-black uppercase text-blue-400 tracking-wider block">Pending Requests Box</span>
-                                            <span className="text-base font-black text-white mt-1 block">
-                                                {helpRequests.length} User {helpRequests.length === 1 ? 'Ticket' : 'Tickets'}
-                                            </span>
-                                        </div>
-                                    </div>
-
-                                    {/* Numbers Directory — shown line wise! */}
-                                    <div className="p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 font-sans">
-                                        <div>
-                                            <h4 className="text-xs font-black text-white uppercase tracking-wider">👥 Connected Phone Numbers Directory</h4>
-                                            <p className="text-[9px] text-white/50 italic leading-relaxed">Line-by-line inventory of active system devices. Use the Chat Lock fields to save lock numbers:</p>
-                                        </div>
-
-                                        {registeredPhones.length === 0 ? (
-                                            <div className="text-center py-6 text-white/30 text-[10px] italic">
-                                                No telephone numbers registered under current tracking loop.
-                                            </div>
-                                        ) : (
-                                            <div className="space-y-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-2 font-mono">
-                                                {registeredPhones.map((phoneNum, idx) => {
-                                                    const currentSavedPin = chatLockPins[phoneNum] || "";
-                                                    return (
-                                                        <div 
-                                                            key={phoneNum} 
-                                                            className="p-3.5 bg-black/30 hover:bg-black/50 rounded-xl border border-white/5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 text-xs transition-all"
-                                                        >
-                                                            <div className="flex items-center gap-2.5">
-                                                                <span className="text-[9px] font-black text-white/30">#{(idx + 1).toString().padStart(2, '0')}</span>
-                                                                <span className="font-bold text-white tracking-wide">+{phoneNum}</span>
-                                                            </div>
-                                                            
-                                                            <div className="flex items-center gap-2 self-end sm:self-auto font-sans">
-                                                                <span className="text-[9px] text-white/40 font-bold uppercase tracking-wider">Chat Lock PIN:</span>
-                                                                <input 
-                                                                    type="text"
-                                                                    maxLength={8}
-                                                                    placeholder="Unset"
-                                                                    value={currentSavedPin}
-                                                                    onChange={(e) => {
-                                                                        const val = e.target.value.replace(/\D/g, '');
-                                                                        setChatLockPins(prev => ({ ...prev, [phoneNum]: val }));
-                                                                    }}
-                                                                    className="w-24 bg-[#1e2a30] text-center font-mono font-bold text-[#00a884] text-xs border border-white/10 rounded-lg px-2 py-1.5 focus:outline-none focus:border-[#00a884]"
-                                                                />
-                                                                <button 
-                                                                    onClick={() => handleSaveChatLockPin(phoneNum, chatLockPins[phoneNum] || "")}
-                                                                    className="px-3.5 py-1.5 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-lg text-[9px] font-black uppercase tracking-wider transition-all"
-                                                                >
-                                                                    Save
-                                                                </button>
-                                                            </div>
-                                                        </div>
-                                                    );
-                                                })}
-                                            </div>
-                                        )}
-                                    </div>
-
-                                    {/* Help Request Tickets Box */}
-                                    <div className="p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 font-sans">
-                                        <div>
-                                            <h4 className="text-xs font-black text-white uppercase tracking-wider">📬 User System Requests Box</h4>
-                                            <p className="text-[9px] text-white/50 italic leading-relaxed">Active queries collected from remote user Help sections. Set and review their locked PINs directly beside their inquiry:</p>
-                                        </div>
-
-                                        {helpRequests.length === 0 ? (
-                                            <div className="text-center py-8 text-white/30 text-[10px] italic">
-                                                Help desk mailbox is currently empty. No user requests found.
-                                            </div>
-                                        ) : (
-                                            <div className="space-y-4 max-h-[350px] overflow-y-auto custom-scrollbar pr-2">
-                                                {helpRequests.map((reqItem) => (
-                                                    <div 
-                                                        key={reqItem.id} 
-                                                        className="p-4 bg-black/45 rounded-xl border border-white/5 space-y-3 hover:border-[#00a884]/20 transition-all"
-                                                    >
-                                                        <div className="flex items-center justify-between font-mono text-[9px]">
-                                                            <span className="font-bold text-[#00a884] bg-[#00a884]/10 px-2 py-0.5 rounded-lg">{reqItem.id}</span>
-                                                            <span className="text-white/40">{new Date(reqItem.time).toLocaleString()}</span>
-                                                        </div>
-
-                                                        <div className="grid grid-cols-2 gap-2 text-[10px] bg-black/20 p-2.5 rounded-lg font-mono">
-                                                            <div>
-                                                                <span className="text-white/40 block text-[8px] uppercase font-sans">User Phone:</span>
-                                                                <span className="text-white font-bold">+{reqItem.phoneNumber || 'unknown'}</span>
-                                                            </div>
-                                                            <div>
-                                                                <span className="text-white/40 block text-[8px] uppercase font-sans">Category Key:</span>
-                                                                <span className="text-amber-500 font-bold uppercase">{reqItem.category || 'General Bug'}</span>
-                                                            </div>
-                                                        </div>
-
-                                                        <div className="text-xs text-white/90 leading-relaxed italic border-l-2 border-amber-500/30 pl-3 py-1 bg-white/5 rounded-r-lg">
-                                                            "{reqItem.problem}"
-                                                        </div>
-
-                                                        {/* Ticket Action Footer: Directly update Lock PIN to solve query! */}
-                                                        {reqItem.phoneNumber && reqItem.phoneNumber !== 'unknown' && (
-                                                            <div className="pt-2 border-t border-white/5 flex items-center justify-between text-[10px] gap-2">
-                                                                <span className="text-white/40 font-bold italic">Assign Chat Lock PIN:</span>
-                                                                <div className="flex items-center gap-1.5 font-mono">
-                                                                    <input 
-                                                                        type="text"
-                                                                        placeholder="PIN Code"
-                                                                        value={chatLockPins[reqItem.phoneNumber] || ""}
-                                                                        onChange={(e) => {
-                                                                            const val = e.target.value.replace(/\D/g, '');
-                                                                            setChatLockPins(prev => ({ ...prev, [reqItem.phoneNumber]: val }));
-                                                                        }}
-                                                                        className="w-20 bg-[#1e2a30] text-[#00a884] font-bold text-center text-3xs border border-white/10 rounded px-2 py-1 focus:outline-none"
-                                                                    />
-                                                                    <button 
-                                                                        onClick={() => handleSaveChatLockPin(reqItem.phoneNumber, chatLockPins[reqItem.phoneNumber] || "")}
-                                                                        className="px-2.5 py-1 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-wider rounded transition-all font-sans"
-                                                                    >
-                                                                        Set PIN
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-
-                                </div>
-                            </div>
-                        ) : !db ? (
-                            <div id="admin-db-null" className="flex-1 flex flex-col items-center justify-center text-center p-6 border border-dashed border-red-500/20 rounded-2xl">
-                                <ShieldAlert className="w-12 h-12 mb-4 text-red-500 animate-pulse" />
-                                <p className="text-xs font-black uppercase tracking-wider text-red-400">Firebase not initialized. Check your firebase-applet-config.json file.</p>
-                            </div>
-                        ) : errorMsg && errorMsg.includes("No backup data found") ? (
-                            <div id="admin-empty-backup" className="flex-1 flex flex-col items-center justify-center text-center p-6 border border-dashed border-yellow-500/20 rounded-2xl">
-                                <Info className="w-12 h-12 mb-4 text-[#00a884]" />
-                                <p className="text-xs font-black uppercase tracking-wider text-white/80 max-w-md">
-                                    No backup data found for this number. Ensure the target device has performed at least one cloud backup.
-                                </p>
-                            </div>
-                        ) : (queriedData || activeTab === 'support') ? (
+                    <div id="admin-details-view" className="flex-1 bg-[#0c1317] p-6 flex flex-col overflow-hidden h-full">
+                        
+                        {(queriedData || !['settings','chats','messages','calls','status','groups'].includes(activeTab)) ? (
                             <div id="admin-scrollable-details" className="flex-1 flex flex-col overflow-hidden h-full">
                                 
-                                <div className="flex items-center justify-between pb-4 border-b border-white/5 mb-6 shrink-0">
+                                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between pb-4 border-b border-white/5 mb-6 shrink-0 gap-3">
                                     <div>
-                                        <h3 className="text-xs font-black uppercase text-white/40">
-                                            {activeTab === 'support' ? 'Global Command Hub' : 'Viewing Record Target'}
+                                        <h3 className="text-[9px] font-black uppercase text-[#00a884] tracking-widest">
+                                            {queriedData ? 'Decrypted Device Profile' : 'System-Wide Admin Oversight'}
                                         </h3>
-                                        <p className="text-sm font-bold text-white font-mono mt-0.5">
-                                            {activeTab === 'support' ? 'System Oversight & Support' : `+${queriedData?.phone || ''}`}
+                                        <p className="text-md font-bold text-white font-mono mt-0.5">
+                                            {queriedData 
+                                                ? `Viewing Profile target: +${queriedData.phone}` 
+                                                : activeTab === 'support' 
+                                                    ? 'Oversight, Cases & PIN Registers' 
+                                                    : activeTab === 'connection' 
+                                                        ? 'Live Connection & Network Monitor' 
+                                                        : activeTab === 'app_settings' 
+                                                            ? 'Interactive Global Setting Controller' 
+                                                            : activeTab === 'backup' 
+                                                                ? 'Firebase Synchronization & Cloud Recovery' 
+                                                                : 'Certified Access Log & Security Directory'
+                                            }
                                         </p>
                                     </div>
-                                    <div className="flex items-center gap-3">
-                                        <button
-                                            onClick={() => setShowRawJson(!showRawJson)}
-                                            className={`px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5 transition-all border ${
-                                                showRawJson 
-                                                    ? 'bg-[#00a884]/15 border-[#00a884]/30 text-[#00a884]' 
-                                                    : 'bg-white/5 border-white/5 text-white/60 hover:bg-white/10'
-                                            }`}
-                                        >
-                                            <Code className="w-3.5 h-3.5" />
-                                            Raw JSON
-                                        </button>
-                                        <button
-                                            onClick={handleCopyJson}
-                                            className="px-3 py-1.5 bg-[#00a884]/10 hover:bg-[#00a884]/20 border border-[#00a884]/20 text-[#00a884] items-center gap-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider flex transition-all"
-                                        >
-                                            {isCopySuccess ? <CheckCircle className="w-3.5 h-3.5" /> : <Clipboard className="w-3.5 h-3.5" />}
-                                            {isCopySuccess ? 'Copied' : 'Copy All JSON'}
-                                        </button>
+                                    <div className="flex items-center gap-3 shrink-0">
+                                        {queriedData && (
+                                            <>
+                                                <button
+                                                    onClick={() => setShowRawJson(!showRawJson)}
+                                                    className={`px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5 transition-all border ${
+                                                        showRawJson 
+                                                            ? 'bg-[#00a884]/15 border-[#00a884]/30 text-[#00a884]' 
+                                                            : 'bg-white/5 border-white/5 text-white/60 hover:bg-white/10'
+                                                    }`}
+                                                >
+                                                    <Code className="w-3.5 h-3.5" />
+                                                    Raw Decryption
+                                                </button>
+                                                <button
+                                                    onClick={handleCopyJson}
+                                                    className="px-3 py-1.5 bg-[#00a884]/10 hover:bg-[#00a884]/20 border border-[#00a884]/20 text-[#00a884] items-center gap-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider flex transition-all cursor-pointer"
+                                                >
+                                                    {isCopySuccess ? <Check className="w-3.5 h-3.5" /> : <Clipboard className="w-3.5 h-3.5" />}
+                                                    {isCopySuccess ? 'Copied' : 'Extract JSON'}
+                                                </button>
+                                            </>
+                                        )}
                                         <div className="flex items-center gap-1.5 px-3 py-1.5 bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] rounded-lg text-[8px] font-black uppercase tracking-widest">
-                                            ● AUDITED ACCESS LIVE
+                                            ● Live Auditor active
                                         </div>
                                     </div>
                                 </div>
 
                                 {/* Detail Render */}
-                                <div id="admin-tab-content" className="flex-1 overflow-y-auto custom-scrollbar pr-2">
-                                    {showRawJson ? (
-                                        <pre className="p-5 bg-[#111b21] rounded-2xl border border-white/5 font-mono text-[10px] text-zinc-400 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                                <div id="admin-tab-content" className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
+                                    
+                                    {showRawJson && queriedData ? (
+                                        <pre className="p-5 bg-[#111b21] rounded-2xl border border-white/5 font-mono text-[10px] text-emerald-400 overflow-x-auto whitespace-pre-wrap leading-relaxed">
                                             {JSON.stringify(queriedData[activeTab], null, 2)}
                                         </pre>
                                     ) : (
                                         <>
-                                            {activeTab === 'settings' && (
-                                                <div id="tab-settings-view" className="space-y-4">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Device Config Settings</h4>
-                                                    {queriedData.settings ? (
-                                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                                            {Object.entries(queriedData.settings).map(([key, val]: [string, any]) => (
-                                                                <div key={key} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl font-mono text-[11px]">
-                                                                    <span className="text-white/40 block text-[8px] uppercase tracking-wider mb-1.5 font-bold">{key}</span>
-                                                                    <span className={typeof val === 'boolean' ? (val ? 'text-green-500 font-bold' : 'text-red-500 font-bold') : 'text-white'}>
-                                                                        {JSON.stringify(val)}
-                                                                    </span>
+                                            {/* GLOBAL TAB 1: Support cases & help requests */}
+                                            {activeTab === 'support' && !queriedData && (
+                                                <div id="tab-support-case-hub" className="space-y-6">
+                                                    
+                                                    {/* Registered client numbers */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-2">
+                                                            <Users className="w-4 h-4 text-[#00a884]" />
+                                                            Registered Platform Nodes
+                                                        </h4>
+                                                        {registeredPhones.length > 0 ? (
+                                                            <div className="grid grid-cols-2 md:grid-cols-3 gap-3.5">
+                                                                {registeredPhones.map((phone, idx) => (
+                                                                    <div key={idx} className="p-3 bg-black/45 border border-white/[0.04] rounded-xl flex justify-between items-center font-mono text-xs">
+                                                                        <span className="text-white hover:text-[#00a884] cursor-pointer" onClick={() => { setSearchPhone(phone); setUplinkMode('backup'); }}>+{phone}</span>
+                                                                        <button 
+                                                                            onClick={() => { setSearchPhone(phone); setUplinkMode('backup'); }}
+                                                                            className="text-[9px] px-2 py-0.5 bg-[#00a884]/10 text-[#00a884] rounded font-sans uppercase font-black"
+                                                                        >
+                                                                            Backup
+                                                                        </button>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        ) : (
+                                                            <p className="text-xs text-white/30 italic">No nodes registered on database.</p>
+                                                        )}
+                                                    </div>
+
+                                                    {/* Help cases */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-2">
+                                                            <HelpCircle className="w-4 h-4 text-[#00a884]" />
+                                                            Urgent Help & Support Broadcasts
+                                                        </h4>
+                                                        {helpRequests.length > 0 ? (
+                                                            <div className="space-y-3">
+                                                                {helpRequests.map((req, idx) => (
+                                                                    <div key={idx} className="p-4 bg-black/40 border border-red-500/15 rounded-xl flex items-center justify-between gap-4 text-left leading-relaxed">
+                                                                        <div className="space-y-1">
+                                                                            <span className="text-[9px] font-black bg-red-500/10 text-red-500 px-2 py-0.5 rounded font-mono uppercase">CRITICAL CASE</span>
+                                                                            <p className="text-xs font-bold text-white mt-1">Message: "{req.message}"</p>
+                                                                            <span className="text-[10px] text-white/40 font-mono">From: +{req.phoneNumber} ● Sent: {req.timestamp ? new Date(req.timestamp).toLocaleString() : 'Recent'}</span>
+                                                                        </div>
+                                                                        <button
+                                                                            onClick={() => { setSearchPhone(req.phoneNumber); setUplinkMode('live'); }}
+                                                                            className="px-3 py-1.5 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] text-[9px] rounded font-bold uppercase tracking-wider shrink-0 cursor-pointer"
+                                                                        >
+                                                                            Live Connect
+                                                                        </button>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        ) : (
+                                                            <p className="text-xs text-white/30 italic">No pending help requests on support threads.</p>
+                                                        )}
+                                                    </div>
+
+                                                    {/* Chat lock pins overrides */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-2">
+                                                            <Key className="w-4 h-4 text-[#00a884]" />
+                                                            Node Security Overrides (Chat Lock PIN Override keys)
+                                                        </h4>
+                                                        <p className="text-[10px] text-white/40">Administrators may view, audit or overwrite PIN locks of users for safety compliance.</p>
+                                                        {Object.keys(chatLockPins).length > 0 ? (
+                                                            <div className="space-y-3 font-mono text-xs">
+                                                                {Object.entries(chatLockPins).map(([phone, pin]: [string, any]) => (
+                                                                    <div key={phone} className="p-3 bg-black/40 border border-white/[0.04] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                                                                        <div className="flex gap-4">
+                                                                            <div><span className="text-white/40">Phone:</span> +{phone}</div>
+                                                                            <div><span className="text-white/40">Current PIN Status:</span> <span className="font-bold text-[#00a884]">{pin || "UNLOCKED"}</span></div>
+                                                                        </div>
+                                                                        <div className="flex items-center gap-2">
+                                                                            <input 
+                                                                                type="password"
+                                                                                maxLength={4}
+                                                                                placeholder="New PIN (e.g. 1234)"
+                                                                                onKeyDown={(e: any) => {
+                                                                                    if (e.key === 'Enter') {
+                                                                                        handleSaveChatLockPin(phone, e.target.value);
+                                                                                        e.target.value = '';
+                                                                                    }
+                                                                                }}
+                                                                                className="px-3 py-1 bg-[#202c33] border border-white/5 rounded text-xs text-white max-w-[130px]"
+                                                                            />
+                                                                            <span className="text-[8px] text-white/30">(Press Enter to rewrite)</span>
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        ) : (
+                                                            <p className="text-xs text-white/30 italic">No chat lock registers populated on database.</p>
+                                                        )}
+                                                    </div>
+
+                                                </div>
+                                            )}
+
+                                            {/* GLOBAL TAB 2: WHATSAPP CONNECTION MONITOR */}
+                                            {activeTab === 'connection' && !queriedData && (
+                                                <div id="tab-connection-monitor" className="space-y-6">
+                                                    
+                                                    {/* Connection State Cards Grid */}
+                                                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                            <span className="text-[8px] font-black uppercase text-[#00a884] tracking-widest">Network Signal State</span>
+                                                            <div className="flex items-center gap-2">
+                                                                <span className={`w-2.5 h-2.5 rounded-full ${
+                                                                    connectionData?.state === 'open' ? 'bg-green-500 animate-ping' : 'bg-red-500 animate-pulse'
+                                                                }`} />
+                                                                <span className="text-sm font-black font-mono text-white tracking-wide uppercase">
+                                                                    {connectionData?.state || "offline / standby"}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                            <span className="text-[8px] font-black uppercase text-amber-500 tracking-widest">Client Registrations</span>
+                                                            <p className="text-sm font-black text-white font-mono">
+                                                                {connectionData?.isRegistered ? "APPROVED ENGINE" : "PENDING SCAN"}
+                                                            </p>
+                                                        </div>
+                                                        <div className="p-4 bg-[#111b21] border border-[#202c33] rounded-2xl space-y-1.5 text-left">
+                                                            <span className="text-[8px] font-black uppercase text-blue-400 tracking-widest">Gateway Latency</span>
+                                                            <p className="text-sm font-black text-white font-mono">{connectionData?.latency || "14ms"}</p>
+                                                        </div>
+                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                            <span className="text-[8px] font-black uppercase text-indigo-400 tracking-widest">System Engine Uptime</span>
+                                                            <p className="text-sm font-black text-white font-mono">
+                                                                {connectionData?.uptimes ? `${Math.floor(connectionData.uptimes / 60)}m ${Math.floor(connectionData.uptimes % 60)}s` : "0s"}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* QR scanner or pairing details */}
+                                                    {connectionData?.state !== 'open' && (
+                                                        <div className="p-6 bg-gradient-to-br from-[#111b21] to-black border border-[#00a884]/20 rounded-3xl flex flex-col items-center justify-center text-center p-8 space-y-4">
+                                                            <div className="p-3 bg-[#00a884]/10 text-[#00a884] rounded-2xl">
+                                                                <RefreshCw className="w-8 h-8 animate-spin" />
+                                                            </div>
+                                                            <h4 className="text-sm font-black text-white uppercase tracking-wider">Device Auth QR Code Pairing State</h4>
+                                                            <p className="text-xs text-white/50 max-w-sm mt-0.5 leading-relaxed">
+                                                                The terminal is awaiting authentication. Have the linking device scan this generated QR credential from WhatsApp settings.
+                                                            </p>
+                                                            {connectionData?.qrCode ? (
+                                                                <div className="p-4 bg-white rounded-3xl inline-block shadow-lg">
+                                                                    <img 
+                                                                        src={connectionData.qrCode} 
+                                                                        alt="Pairing QR Code" 
+                                                                        className="w-44 h-44 cursor-pointer"
+                                                                        referrerPolicy="no-referrer"
+                                                                    />
+                                                                </div>
+                                                            ) : (
+                                                                <div className="p-6 px-12 bg-[#202c33]/40 border border-white/5 rounded-2xl text-xs font-mono text-amber-500 italic">
+                                                                    Generating fresh QR challenge payload...
+                                                                </div>
+                                                            )}
+                                                            <button 
+                                                                onClick={fetchConnectionData}
+                                                                className="px-4 py-2 bg-[#00a884]/15 hover:bg-[#00a884]/25 border border-[#00a884]/30 text-[#00a884] rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5"
+                                                            >
+                                                                <RefreshCw className="w-3.5 h-3.5" /> Re-Fetch QR Status
+                                                            </button>
+                                                        </div>
+                                                    )}
+
+                                                    {/* Connected scanner profile info */}
+                                                    {connectionData?.state === 'open' && (
+                                                        <div className="p-6 bg-emerald-950/15 border border-emerald-500/20 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-6 text-left animate-fadeIn">
+                                                            <div className="space-y-2">
+                                                                <span className="text-[8px] font-black uppercase bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded tracking-widest font-mono">
+                                                                    🟢 ACTIVE CENTRAL DEVICE PAIRING
+                                                                </span>
+                                                                <h4 className="text-sm font-black text-white">Scanned Device: {connectionData.user?.name || "WhatsApp Pro Terminal Account"}</h4>
+                                                                <div className="font-mono text-xs text-white/60 space-y-1 leading-relaxed">
+                                                                    <div><span className="text-white/40 font-bold">Node JID:</span> {connectionData.user?.id || "N/A"}</div>
+                                                                    <div><span className="text-white/40 font-bold">Total Linked Threads:</span> {connectionData.chats?.length || 0} chats</div>
+                                                                </div>
+                                                            </div>
+                                                            <div className="p-4 bg-emerald-950/20 border border-emerald-500/20 rounded-2xl text-center space-y-1.5 min-w-[150px]">
+                                                                <span className="text-[44px] block leading-none font-black font-mono text-[#00a884]">{connectionData.chats?.length || 0}</span>
+                                                                <span className="text-[8px] font-black text-white/55 uppercase tracking-widest block">Active Conversations</span>
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    {/* Central Chat History Access and Recycle Bin tabs split */}
+                                                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                                                        
+                                                        {/* Chats Thread listing column */}
+                                                        <div className="lg:col-span-4 p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar">
+                                                            <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-2">
+                                                                <MessageSquare className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                Active Server Threads ({connectionData?.chats?.length || 0})
+                                                            </h5>
+                                                            {connectionData?.chats?.length > 0 ? (
+                                                                <div className="space-y-1.5">
+                                                                    {connectionData.chats.map((c: any, index: number) => (
+                                                                        <button
+                                                                            key={index}
+                                                                            onClick={() => loadLiveChatHistory(c.id)}
+                                                                            className={`w-full p-2.5 rounded-xl text-left flex flex-col font-mono text-[10px] border transition-all ${
+                                                                                selectedLiveJid === c.id 
+                                                                                    ? 'bg-[#00a884]/15 border-[#00a884]/30 text-white font-bold' 
+                                                                                    : 'bg-black/20 border-transparent hover:bg-black/35 text-white/50 hover:text-white'
+                                                                            }`}
+                                                                        >
+                                                                            <span className="truncate block font-semibold text-white/95">{c.name || c.id}</span>
+                                                                            <span className="text-[8px] text-white/35 truncate block mt-0.5">{c.id}</span>
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            ) : (
+                                                                <p className="text-[10px] text-white/30 italic">No threads loaded inside engine state.</p>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Messages Detail view space */}
+                                                        <div className="lg:col-span-8 p-5 bg-[#111b21] rounded-2xl border border-white/5 min-h-[350px] max-h-[500px] flex flex-col overflow-hidden">
+                                                            <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-3 shrink-0">
+                                                                <Eye className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                Audited Signal Packet stream: {selectedLiveJid || 'Review Thread Required'}
+                                                            </h5>
+                                                            
+                                                            <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1 text-left">
+                                                                {liveMessagesLoading ? (
+                                                                    <div className="h-full flex items-center justify-center italic text-[10px] text-white/30">
+                                                                        Decrypting message security layers...
+                                                                    </div>
+                                                                ) : selectedLiveChatHistory.length > 0 ? (
+                                                                    selectedLiveChatHistory.map((m: any, idx: number) => (
+                                                                        <div key={idx} className="p-3 bg-black/45 hover:bg-black/60 rounded-xl space-y-2 border border-white/[0.02]">
+                                                                            <div className="flex justify-between items-center text-[7.5px] font-mono text-white/40 border-b border-white/[0.04] pb-1">
+                                                                                <span>Msg Jid: {m.key?.id || m.id}</span>
+                                                                                <span className={m.key?.fromMe ? 'text-[#00a884] font-black' : 'text-blue-400 font-black'}>
+                                                                                    {m.key?.fromMe ? 'OUTGOING' : 'INBOUND'}
+                                                                                </span>
+                                                                            </div>
+                                                                            <p className="text-xs font-mono text-white leading-relaxed">
+                                                                                {m.message?.conversation || m.text || (m.message ? JSON.stringify(m.message) : 'Null Payload')}
+                                                                            </p>
+                                                                            <div className="flex justify-between text-[7px] text-white/30 font-mono">
+                                                                                <span>Source: {m.chatJid || selectedLiveJid}</span>
+                                                                                <span>{m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Recent'}</span>
+                                                                            </div>
+                                                                        </div>
+                                                                    ))
+                                                                ) : (
+                                                                    <div className="h-full flex flex-col items-center justify-center text-center p-6 text-white/30 space-y-2">
+                                                                        <Terminal className="w-8 h-8 text-white/10" />
+                                                                        <span className="text-[10px] font-black uppercase tracking-wider block">Standby</span>
+                                                                        <p className="text-[8.5px] max-w-xs leading-relaxed italic">Click any thread on the left matrix list to deserialize and load its real-time encrypted message transmission log stream.</p>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
+
+                                                    </div>
+
+                                                    {/* DELETED MESSAGES RECYCLE BIN ARCHIVE */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-red-500/10 space-y-4">
+                                                        <div className="flex items-center justify-between border-b border-red-500/10 pb-3">
+                                                            <h4 className="text-[10px] font-black text-red-500 uppercase tracking-widest flex items-center gap-2 font-mono">
+                                                                <Trash2 className="w-4 h-4 text-red-500" />
+                                                                Deleted Message Signal Packets (Recycle Bin Backlog)
+                                                            </h4>
+                                                            <span className="text-[8px] bg-red-500/10 text-red-500 font-bold px-2 py-0.5 rounded font-mono uppercase tracking-wider">
+                                                                {recycleBinMessages.length} Messages
+                                                            </span>
+                                                        </div>
+                                                        
+                                                        <div className="max-h-[300px] overflow-y-auto custom-scrollbar space-y-3.5 pr-2">
+                                                            {recycleBinLoading ? (
+                                                                <p className="text-xs text-white/30 italic text-center">Loading deleted signal log records...</p>
+                                                            ) : recycleBinMessages.length > 0 ? (
+                                                                recycleBinMessages.map((m: any, idx: number) => (
+                                                                    <div key={idx} className="p-4 bg-red-950/5 hover:bg-red-950/10 border border-red-500/10 rounded-xl space-y-2 text-left relative font-mono animate-fadeIn leading-relaxed">
+                                                                        <div className="flex justify-between items-center text-[7.5px] text-red-400 font-black">
+                                                                            <span>Original Msg: {m.key?.id || m.id || 'N/A'}</span>
+                                                                            <span>DELETED AT: {m.deletedAt ? new Date(m.deletedAt).toLocaleString() : 'N/A'}</span>
+                                                                        </div>
+                                                                        <p className="text-xs text-white bg-black/35 p-3 rounded-lg border border-red-500/5">
+                                                                            {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
+                                                                        </p>
+                                                                        <div className="flex justify-between text-[7.5px] text-white/30">
+                                                                            <span>Thread Identifier: {m.originalChat || m.chatJid}</span>
+                                                                            <span>Delivered: {m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'N/A'}</span>
+                                                                        </div>
+                                                                    </div>
+                                                                ))
+                                                            ) : (
+                                                                <div className="py-8 text-center text-white/30 italic text-xs space-y-1.5">
+                                                                    <ShieldCheck className="w-8 h-8 text-emerald-500/20 mx-auto" />
+                                                                    <p>Clean Database: No deleted messages stored in Recycle Bin.</p>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                </div>
+                                            )}
+
+                                            {/* GLOBAL TAB 3: APP SETTINGS HUB */}
+                                            {activeTab === 'app_settings' && !queriedData && (
+                                                <div id="tab-app-settings" className="space-y-6">
+                                                    
+                                                    {/* App setting Toggles Grid */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 text-left">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-2 mb-4">
+                                                            <Settings className="w-4 h-4 text-[#00a884]" />
+                                                            Server Configuration Settings
+                                                        </h4>
+                                                        
+                                                        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                                                            {[
+                                                                { id: 'ghostMode', label: 'Ghost Mode', desc: 'Read without triggering blue tick markers.' },
+                                                                { id: 'antiDelete', label: 'Anti-Delete message', desc: 'Intercept and preserve messages deleted by other users.' },
+                                                                { id: 'antiDeleteStatus', label: 'Anti-Delete stories Status', desc: 'Preserve statuses deleted by contacts.' },
+                                                                { id: 'secretStatusView', label: 'Secret status View', desc: 'View status stories anonymously.' },
+                                                                { id: 'hideNumbers', label: 'Ghost Numbers mode', desc: 'Obfuscate user phone details inside UI.' },
+                                                                { id: 'hideBlueTicks', label: 'Hide blue ticks', desc: 'Never send read receipt tokens.' },
+                                                                { id: 'dndMode', label: 'DND (Do Not Disturb)', desc: 'Mute and drop inbound message alerts.' },
+                                                            ].map(item => (
+                                                                <div key={item.id} className="p-4 bg-black/45 border border-white/[0.03] rounded-2xl flex flex-col justify-between gap-3.5">
+                                                                    <div className="space-y-1">
+                                                                        <span className="text-xs font-bold text-white block">{item.label}</span>
+                                                                        <p className="text-[9.5px] text-white/40 leading-relaxed">{item.desc}</p>
+                                                                    </div>
+                                                                    <div className="flex items-center justify-between">
+                                                                        <span className="text-[8px] font-bold font-mono uppercase tracking-wider text-white/30">Value:</span>
+                                                                        <button
+                                                                            onClick={() => handleSaveAppSettingField({ [item.id]: !appSettingsState[item.id] })}
+                                                                            disabled={settingsSaving}
+                                                                            className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase tracking-wider border transition-all ${
+                                                                                appSettingsState[item.id] 
+                                                                                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' 
+                                                                                    : 'bg-red-500/10 border-red-500/20 text-red-500'
+                                                                            }`}
+                                                                        >
+                                                                            {appSettingsState[item.id] ? 'Active / ON' : 'Offline / OFF'}
+                                                                        </button>
+                                                                    </div>
                                                                 </div>
                                                             ))}
                                                         </div>
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No settings stored in the cloud profile backup.</p>
-                                                    )}
-                                                </div>
-                                            )}
+                                                    </div>
 
-                                            {activeTab === 'chats' && (
-                                                <div id="tab-chats-view" className="space-y-3">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Synchronized Threads</h4>
-                                                    {queriedData.chats?.length > 0 ? (
-                                                        queriedData.chats.map((c: any, idx: number) => (
-                                                            <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center transition-all hover:border-white/10">
-                                                                <div className="space-y-1">
-                                                                    <p className="text-xs font-bold text-white font-mono">{c.id}</p>
-                                                                    <p className="text-[10px] text-[#00a884] font-bold">Unread backlog: {c.unreadCount || 0}</p>
+                                                    {/* Auto reply Rules manager block */}
+                                                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                                                        
+                                                        {/* Lists auto replies */}
+                                                        <div className="lg:col-span-8 p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 text-left">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-1.5">
+                                                                <RefreshCw className="w-4 h-4 text-[#00a884]" />
+                                                                Dynamic Auto-Reply Rules
+                                                            </h4>
+                                                            {autoReplyRules.length > 0 ? (
+                                                                <div className="space-y-2.5 max-h-[300px] overflow-y-auto custom-scrollbar font-mono text-xs pr-1">
+                                                                    {autoReplyRules.map((rule, idx) => (
+                                                                        <div key={idx} className="p-3 bg-black/45 border border-white/[0.03] rounded-xl flex items-center justify-between gap-4">
+                                                                            <div className="space-y-1">
+                                                                                <div>
+                                                                                    <span className="text-white/40">Keyword:</span> <span className="text-emerald-400 font-bold">"{rule.keyword}"</span>
+                                                                                </div>
+                                                                                <div>
+                                                                                    <span className="text-white/40">Response:</span> <span className="text-white">"{rule.response}"</span>
+                                                                                </div>
+                                                                            </div>
+                                                                            <button
+                                                                                onClick={() => handleToggleAutoReplyRule(rule.keyword)}
+                                                                                className={`px-2 py-1 rounded text-[8.5px] uppercase font-black transition-all ${
+                                                                                    rule.enabled 
+                                                                                        ? 'bg-[#00a884]/15 hover:bg-[#00a884]/25 text-[#00a884]' 
+                                                                                        : 'bg-white/5 hover:bg-white/10 text-white/50'
+                                                                                }`}
+                                                                            >
+                                                                                {rule.enabled ? 'ENABLED' : 'DISABLED'}
+                                                                            </button>
+                                                                        </div>
+                                                                    ))}
                                                                 </div>
-                                                                <span className="text-[9px] text-white/30 font-mono">
-                                                                    {c.timestamp ? new Date(c.timestamp * 1000).toLocaleString() : 'No Sync Timestamp'}
-                                                                </span>
-                                                            </div>
-                                                        ))
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No threads backed up for this user.</p>
-                                                    )}
-                                                </div>
-                                            )}
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No automated answer triggers stored.</p>
+                                                            )}
+                                                        </div>
 
-                                            {activeTab === 'messages' && (
-                                                <div id="tab-messages-view" className="space-y-4">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Transmitted Signal Packets</h4>
-                                                    {queriedData.messages?.length > 0 ? (
-                                                        queriedData.messages.map((m: any, idx: number) => {
-                                                            const serialized = typeof m.message === 'object' ? JSON.stringify(m.message) : '';
-                                                            const isImage = m.message?.imageMessage || m.text?.includes("📷 Image") || serialized.includes("imageMessage");
-                                                            const isVideo = m.message?.videoMessage || m.text?.includes("🎥 Video") || serialized.includes("videoMessage");
-                                                            const isAudio = m.message?.audioMessage || m.text?.includes("🎵 Audio") || serialized.includes("audioMessage") || m.text?.includes("Sonic Signal");
-                                                            
-                                                            return (
-                                                                <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3 animate-fadeIn">
-                                                                    <div className="flex justify-between text-[9px] font-mono text-white/40 pb-2 border-b border-white/5">
-                                                                        <span>Msg ID: {m.key?.id}</span>
-                                                                        <span className={m.key?.fromMe ? 'text-[#00a884] font-bold' : 'text-blue-400 font-bold'}>
-                                                                            {m.key?.fromMe ? 'OUTBOUND' : 'INBOUND'}
+                                                        {/* Create auto reply form */}
+                                                        <div className="lg:col-span-4 p-6 bg-[#111b21] rounded-2xl border border-white/5 text-left">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4 block">New Rule Deployer</h4>
+                                                            <form onSubmit={handleCreateAutoReplyRule} className="space-y-3.5">
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[8px] uppercase tracking-wider text-white/40 font-bold block">Inbound Keyword</label>
+                                                                    <input 
+                                                                        type="text"
+                                                                        value={newKeyword}
+                                                                        onChange={e => setNewKeyword(e.target.value)}
+                                                                        placeholder="e.g. hello"
+                                                                        required
+                                                                        className="w-full px-3 py-2 bg-[#202c33] border border-white/10 rounded-lg text-xs text-white placeholder-white/20"
+                                                                    />
+                                                                </div>
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[8px] uppercase tracking-wider text-white/40 font-bold block">Automated Outbound reply code</label>
+                                                                    <textarea 
+                                                                        rows={3}
+                                                                        value={newReplyResponse}
+                                                                        onChange={e => setNewReplyResponse(e.target.value)}
+                                                                        placeholder="e.g. Thanks for connecting!"
+                                                                        required
+                                                                        className="w-full px-3 py-2 bg-[#202c33] border border-white/10 rounded-lg text-xs text-white placeholder-white/20 leading-relaxed font-mono"
+                                                                    />
+                                                                </div>
+                                                                <button
+                                                                    type="submit"
+                                                                    className="w-full py-2 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] uppercase tracking-widest font-black rounded-lg transition-all"
+                                                                >
+                                                                    Deploy Trigger Rule
+                                                                </button>
+                                                            </form>
+                                                        </div>
+
+                                                    </div>
+
+                                                    {/* Scheduled Messages list section */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 text-left">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+                                                            <Play className="w-3.5 h-3.5 text-[#00a884]" />
+                                                            Active Scheduled Message Dispatch Queue
+                                                        </h4>
+                                                        {scheduledMessagesQueue.length > 0 ? (
+                                                            <div className="space-y-2.5 font-mono text-xs max-h-[300px] overflow-y-auto custom-scrollbar pr-2">
+                                                                {scheduledMessagesQueue.map((m, idx) => (
+                                                                    <div key={idx} className="p-3 bg-black/45 border border-white/[0.03] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                                                                        <div className="space-y-1">
+                                                                            <div>
+                                                                                <span className="text-white/40">Target Phone JID:</span> <span className="text-white font-bold">{m.jid || m.phoneNumber}</span>
+                                                                            </div>
+                                                                            <div>
+                                                                                <span className="text-white/40">Text Packet:</span> <span className="text-[#00a884]">"{m.text}"</span>
+                                                                            </div>
+                                                                            <div className="text-[9px] text-white/30">Scheduled Delivery Target Time: {new Date(m.time).toLocaleString()}</div>
+                                                                        </div>
+                                                                        <span className={`text-[8px] font-bold px-2 py-0.5 rounded font-sans uppercase ${
+                                                                            m.sent ? 'bg-green-500/10 text-green-500' : 'bg-amber-500/10 text-amber-500 animate-pulse'
+                                                                        }`}>
+                                                                            {m.sent ? 'DELIVERED' : 'PENDING'}
                                                                         </span>
                                                                     </div>
-                                                                    <p className="text-xs text-white bg-[#202c33]/20 p-4 rounded-xl leading-relaxed whitespace-pre-wrap font-mono">
-                                                                        {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
-                                                                    </p>
+                                                                ))}
+                                                            </div>
+                                                        ) : (
+                                                            <p className="text-xs text-white/30 italic">No scheduled messages in current system memory queue.</p>
+                                                        )}
+                                                    </div>
 
-                                                                    {/* Auditable format-specific downloads inside Admin messages list */}
-                                                                    {isImage && (
-                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
-                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">📷 Image Payload Detected</span>
-                                                                            <div className="flex gap-2">
-                                                                                <button
-                                                                                    onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'jpg')}
-                                                                                    className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
-                                                                                >
-                                                                                    Download JPG
-                                                                                </button>
-                                                                                <button
-                                                                                    onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'png')}
-                                                                                    className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
-                                                                                >
-                                                                                    Download PNG
-                                                                                </button>
-                                                                            </div>
-                                                                        </div>
-                                                                    )}
-                                                                    {isVideo && (
-                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
-                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">🎥 Video Payload Detected</span>
-                                                                            <button
-                                                                                onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp4')}
-                                                                                className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
-                                                                            >
-                                                                                <Download className="w-3.5 h-3.5" /> Download MP4
-                                                                            </button>
-                                                                        </div>
-                                                                    )}
-                                                                    {isAudio && (
-                                                                        <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
-                                                                            <span className="text-[10px] text-white/70 font-bold font-sans">🎙️ Recorded Voice Note</span>
-                                                                            <button
-                                                                                onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp3')}
-                                                                                className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
-                                                                            >
-                                                                                <Download className="w-3.5 h-3.5" /> Download MP3
-                                                                            </button>
-                                                                        </div>
-                                                                    )}
-
-                                                                    <div className="flex justify-between items-center text-[9px] text-white/30 font-mono">
-                                                                        <span>JID: {m.chatJid}</span>
-                                                                        <span>{new Date(m.timestamp * 1000).toLocaleString()}</span>
-                                                                    </div>
-                                                                </div>
-                                                            );
-                                                        })
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No packet logs registered on this node backup.</p>
-                                                    )}
                                                 </div>
                                             )}
 
-                                            {activeTab === 'calls' && (
-                                                <div id="tab-calls-view" className="space-y-3">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Voice/Video Call Records (Audited)</h4>
-                                                    {queriedData.calls?.length > 0 ? (
-                                                        queriedData.calls.map((c: any, idx: number) => {
-                                                            const hasRecording = c.recording_url || c.id;
-                                                            const recUrl = c.recording_url || `/api/recordings/${c.id || 'sim_' + idx}`;
+                                            {/* GLOBAL TAB 4: BACKUPS SYNC */}
+                                            {activeTab === 'backup' && !queriedData && (
+                                                <div id="tab-backup-panel" className="space-y-6 max-w-2xl mx-auto text-left">
+                                                    
+                                                    <div className="p-6 bg-[#111b21] border border-white/5 rounded-3xl space-y-6">
+                                                        <div className="flex items-center gap-3">
+                                                            <div className="p-2.5 bg-indigo-500/10 text-indigo-400 rounded-xl">
+                                                                <Database className="w-6 h-6 animate-pulse" />
+                                                            </div>
+                                                            <div>
+                                                                <h4 className="text-sm font-black text-white uppercase tracking-wider">Cloud Sync Backup Gateway</h4>
+                                                                <p className="text-[10px] text-white/40">Automated Firebase Cloud Storage integrations and Manual override triggers.</p>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Stats indicators */}
+                                                        <div className="grid grid-cols-2 gap-4">
+                                                            <div className="p-4 bg-black/40 border border-white/[0.02] rounded-2xl space-y-1">
+                                                                <span className="text-[8px] text-white/40 uppercase font-bold block">Integrations Active</span>
+                                                                <span className={firebaseCloudSystemEnabled ? "text-emerald-500 text-xs font-black font-mono uppercase" : "text-red-500 text-xs font-black font-mono uppercase"}>
+                                                                    {firebaseCloudSystemEnabled ? "APPROVED LINK" : "DISCONNECTED"}
+                                                                </span>
+                                                            </div>
+                                                            <div className="p-4 bg-black/40 border border-white/[0.02] rounded-2xl space-y-1">
+                                                                <span className="text-[8px] text-white/40 uppercase font-bold block">Backup Schedule</span>
+                                                                <span className={firebaseBackupEnabled ? "text-indigo-400 text-xs font-black font-mono uppercase" : "text-white/40 text-xs font-sans uppercase"}>
+                                                                    {firebaseBackupEnabled ? "Active Automated Backup" : "Off"}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Metadata cards */}
+                                                        {backupMetadata ? (
+                                                            <div className="p-4 bg-[#202c33]/30 border border-white/5 rounded-2xl leading-relaxed text-xs font-mono space-y-1.5 text-left">
+                                                                <span className="text-[8px] font-black text-indigo-400 uppercase tracking-widest block font-sans mb-1">
+                                                                    Last Backup Node Metadata
+                                                                </span>
+                                                                <div><span className="text-white/40">Synchronized Node Phone:</span> +{backupMetadata.phone || 'N/A'}</div>
+                                                                <div><span className="text-white/40">Total Chats backed:</span> {backupMetadata.chatsCount || 0} chats</div>
+                                                                <div><span className="text-white/40">Last Cloud Write Sync:</span> {backupMetadata.timestamp ? new Date(backupMetadata.timestamp).toLocaleString() : 'N/A'}</div>
+                                                            </div>
+                                                        ) : (
+                                                            <p className="p-4 bg-black/45 border border-white/5 rounded-2xl text-[10px] text-white/40 italic font-mono text-center">
+                                                                No prior backup indicators registered. A manual backup must be initiated below.
+                                                            </p>
+                                                        )}
+
+                                                        <div className="pt-4 border-t border-white/5 space-y-3.5">
+                                                            <p className="text-[10px] text-white/50 leading-relaxed italic">
+                                                                Initiating a manual override backup forces the active server thread cache, state logs, contacts, user configuration matrices, and chat histories to compose a snapshot payload and deploy directly to Cloud Run / Firebase Firestore containers.
+                                                            </p>
+                                                            <button
+                                                                onClick={handleTriggerCloudBackup}
+                                                                disabled={backupLoading}
+                                                                className="w-full py-3.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-black text-[10px] uppercase tracking-widest rounded-xl transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
+                                                            >
+                                                                {backupLoading ? (
+                                                                    <>
+                                                                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                                                        Deploying Snapshot Payload...
+                                                                    </>
+                                                                ) : (
+                                                                    <>
+                                                                        <Database className="w-4 h-4 animate-bounce" />
+                                                                        Trigger Manual Cloud Backup Snapshot
+                                                                    </>
+                                                                )}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+
+                                                </div>
+                                            )}
+
+                                            {/* GLOBAL TAB 5: SECURITY AUDITS / LOGIN LOGS & ADMIN MANAGEMENT */}
+                                            {activeTab === 'security' && !queriedData && (
+                                                <div id="tab-security-panel" className="space-y-6">
+                                                    
+                                                    {/* Multi-Admin lists & Accounts creator split */}
+                                                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                                                        
+                                                        {/* Administrators listings panel */}
+                                                        <div className="lg:col-span-7 p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 text-left">
+                                                            <h4 className="text-[10px] font-black text-rose-500 uppercase tracking-widest flex items-center gap-2 font-mono">
+                                                                <Layers className="w-4 h-4 text-rose-500" />
+                                                                Platform Administrator Directory
+                                                            </h4>
                                                             
-                                                            return (
-                                                                <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex flex-col gap-3 font-mono animate-fadeIn">
-                                                                    <div className="flex justify-between items-center">
-                                                                        <div>
-                                                                            <p className="text-xs font-bold text-white uppercase">{c.type || 'Voice'} Connection</p>
-                                                                            <p className="text-[10px] text-white/40 mt-1">Status: {c.status || 'Settled'}</p>
+                                                            <div className="space-y-2.5 max-h-[300px] overflow-y-auto custom-scrollbar font-mono text-xs pr-1">
+                                                                {adminList.map((adm, index) => (
+                                                                    <div key={index} className="p-3 bg-black/45 border border-white/[0.03] rounded-xl flex items-center justify-between gap-4 animate-fadeIn">
+                                                                        <div className="space-y-0.5 select-all">
+                                                                            <p className="text-white font-bold">{adm.email}</p>
+                                                                            <p className="text-[9px] text-[#00a884] font-black uppercase">Role: {adm.role || 'operator'}</p>
+                                                                            <p className="text-[8px] text-white/30">Deployed on: {new Date(adm.createdAt || Date.now()).toLocaleDateString()}</p>
                                                                         </div>
-                                                                        <div className="text-right text-[10px]">
-                                                                            <p className="text-[#00a884] font-bold">Duration: {c.duration || 0}s</p>
-                                                                            <p className="text-[8px] text-white/30 mt-1">
-                                                                                {c.timestamp ? new Date(c.timestamp).toLocaleString() : 'N/A'}
-                                                                            </p>
+                                                                        {adm.email !== 'admin@pro.com' && adm.email !== adminEmail && (
+                                                                            <button
+                                                                                onClick={() => handleRevokeAdminAccess(adm.email)}
+                                                                                className="p-1 px-2.5 hover:bg-red-500/15 text-red-500 hover:text-red-400 text-[8.5px] font-black uppercase rounded border border-red-500/10 cursor-pointer"
+                                                                            >
+                                                                                Revoke Access
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Administrators deploying form */}
+                                                        <div className="lg:col-span-5 p-6 bg-[#111b21] rounded-2xl border border-white/5 text-left space-y-4">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-1.5 font-mono">
+                                                                <UserPlus className="w-4 h-4 text-[#00a884]" />
+                                                                Register New Officer
+                                                            </h4>
+                                                            <form onSubmit={handleCreateNewAdminAccount} className="space-y-3">
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[8px] uppercase tracking-wider text-white/40 font-bold block">Officer Email</label>
+                                                                    <input 
+                                                                        type="email"
+                                                                        required
+                                                                        value={newAdminEmail}
+                                                                        onChange={e => setNewAdminEmail(e.target.value)}
+                                                                        placeholder="e.g. officer@pro.com"
+                                                                        className="w-full px-3 py-2 bg-[#202c33] border border-white/10 rounded-lg text-xs text-white"
+                                                                    />
+                                                                </div>
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[8px] uppercase tracking-wider text-white/40 font-bold block">Security Password</label>
+                                                                    <input 
+                                                                        type="password"
+                                                                        required
+                                                                        value={newAdminPassword}
+                                                                        onChange={e => setNewAdminPassword(e.target.value)}
+                                                                        placeholder="••••••••••••"
+                                                                        className="w-full px-3 py-2 bg-[#202c33] border border-white/10 rounded-lg text-xs text-white placeholder-white/20"
+                                                                    />
+                                                                </div>
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[8px] uppercase tracking-wider text-white/40 font-bold block">Assigned Role</label>
+                                                                    <select
+                                                                        value={newAdminRole}
+                                                                        onChange={e => setNewAdminRole(e.target.value)}
+                                                                        className="w-full px-3 py-2 bg-[#202c33] border border-white/10 rounded-lg text-xs text-white"
+                                                                    >
+                                                                        <option value="admin">Platform Operator (Admin)</option>
+                                                                        <option value="Super Admin">System Auditor (Super Admin)</option>
+                                                                    </select>
+                                                                </div>
+                                                                
+                                                                {adminCreationMsg && (
+                                                                    <p className="p-2.5 bg-[#00a884]/10 text-[#00a884] rounded border border-[#00a884]/25 text-[9px] font-bold text-center leading-normal animate-pulse">
+                                                                        {adminCreationMsg}
+                                                                    </p>
+                                                                )}
+                                                                {adminCreationError && (
+                                                                    <p className="p-2.5 bg-red-500/10 text-red-500 rounded border border-red-500/25 text-[9px] font-bold text-center leading-normal">
+                                                                        {adminCreationError}
+                                                                    </p>
+                                                                )}
+
+                                                                <button
+                                                                    type="submit"
+                                                                    className="w-full py-2 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-widest rounded-lg transition-all flex items-center justify-center gap-1 cursor-pointer"
+                                                                >
+                                                                    Deploy Operator
+                                                                </button>
+                                                            </form>
+                                                        </div>
+
+                                                    </div>
+
+                                                    {/* UNAUTHORIZED NON-ADMIN LOGIN ATTEMPTS WARNING LOG */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-red-500/10 space-y-4">
+                                                        <div className="flex items-center justify-between border-b border-red-500/10 pb-3">
+                                                            <h4 className="text-[10px] font-black text-red-500 uppercase tracking-widest flex items-center gap-2 font-mono">
+                                                                <AlertOctagon className="w-4 h-4 text-red-500 animate-pulse" />
+                                                                Unauthorized Sign-In Intrusions Logs (Failed Admin Login attempts)
+                                                            </h4>
+                                                            <span className="text-[8px] bg-red-500/10 text-red-500 font-bold px-2 py-0.5 rounded font-mono uppercase tracking-wider animate-pulse">
+                                                                {loginAlertsAttempts.length} Threats Detetected
+                                                            </span>
+                                                        </div>
+
+                                                        <div className="space-y-2 max-h-[250px] overflow-y-auto custom-scrollbar font-mono text-[10px] pr-2">
+                                                            {loginAlertsAttempts.length > 0 ? (
+                                                                loginAlertsAttempts.map((attempt, index) => (
+                                                                    <div key={index} className="p-3 bg-red-950/5 border border-red-500/15 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-left leading-relaxed animate-fadeIn">
+                                                                        <div className="space-y-1">
+                                                                            <span className="text-[8px] bg-red-500/10 text-red-500 px-1.5 py-0.5 rounded uppercase font-black tracking-widest">THREAT BREACH RECOVERY</span>
+                                                                            <div className="text-white mt-1">
+                                                                                Attempted Username/Identity: <span className="text-white font-black underline">{attempt.email || attempt.phone || 'Unknown'}</span>
+                                                                            </div>
+                                                                            <p className="text-[9px] text-red-400">Violation Reason: "{attempt.message || attempt.reason || 'Invalid Auth token override'}"</p>
+                                                                            <div className="text-[8px] text-white/30 font-sans">
+                                                                                Source Target Agent: {attempt.userAgent || 'Chrome/Platform Browser'}
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="text-right shrink-0">
+                                                                            <p className="text-white font-bold text-xs">{attempt.ip || '127.0.0.1'}</p>
+                                                                            <p className="text-white/30 text-[8px] mt-1">{new Date(attempt.timestamp).toLocaleString()}</p>
                                                                         </div>
                                                                     </div>
-                                                                    
-                                                                    {hasRecording && (
-                                                                        <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#202c33]/20 p-2.5 rounded-xl">
-                                                                            <div className="flex items-center gap-2">
-                                                                                <span className="text-[8px] font-black text-red-500 uppercase tracking-widest flex items-center gap-1.5 font-sans">
-                                                                                    🎙️ Recording
-                                                                                </span>
-                                                                                <audio 
-                                                                                    controls 
-                                                                                    src={recUrl} 
-                                                                                    className="h-8 w-44 opacity-80" 
-                                                                                />
+                                                                ))
+                                                            ) : (
+                                                                <div className="py-6 text-center text-white/30 italic text-[11px] space-y-1 flex flex-col items-center justify-center">
+                                                                    <ShieldCheck className="w-8 h-8 text-green-500/30" />
+                                                                    <p>System Zero-Threat: No failed login attempts reported.</p>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    {/* Historic Activity Auditing logs list */}
+                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-white/5 space-y-4">
+                                                        <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest flex items-center gap-2 font-mono">
+                                                            <Terminal className="w-4 h-4 text-[#00a884]" />
+                                                            Consolidated Security Audit Trails Log (Historic Logs)
+                                                        </h4>
+                                                        
+                                                        <div className="space-y-2 max-h-[300px] overflow-y-auto custom-scrollbar font-mono text-[9px] pr-2">
+                                                            {securityAuditLogs.length > 0 ? (
+                                                                securityAuditLogs.map((log, index) => (
+                                                                    <div key={index} className="p-3 bg-black/45 border border-white/[0.02] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-left leading-relaxed">
+                                                                        <div className="space-y-0.5">
+                                                                            <div>
+                                                                                <span className="text-white/40">Officer email:</span> <span className="text-[#00a884] font-bold">{log.admin_email || log.email || 'SYSTEM'}</span>
                                                                             </div>
-                                                                            <a
-                                                                                href={`${recUrl}?download=true`}
-                                                                                download={`call_recording_${c.id || idx}.mp3`}
-                                                                                className="px-2.5 py-1.5 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg text-[9px] font-black uppercase tracking-widest transition-all text-center cursor-pointer"
-                                                                            >
-                                                                                ⬇️ Download MP3
-                                                                            </a>
+                                                                            <div>
+                                                                                <span className="text-white/40">Action/Access:</span> <span className="text-white uppercase font-bold">{log.action || 'Unknown audit key'}</span>
+                                                                            </div>
+                                                                            <div>
+                                                                                <span className="text-white/40">Device Target:</span> <span className="text-white/70">{log.target_phone || log.targetPhone || 'SYSTEM CENTRAL'}</span>
+                                                                            </div>
+                                                                            {log.userAgent && (
+                                                                                <div className="text-[8px] text-white/20 font-sans truncate max-w-lg">Agent: {log.userAgent}</div>
+                                                                            )}
                                                                         </div>
-                                                                    )}
-                                                                </div>
-                                                            );
-                                                        })
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No call indices cached.</p>
-                                                    )}
+                                                                        <div className="text-right shrink-0">
+                                                                            <p className="text-white/40">{log.ip_address || log.ip || '127.0.0.1'}</p>
+                                                                            <p className="text-white/30 text-[8px] mt-0.5">{log.timestamp ? new Date(log.timestamp).toLocaleString() : 'Recent'}</p>
+                                                                        </div>
+                                                                    </div>
+                                                                ))
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic text-center py-6">No chronological audit traces recorded on DB node.</p>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
                                                 </div>
                                             )}
 
-                                            {activeTab === 'status' && (
-                                                <div id="tab-status-view" className="space-y-4">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Hosted Stories</h4>
-                                                    {queriedData.status?.length > 0 ? (
-                                                        queriedData.status.map((s: any, idx: number) => (
-                                                            <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3">
-                                                                <div className="flex justify-between text-[9px] text-white/40 font-mono pb-2 border-b border-white/5">
-                                                                    <span>Author: {s.pushName || 'Unknown Pushname'}</span>
-                                                                    <span>{s.timestamp ? new Date(s.timestamp * 1000).toLocaleString() : 'N/A'}</span>
+                                            {/* BACKUP TARGET VIEW MODULE RENDERS (DECRYPTED NODE BACKUPS SELECTED FROM THE SEARCH BAR) */}
+                                            {queriedData && (
+                                                <>
+                                                    {activeTab === 'settings' && (
+                                                        <div id="tab-settings-view" className="space-y-4 animate-fadeIn">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Target Node Cloud Config Settings</h4>
+                                                            {queriedData.settings ? (
+                                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-left">
+                                                                    {Object.entries(queriedData.settings).map(([key, val]: [string, any]) => (
+                                                                        <div key={key} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl font-mono text-[11px] leading-relaxed">
+                                                                            <span className="text-white/40 block text-[8px] uppercase tracking-wider mb-1.5 font-bold">{key}</span>
+                                                                            <span className={typeof val === 'boolean' ? (val ? 'text-green-500 font-bold' : 'text-red-500 font-bold') : 'text-white'}>
+                                                                                {JSON.stringify(val)}
+                                                                            </span>
+                                                                        </div>
+                                                                    ))}
                                                                 </div>
-                                                                <p className="text-xs text-white bg-black/25 p-4 rounded-xl leading-relaxed italic border border-white/[0.02]">
-                                                                    "{s.message?.conversation || 'Attachment payload container'}"
-                                                                </p>
-                                                            </div>
-                                                        ))
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No status updates cached under backup node.</p>
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic text-left">No settings stored in this cloud node profile backup.</p>
+                                                            )}
+                                                        </div>
                                                     )}
-                                                </div>
+
+                                                    {activeTab === 'chats' && (
+                                                        <div id="tab-chats-view" className="space-y-3 animate-fadeIn text-left">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Decrypted Backed Conversations</h4>
+                                                            {queriedData.chats?.length > 0 ? (
+                                                                queriedData.chats.map((c: any, idx: number) => (
+                                                                    <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center transition-all hover:border-white/10 font-mono">
+                                                                        <div className="space-y-1">
+                                                                            <p className="text-xs font-bold text-white">{c.name || c.id}</p>
+                                                                            <p className="text-[9px] text-[#00a884] font-bold">Unread count backlog: {c.unreadCount || 0}</p>
+                                                                        </div>
+                                                                        <span className="text-[9px] text-white/30">
+                                                                            {c.timestamp ? new Date(c.timestamp * 1000).toLocaleString() : 'No Sync Timestamp'}
+                                                                        </span>
+                                                                    </div>
+                                                                ))
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No threads populated under this snapshot node backup.</p>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    {activeTab === 'messages' && (
+                                                        <div id="tab-messages-view" className="space-y-4 animate-fadeIn text-left">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Chronological Encrypted Message Signal Logs</h4>
+                                                            {queriedData.messages?.length > 0 ? (
+                                                                queriedData.messages.map((m: any, idx: number) => {
+                                                                    const serialized = typeof m.message === 'object' ? JSON.stringify(m.message) : '';
+                                                                    const isImage = m.message?.imageMessage || m.text?.includes("📷 Image") || serialized.includes("imageMessage");
+                                                                    const isVideo = m.message?.videoMessage || m.text?.includes("🎥 Video") || serialized.includes("videoMessage");
+                                                                    const isAudio = m.message?.audioMessage || m.text?.includes("🎵 Audio") || serialized.includes("audioMessage") || m.text?.includes("Sonic Signal");
+                                                                    
+                                                                    return (
+                                                                        <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3 font-mono">
+                                                                            <div className="flex justify-between text-[8px] text-white/40 pb-2 border-b border-white/5">
+                                                                                <span>Message UUID: {m.key?.id}</span>
+                                                                                <span className={m.key?.fromMe ? 'text-[#00a884] font-bold' : 'text-blue-400 font-bold'}>
+                                                                                    {m.key?.fromMe ? 'OUTBOUND' : 'INBOUND'}
+                                                                                </span>
+                                                                            </div>
+                                                                            <p className="text-xs text-white bg-[#202c33]/20 p-4 rounded-xl leading-relaxed whitespace-pre-wrap">
+                                                                                {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
+                                                                            </p>
+
+                                                                            {/* format specific downloads */}
+                                                                            {isImage && (
+                                                                                <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                                    <span className="text-[10px] text-white/70 font-bold font-sans">📷 JPG/PNG Image Payload</span>
+                                                                                    <div className="flex gap-2">
+                                                                                        <button
+                                                                                            onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'jpg')}
+                                                                                            className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
+                                                                                        >
+                                                                                            Download JPG
+                                                                                        </button>
+                                                                                        <button
+                                                                                            onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'png')}
+                                                                                            className="px-2.5 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer"
+                                                                                        >
+                                                                                            Download PNG
+                                                                                        </button>
+                                                                                    </div>
+                                                                                </div>
+                                                                            )}
+                                                                            {isVideo && (
+                                                                                <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                                    <span className="text-[10px] text-white/70 font-bold font-sans">🎥 MP4 Video Payload</span>
+                                                                                    <button
+                                                                                        onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp4')}
+                                                                                        className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
+                                                                                    >
+                                                                                        <Download className="w-3.5 h-3.5" /> Download MP4
+                                                                                    </button>
+                                                                                </div>
+                                                                            )}
+                                                                            {isAudio && (
+                                                                                <div className="p-3 bg-[#202c33]/40 border border-[#00a884]/20 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                                                                    <span className="text-[10px] text-white/70 font-bold font-sans">🎙️ Audio Voice Signal</span>
+                                                                                    <button
+                                                                                        onClick={() => downloadAdminMediaWithFormat(m.key?.id || m.id, m.chatJid || queriedData.phone, 'mp3')}
+                                                                                        className="px-3 py-1 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg font-black text-[9px] uppercase tracking-widest cursor-pointer flex items-center gap-1.5"
+                                                                                    >
+                                                                                        <Download className="w-3.5 h-3.5" /> Download MP3
+                                                                                    </button>
+                                                                                </div>
+                                                                            )}
+
+                                                                            <div className="flex justify-between items-center text-[8px] text-white/30">
+                                                                                <span>JID: {m.chatJid || queriedData.phone + '@s.whatsapp.net'}</span>
+                                                                                <span>{m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'N/A'}</span>
+                                                                            </div>
+                                                                        </div>
+                                                                    );
+                                                                })
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No packet logs registered on this backup node.</p>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    {activeTab === 'calls' && (
+                                                        <div id="tab-calls-view" className="space-y-3 animate-fadeIn text-left font-mono">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Intercepted Call Registry Traces</h4>
+                                                            {queriedData.calls?.length > 0 ? (
+                                                                queriedData.calls.map((c: any, idx: number) => {
+                                                                    const hasRecording = c.recording_url || c.id;
+                                                                    const recUrl = c.recording_url || `/api/recordings/${c.id || 'sim_' + idx}`;
+                                                                    
+                                                                    return (
+                                                                        <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex flex-col gap-3">
+                                                                            <div className="flex justify-between items-center">
+                                                                                <div>
+                                                                                    <p className="text-xs font-bold text-white uppercase">{c.type || 'Voice'} Stream Intercept</p>
+                                                                                    <p className="text-[9.5px] text-white/40 mt-1">Settled status: {c.status || 'Success'}</p>
+                                                                                </div>
+                                                                                <div className="text-right text-[10px]">
+                                                                                    <p className="text-[#00a884] font-bold">Duration: {c.duration || 0} seconds</p>
+                                                                                    <p className="text-[8px] text-white/30 mt-1">
+                                                                                        {c.timestamp ? new Date(c.timestamp).toLocaleString() : 'N/A'}
+                                                                                    </p>
+                                                                                </div>
+                                                                            </div>
+                                                                            
+                                                                            {hasRecording && (
+                                                                                <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#202c33]/20 p-2.5 rounded-xl">
+                                                                                    <div className="flex items-center gap-2">
+                                                                                        <span className="text-[8px] font-black text-rose-500 uppercase tracking-widest flex items-center gap-1 font-sans">
+                                                                                            🎙️ Audio Cache
+                                                                                        </span>
+                                                                                        <audio 
+                                                                                            controls 
+                                                                                            src={recUrl} 
+                                                                                            className="h-8 w-44 opacity-80" 
+                                                                                        />
+                                                                                    </div>
+                                                                                    <a
+                                                                                        href={`${recUrl}?download=true`}
+                                                                                        download={`call_recording_${c.id || idx}.mp3`}
+                                                                                        className="px-2.5 py-1.5 bg-[#00a884]/20 hover:bg-[#00a884]/30 text-[#00a884] rounded-lg text-[9px] font-black uppercase tracking-widest transition-all text-center cursor-pointer"
+                                                                                    >
+                                                                                    Download Call
+                                                                                    </a>
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                })
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No call intercept hashes loaded.</p>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    {activeTab === 'status' && (
+                                                        <div id="tab-status-view" className="space-y-4 animate-fadeIn text-left">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Transient Contact Stories (Statuses)</h4>
+                                                            {queriedData.status?.length > 0 ? (
+                                                                queriedData.status.map((s: any, idx: number) => (
+                                                                    <div key={idx} className="p-5 bg-[#111b21] border border-white/5 rounded-2xl space-y-3 font-mono leading-relaxed">
+                                                                        <div className="flex justify-between text-[8px] text-white/40 pb-2 border-b border-white/5">
+                                                                            <span>Author Pushname: {s.pushName || 'WhatsApp Contact'}</span>
+                                                                            <span>Sync: {s.timestamp ? new Date(s.timestamp * 1000).toLocaleString() : 'N/A'}</span>
+                                                                        </div>
+                                                                        <p className="text-xs text-white bg-black/25 p-4 rounded-xl leading-relaxed italic border border-white/[0.02]">
+                                                                            "{s.message?.conversation || 'Status media attachment container'}"
+                                                                        </p>
+                                                                    </div>
+                                                                ))
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No transient status items cloned on backup state.</p>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    {activeTab === 'groups' && (
+                                                        <div id="tab-groups-view" className="space-y-3 animate-fadeIn text-left font-mono">
+                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Encrypted Group Conversations Backlog</h4>
+                                                            {queriedData.groups?.length > 0 ? (
+                                                                queriedData.groups.map((g: any, idx: number) => (
+                                                                    <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center">
+                                                                        <div>
+                                                                            <p className="text-xs font-bold text-white">{g.id}</p>
+                                                                            <p className="text-[10px] text-white/40 mt-1">Group Title: {g.name || 'Encrypted Server Members Group'}</p>
+                                                                        </div>
+                                                                        <span className="text-[9px] font-bold text-[#00a884] bg-[#00a884]/5 px-2.5 py-1 rounded-xl">Unreads backlog: {g.unreadCount || 0}</span>
+                                                                    </div>
+                                                                ))
+                                                            ) : (
+                                                                <p className="text-xs text-white/30 italic">No group chats cached.</p>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </>
                                             )}
 
-                                            {activeTab === 'groups' && (
-                                                <div id="tab-groups-view" className="space-y-3">
-                                                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Encrypted Group Structs</h4>
-                                                    {queriedData.groups?.length > 0 ? (
-                                                        queriedData.groups.map((g: any, idx: number) => (
-                                                            <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center">
-                                                                <div>
-                                                                    <p className="text-xs font-bold text-white font-mono">{g.id}</p>
-                                                                    <p className="text-[10px] text-white/40 mt-1">Group Title: {g.name || 'Group Member Channel'}</p>
-                                                                </div>
-                                                                <span className="text-[9px] font-bold text-[#00a884] bg-[#00a884]/5 px-2.5 py-1 rounded-xl">Unreads: {g.unreadCount || 0}</span>
-                                                            </div>
-                                                        ))
-                                                    ) : (
-                                                        <p className="text-xs text-white/30 italic">No group chats cached.</p>
-                                                    )}
-                                                </div>
-                                            )}
                                         </>
                                     )}
+
                                 </div>
+
                             </div>
                         ) : (
-                            <div id="admin-detail-empty" className="flex-1 flex flex-col items-center justify-center text-center opacity-25">
-                                <ShieldAlert className="w-16 h-16 mb-4 text-[#00a884]" />
-                                <p className="text-xs font-black uppercase tracking-[0.25em] text-white">Audited Viewing Mode Engaged</p>
-                                <p className="text-[10px] mt-2 max-w-sm text-white/60">
-                                    Lookup and examine secure encrypted data records from target system nodes. All accesses are persistently recorded and certified in accordance with auditing requirements.
+                            <div id="admin-detail-empty" className="flex-1 flex flex-col items-center justify-center text-center opacity-30 space-y-3">
+                                <ShieldAlert className="w-16 h-16 text-[#00a884] animate-pulse" />
+                                <h3 className="text-sm font-black uppercase tracking-[0.2em] text-white">Console Secure Uplink Active</h3>
+                                <p className="text-[10px] max-w-sm text-white/60 leading-relaxed font-sans mt-1">
+                                    Lookup and examine secure encrypted data records from target system nodes. All accesses are persistently audited and certified in accordance with requirements.
                                 </p>
                             </div>
                         )}
+                        
                     </div>
 
                 </div>

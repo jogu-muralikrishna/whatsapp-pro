@@ -10,8 +10,6 @@ export default defineConfig(({mode}) => {
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
     },
-    // VERCEL FIX: VITE_ prefixed vars are auto-exposed to frontend by Vite at build time.
-    // Set VITE_RAILWAY_WS_URL=wss://whatsapp-pro-production.up.railway.app in Vercel env vars.
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

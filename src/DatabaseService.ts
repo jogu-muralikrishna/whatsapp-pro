@@ -187,6 +187,21 @@ export async function getAdminByEmail(email: string): Promise<any> {
   return db.admins[email] || null;
 }
 
+export async function getAllAdmins(): Promise<any[]> {
+  const db = readDB();
+  return Object.values(db.admins || {});
+}
+
+export async function deleteAdmin(email: string): Promise<boolean> {
+  const db = readDB();
+  if (db.admins && db.admins[email]) {
+    delete db.admins[email];
+    writeDB(db);
+    return true;
+  }
+  return false;
+}
+
 export async function insertAuditLog(log: any): Promise<any> {
   const db = readDB();
   const entry = {
@@ -252,6 +267,8 @@ export const DatabaseService = {
   getAllChats,
   createAdmin,
   getAdminByEmail,
+  getAllAdmins,
+  deleteAdmin,
   insertAuditLog,
   getAuditLogs,
   insertNotification,

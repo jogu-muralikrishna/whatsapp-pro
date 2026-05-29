@@ -54,11 +54,17 @@ import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db as clientDb } from "./lib/firebaseClient";
 
 const API_BASE = "";
-// VERCEL FIX: WebSocket must connect directly to Railway backend.
-// Vercel cannot proxy WebSocket connections via its rewrite rules.
-// Add VITE_RAILWAY_WS_URL = wss://whatsapp-pro-production.up.railway.app
-// in your Vercel project → Settings → Environment Variables
-const WS_BASE = (import.meta as any).env?.VITE_RAILWAY_WS_URL || "";
+const WS_BASE = "";
+
+function maskAdminEmail(email: string): string {
+  if (!email) return "Authorized Administrator";
+  if (!email.includes("@")) return "Authorized Administrator";
+  const [local, domain] = email.split("@");
+  if (local.length <= 3) {
+    return `${local[0]}***@${domain}`;
+  }
+  return `${local.substring(0, 3)}***${local.slice(-1)}@${domain}`;
+}
 
 function safeFormat(
   dateVal: any,
@@ -1258,19 +1264,8 @@ export default function App() {
   };
 
   const connectWebSocket = () => {
-    // VERCEL FIX: If VITE_RAILWAY_WS_URL is set, connect WebSocket directly to Railway.
-    // This is required because Vercel cannot proxy WebSocket upgrade requests.
-    // Falls back to same-host for local dev and Railway direct-access.
-    let wsUrl: string;
-    if (WS_BASE && WS_BASE.startsWith("wss://")) {
-      wsUrl = WS_BASE;
-    } else if (WS_BASE && WS_BASE.startsWith("ws://")) {
-      wsUrl = WS_BASE;
-    } else {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      wsUrl = `${protocol}//${window.location.host}`;
-    }
-    const socket = new WebSocket(wsUrl);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
     ws.current = socket;
 
     socket.onclose = () => {
@@ -1282,6 +1277,11 @@ export default function App() {
     socket.onmessage = (event) => {
       const { type, data } = JSON.parse(event.data);
       switch (type) {
+        case "ADMIN_LOGIN_ATTEMPT_ALERT": {
+          const customEvent = new CustomEvent("ADMIN_LOGIN_ATTEMPT_ALERT", { detail: data });
+          window.dispatchEvent(customEvent);
+          break;
+        }
         case "CONNECTION_STATE":
           setConnectionState(data);
           if (data === "open") {
@@ -6419,7 +6419,7 @@ export default function App() {
                       Auditor ID:
                     </span>
                     <span className="text-zinc-300">
-                      {adminAccessAlert.adminEmail}
+                      {maskAdminEmail(adminAccessAlert.adminEmail)}
                     </span>
                   </div>
                   <div className="flex justify-between">
@@ -6485,7 +6485,7 @@ export default function App() {
               <div className="space-y-2">
                 <h3 className="text-sm font-black text-white uppercase tracking-wider">⚠️ ADMINISTRATIVE ACCESS REQUEST</h3>
                 <p className="text-[10px] text-white/50 leading-relaxed italic">
-                  An administrator (<span className="text-white font-mono">{pendingConsentRequest.adminEmail}</span>) is requesting consent to temporarily view your chats and call history under privacy protocols. This permission is 100% read-only and expires in 5 minutes.
+                  An administrator (<span className="text-[#00a884] font-bold font-mono">{maskAdminEmail(pendingConsentRequest.adminEmail)}</span>) is requesting consent to temporarily view your chats and call history under privacy protocols. This permission is 100% read-only and expires in 5 minutes.
                 </p>
               </div>
 

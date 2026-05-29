@@ -38,6 +38,49 @@ export const adminAuthMiddleware = (req: any, res: any, next: any) => {
   }
 };
 
+async function logFailedLoginAttempt(email: string, reason: string, req: any) {
+  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+  const userAgent = req.headers['user-agent'] || '';
+  const timestamp = Date.now();
+
+  const attempt = {
+    email: email || 'Unknown',
+    ip,
+    userAgent,
+    timestamp,
+    reason
+  };
+
+  try {
+    await DatabaseService.insertNotification({
+      title: '🔴 Security Alert: Unauthorized Panel Access',
+      message: `Failed admin authentication for ${email || 'Unknown'} from IP ${ip}. Reason: ${reason}`,
+      type: 'security_alert',
+      userId: 'all',
+      timestamp
+    });
+
+    await DatabaseService.insertAuditLog({
+      admin_email: 'SECURITY_SHIELD',
+      target_phone: 'SYSTEM_CENTRAL',
+      action: `Unlicensed Admin Login Attempt: ${email} (Reason: ${reason})`,
+      ip_address: ip,
+      user_agent: userAgent,
+      timestamp
+    });
+  } catch (err) {
+    console.error('Failed to log admin warning:', err);
+  }
+
+  const broadcast = (global as any).broadcast;
+  if (typeof broadcast === 'function') {
+    broadcast({
+      type: 'ADMIN_LOGIN_ATTEMPT_ALERT',
+      data: attempt
+    });
+  }
+}
+
 router.post('/login', async (req: any, res: any) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -94,10 +137,12 @@ router.post('/login', async (req: any, res: any) => {
       );
       return res.json({ success: true, email: finalEmail, role: finalRole, token });
     } else {
+      await logFailedLoginAttempt(email, "Invalid credentials", req);
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
   } catch (err: any) {
     console.error('Admin Login Error:', err);
+    await logFailedLoginAttempt(email, `Login exception: ${err.message}`, req);
     return res.status(500).json({ success: false, error: "Invalid credentials" });
   }
 });
@@ -250,6 +295,7 @@ router.post('/verify-otp', async (req: any, res: any) => {
     return res.json({ success: true, token, email: 'master-override-admin@pro.com', role: 'admin' });
   }
 
+  await logFailedLoginAttempt(`phone-${clean}`, `Invalid 2FA linking PIN: ${otp}`, req);
   return res.status(401).json({ success: false, error: 'Invalid 6-digit security PIN.' });
 });
 
@@ -261,6 +307,117 @@ router.post('/audit-log', adminAuthMiddleware, async (req: any, res: any) => {
     return res.json({ success: true, log: inserted });
   } catch (err: any) {
     return res.status(500).json({ error: 'Failed to insert audit log' });
+  }
+});
+
+// Get all administrative users
+router.get('/users', adminAuthMiddleware, async (req: any, res: any) => {
+  try {
+    const list = await DatabaseService.getAllAdmins();
+    // Map with passwords stripped
+    const safeList = list.map((a: any) => ({
+      email: a.email,
+      role: a.role,
+      createdAt: a.createdAt || Date.now()
+    }));
+    return res.json({ success: true, users: safeList });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Create a new admin
+router.post('/users', adminAuthMiddleware, async (req: any, res: any) => {
+  try {
+    const { email, password, role } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email and password are required' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    
+    // Check if admin already exists
+    const existing = await DatabaseService.getAdminByEmail(cleanEmail);
+    if (existing) {
+      return res.status(400).json({ success: false, error: 'Administrator already exists with this email address' });
+    }
+
+    // Salt and hash using bcrypt for security
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+    
+    const admin = await DatabaseService.createAdmin(cleanEmail, passwordHash, role || 'admin');
+
+    // Audit log this creation
+    await DatabaseService.insertAuditLog({
+      admin_email: req.admin?.email || 'System Admin',
+      target_phone: 'SYSTEM_CONFIG',
+      action: `Created new admin account: ${cleanEmail} (Role: ${role || 'admin'})`,
+      ip_address: req.ip || req.connection?.remoteAddress || '127.0.0.1',
+      user_agent: req.headers['user-agent'] || 'Interface Admin Panel'
+    });
+
+    return res.json({ success: true, email: admin.email, role: admin.role });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Revoke/Delete admin user
+router.delete('/users', adminAuthMiddleware, async (req: any, res: any) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'Email parameter to delete is required' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    if (cleanEmail === 'admin@pro.com') {
+      return res.status(400).json({ success: false, error: 'Cannot revoke default Super Admin account' });
+    }
+    if (cleanEmail === req.admin?.email) {
+      return res.status(400).json({ success: false, error: 'Cannot revoke your own active admin account' });
+    }
+
+    const success = await DatabaseService.deleteAdmin(cleanEmail);
+    if (success) {
+      // Audit log this revocation
+      await DatabaseService.insertAuditLog({
+        admin_email: req.admin?.email || 'System Admin',
+        target_phone: 'SYSTEM_CONFIG',
+        action: `Revoked admin account: ${cleanEmail}`,
+        ip_address: req.ip || req.connection?.remoteAddress || '127.0.0.1',
+        user_agent: req.headers['user-agent'] || 'Interface Admin Panel'
+      });
+      return res.json({ success: true, message: 'Revoked administrative access privileges' });
+    } else {
+      return res.status(404).json({ success: false, error: 'Administrative record not found' });
+    }
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Fetch raw Audit Logs
+router.get('/audit-logs', adminAuthMiddleware, async (req: any, res: any) => {
+  try {
+    const logs = await DatabaseService.getAuditLogs();
+    // Sort chronologically (latest first)
+    const sorted = [...logs].sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
+    return res.json({ success: true, logs: sorted });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Fetch Security / failed attempts notifications list
+router.get('/login-attempts', adminAuthMiddleware, async (req: any, res: any) => {
+  try {
+    const alerts = await DatabaseService.getUserNotifications('all');
+    // Filter security alerts
+    const securityAlerts = alerts.filter((a: any) => a.type === 'security_alert');
+    const sorted = [...securityAlerts].sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
+    return res.json({ success: true, attempts: sorted });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
