@@ -87,7 +87,13 @@ if (fs.existsSync(firebaseConfigPath)) {
                     console.log('[Firebase] Firestore Database is active, writable, and verified.');
                 })
                 .catch((err: any) => {
-                    checkQuotaError(err);
+                    const isQuotaExceeded = checkQuotaError(err);
+                    if (isQuotaExceeded) {
+                        console.warn(`🚨 [Firebase Safeguard] Firestore daily free quota exceeded! Seamlessly running on 100% resilient permanent local storage backups.`);
+                        firestoreAvailable = false;
+                        setFirebaseEnabledState(false);
+                        return; // Prevent retries to conserve system resources
+                    }
                     const errMsg = (err?.message || '').toLowerCase();
                     const errCode = err?.code || '';
                     

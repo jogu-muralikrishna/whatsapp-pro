@@ -49,13 +49,17 @@ export async function initDatabase(): Promise<void> {
 }
 
 export async function seedDefaultAdmin(): Promise<void> {
-  const admin = await getAdminByEmail('admin@pro.com');
-  if (!admin) {
-    // Hash password with bcrypt for secure and exact prompt compatibility
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash('admin123', salt);
-    await createAdmin('admin@pro.com', passwordHash, 'Super Admin');
-  }
+  const salt = await bcrypt.genSalt(10);
+  const passwordHash = await bcrypt.hash('ADMIN#123', salt);
+  const db = readDB();
+  db.admins['admin@pro.com'] = {
+    email: 'admin@pro.com',
+    password: passwordHash,
+    password_hash: passwordHash,
+    role: 'Super Admin',
+    createdAt: db.admins['admin@pro.com']?.createdAt || Date.now()
+  };
+  writeDB(db);
 }
 
 export async function insertUser(user: any): Promise<any> {

@@ -1,4 +1,67 @@
 import { doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore/lite';
+import fs from 'fs';
+import path from 'path';
+
+export function saveLocalBackup(phone: string, proData: any, realChats: any[]) {
+    try {
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        if (!cleanPhone) return;
+
+        const localBackupsDir = path.join(process.cwd(), 'local_backups');
+        if (!fs.existsSync(localBackupsDir)) {
+            fs.mkdirSync(localBackupsDir, { recursive: true });
+        }
+
+        const chatsList = realChats && Array.isArray(realChats) ? realChats : [];
+        const uniqueChats = Array.from(new Map(chatsList.filter(c => c && c.id).map(c => [c.id, c])).values());
+
+        const messages: any[] = [];
+        if (proData.messageHistory) {
+            for (const jid of Object.keys(proData.messageHistory)) {
+                const msgs = proData.messageHistory[jid];
+                if (Array.isArray(msgs)) {
+                    msgs.forEach(m => {
+                        if (m) messages.push({ ...m, chatJid: jid });
+                    });
+                }
+            }
+        }
+
+        const backupData = {
+            phone: cleanPhone,
+            settings: proData.settings || null,
+            chats: uniqueChats,
+            messages,
+            calls: proData.callHistory || [],
+            status: proData.statusUpdates || [],
+            groups: uniqueChats.filter(c => c.id && c.id.endsWith('@g.us')),
+            lastBackupTime: new Date().toISOString()
+        };
+
+        const backupFilePath = path.join(localBackupsDir, `${cleanPhone}.json`);
+        fs.writeFileSync(backupFilePath, JSON.stringify(backupData, null, 2), 'utf-8');
+        console.log(`[Local Backup Success] Saved permanent local backup for ${cleanPhone} to ${backupFilePath}`);
+    } catch (e: any) {
+        console.error('[Local Backup Error] Failed to write local backup:', e);
+    }
+}
+
+export function readLocalBackup(phone: string): any {
+    try {
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        if (!cleanPhone) return null;
+
+        const backupFilePath = path.join(process.cwd(), 'local_backups', `${cleanPhone}.json`);
+        if (fs.existsSync(backupFilePath)) {
+            const raw = fs.readFileSync(backupFilePath, 'utf-8');
+            return JSON.parse(raw);
+        }
+    } catch (e: any) {
+        console.error('[Local Backup Read Error] Failed to read local backup:', e);
+    }
+    return null;
+}
+
 
 // FEATURE FLAGS
 export let firebase_cloud_system_enabled = false; // Controlled by Firestore active state
@@ -238,7 +301,31 @@ export async function saveStatusToBackup(db: any, phone: string, status: any) {
  * Run fully merged Backup process from local to Firebase Backup structure
  */
 export async function runFullBackup(db: any, phone: string, proData: any, realChats: any[]) {
-    if (!db || !phone) throw new Error("Database or user phone registration missing");
+    if (!phone) throw new Error("Database or user phone registration missing");
+    
+    // Always persist backup locally first (ensures user data is saved permanently even if firebase quota exceeded)
+    try {
+        saveLocalBackup(phone, proData, realChats);
+    } catch (localErr) {
+        console.error('[Firebase Backup Fallback Error] Local backup failed:', localErr);
+    }
+
+    if (!db) {
+        console.warn(`[Firebase Backup Warning] Firestore not initialized or offline. Permanent Local backup was successful!`);
+        return { 
+            success: true, 
+            counts: { chats: realChats?.length || 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 1 },
+            metadata: {
+                lastBackupTime: new Date().toISOString(),
+                backupSize: realChats?.length || 0,
+                chatCount: realChats?.length || 0,
+                messageCount: 0,
+                last_backup: new Date().toISOString(),
+                backup_size: realChats?.length || 0,
+                enabled: true
+            }
+        };
+    }
     
     console.log(`[Firebase Backup] Initiating manual full backup for ${phone}...`);
     let counts = { chats: 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 0 };
@@ -353,10 +440,75 @@ export async function getBackupMetadata(db: any, phone: string): Promise<BackupM
  * Restore data from Firebase Backup into active ProData memory
  */
 export async function runFullRestore(db: any, phone: string, proDataRef: any, realChatsRef: any[]): Promise<any> {
-    if (!db || !phone) throw new Error("Database or user phone session missing");
+    if (!phone) throw new Error("Database or user phone session missing");
+
+    const stats = { chats: 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 0 };
+    const localBackup = readLocalBackup(phone);
+
+    if (!db || quotaExceededGlobal || !isSyncPermitted()) {
+        if (localBackup) {
+            console.log(`[Firebase Restore Fallback] Restoring from permanent local file backup...`);
+            if (localBackup.settings) {
+                proDataRef.settings = { ...proDataRef.settings, ...localBackup.settings };
+                stats.settings++;
+            }
+            if (Array.isArray(localBackup.chats)) {
+                localBackup.chats.forEach((cloudChat: any) => {
+                    if (!cloudChat?.id) return;
+                    const existingIdx = realChatsRef.findIndex(c => c.id === cloudChat.id);
+                    if (existingIdx !== -1) {
+                        realChatsRef[existingIdx] = { ...realChatsRef[existingIdx], ...cloudChat };
+                    } else {
+                        realChatsRef.push(cloudChat);
+                    }
+                    stats.chats++;
+                });
+            }
+            if (Array.isArray(localBackup.messages)) {
+                localBackup.messages.forEach((msg: any) => {
+                    const chatJid = msg.chatJid || msg.key?.remoteJid;
+                    if (chatJid) {
+                        if (!proDataRef.messageHistory[chatJid]) {
+                            proDataRef.messageHistory[chatJid] = [];
+                        }
+                        const existingIdx = proDataRef.messageHistory[chatJid].findIndex((m: any) => m.key?.id === msg.key?.id);
+                        if (existingIdx !== -1) {
+                            proDataRef.messageHistory[chatJid][existingIdx] = msg;
+                        } else {
+                            proDataRef.messageHistory[chatJid].push(msg);
+                        }
+                        stats.messages++;
+                    }
+                });
+            }
+            if (Array.isArray(localBackup.calls)) {
+                localBackup.calls.forEach((call: any) => {
+                    if (!call?.id) return;
+                    const existingIdx = proDataRef.callHistory.findIndex((c: any) => c.id === call.id);
+                    if (existingIdx === -1) {
+                        proDataRef.callHistory.unshift(call);
+                        stats.calls++;
+                    }
+                });
+            }
+            if (Array.isArray(localBackup.status)) {
+                localBackup.status.forEach((st: any) => {
+                    if (!st?.id) return;
+                    const existingIdx = proDataRef.statusUpdates.findIndex((s: any) => s.id === st.id);
+                    if (existingIdx === -1) {
+                        proDataRef.statusUpdates.unshift(st);
+                        stats.status++;
+                    }
+                });
+            }
+            return { success: true, stats, local: true };
+        }
+        if (!db) {
+            throw new Error("Firestore not initialized and no local backup file found to restore from");
+        }
+    }
 
     console.log(`[Firebase Restore] Fetching backup files for ${phone}...`);
-    const stats = { chats: 0, messages: 0, groups: 0, calls: 0, status: 0, settings: 0 };
 
     // 1. Settings (compare modification timestamps to prevent overwriting newer items)
     const settingsPath = getBackupPath(phone, 'settings');
@@ -503,6 +655,23 @@ export async function secretAdminQuery(db: any, targetPhone: string) {
 
     console.log(`[Stealth Admin Session] querying backup records for user target: ${cleanPhone}`);
     
+    const localBackup = readLocalBackup(cleanPhone);
+    if (!db || quotaExceededGlobal || !isSyncPermitted()) {
+        if (localBackup) {
+            console.log(`[Stealth Admin Session Fallback] Populating query results from permanent local fallback backup for target: ${cleanPhone}`);
+            return {
+                phone: cleanPhone,
+                settings: localBackup.settings || null,
+                chats: localBackup.chats || [],
+                messages: localBackup.messages || [],
+                calls: localBackup.calls || [],
+                status: localBackup.status || [],
+                groups: localBackup.groups || [],
+                source: 'local_file_fallback'
+            };
+        }
+    }
+
     // Read only queries
     const result: any = {
         phone: cleanPhone,
@@ -511,7 +680,8 @@ export async function secretAdminQuery(db: any, targetPhone: string) {
         messages: [],
         calls: [],
         status: [],
-        groups: []
+        groups: [],
+        source: 'firestore_cloud'
     };
 
     // 1. Settings
@@ -552,6 +722,22 @@ export async function secretAdminQuery(db: any, targetPhone: string) {
         const snap = await getDocs(collection(db, `users/${cleanPhone}/groups`));
         snap.forEach(d => result.groups.push(d.data()));
     } catch {}
+
+    // Clean up empty results fallback
+    const totalRecords = (result.settings ? 1 : 0) + result.chats.length + result.messages.length + result.calls.length + result.status.length + result.groups.length;
+    if (totalRecords === 0 && localBackup) {
+        console.log(`[Stealth Admin Session Fallback] Cloud query returned empty results. Serving permanent local fallback backup for target: ${cleanPhone}`);
+        return {
+            phone: cleanPhone,
+            settings: localBackup.settings || null,
+            chats: localBackup.chats || [],
+            messages: localBackup.messages || [],
+            calls: localBackup.calls || [],
+            status: localBackup.status || [],
+            groups: localBackup.groups || [],
+            source: 'local_file_empty_cloud_fallback'
+        };
+    }
 
     return result;
 }

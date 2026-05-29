@@ -16,8 +16,8 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({
   onLoginSuccess, 
   currentPhoneNumber = "12065550100" 
 }) => {
-  const [email, setEmail] = useState('admin@pro.com');
-  const [password, setPassword] = useState('123456');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [stage, setStage] = useState<'login' | 'link_portal'>('login');
   
   // Device Link states
