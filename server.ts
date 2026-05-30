@@ -55,6 +55,25 @@ const app = express(); // FIXED (Move globally)
 const server = createServer(app); // FIXED (Move globally)
 const wss = new WebSocketServer({ server }); // FIXED (Move globally)
 
+// Replay current connection state to any newly connected WebSocket client
+// This fixes the bug where QR is scanned but the app never transitions to the main screen
+// because the client missed the LOGGED_IN / CONNECTION_STATE events
+wss.on('connection', (ws) => {
+    try {
+        if (connectionState) {
+            ws.send(JSON.stringify({ type: 'CONNECTION_STATE', data: connectionState }));
+        }
+        if (qrCode && connectionState !== 'open') {
+            ws.send(JSON.stringify({ type: 'QR_CODE', data: qrCode }));
+        }
+        if (connectionState === 'open' && sock?.user) {
+            ws.send(JSON.stringify({ type: 'LOGGED_IN', data: sock.user }));
+        }
+    } catch (e) {
+        // Ignore send errors on newly connected clients
+    }
+});
+
 const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
 const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
@@ -189,6 +208,8 @@ let proData = {
 
 let sock: any = null;
 let realChats: any[] = [];
+let qrCode: string | null = null;       // Hoisted to module level for wss connection handler
+let connectionState: any = 'close';     // Hoisted to module level for wss connection handler
 let consecutiveBadSessions = 0;
 let consecutiveStreamErrors = 0;
 let lastInteractionTime = Date.now();
@@ -521,8 +542,8 @@ async function startServer() {
     }
 
     sock = null;
-    let qrCode: string | null = null;
-    let connectionState: any = 'close';
+    qrCode = null;
+    connectionState = 'close';
     realChats = proData.cachedChats || [];
     let initTimeout: NodeJS.Timeout | null = null;
     let isInitializing = false;
