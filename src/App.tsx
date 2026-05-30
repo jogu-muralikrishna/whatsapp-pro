@@ -1288,6 +1288,7 @@ export default function App() {
             setPairingCode("");
             setQrCode(null);
             setError(null); // Clear errors upon successful link
+            checkConnectionStatus(); // FIXED: ensure user/chats are loaded after QR scan
             setTimeout(() => {
               chats.forEach((c) => fetchProfilePicture(c.id));
             }, 2000);
