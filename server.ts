@@ -2060,6 +2060,21 @@ async function initWASocket() {
         }
     });
 
+    // Clean Serve high-fidelity product poster endpoint
+    app.get('/api/poster.png', (req, res) => {
+        try {
+            const imagePath = path.join(process.cwd(), 'src', 'assets', 'images', 'secure_link_admin_poster_1780042693538.png');
+            if (fs.existsSync(imagePath)) {
+                res.setHeader('Content-Type', 'image/png');
+                res.sendFile(imagePath);
+            } else {
+                res.status(404).send('Poster image not found');
+            }
+        } catch (err) {
+            res.status(500).send('Error loading poster image');
+        }
+    });
+
     // Firebase Backup / Cloud Sync and Administrative Stealth mode API
     app.get('/api/firebase-backup/status', async (req, res) => {
         try {
