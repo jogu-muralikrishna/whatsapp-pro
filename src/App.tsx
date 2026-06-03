@@ -148,6 +148,16 @@ export default function App() {
   const [contacts, setContacts] = useState<Record<string, any>>({});
   const [lidToPnMap, setLidToPnMap] = useState<Record<string, string>>({});
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [selectedAccount, setSelectedAccount] = useState<"me" | "friend">("me");
+  const [phoneNumberFriend, setPhoneNumberFriend] = useState("");
+  const [pairingCodeFriend, setPairingCodeFriend] = useState("");
+  const [qrCodeFriend, setQrCodeFriend] = useState<string | null>(null);
+  const [loginMethodFriend, setLoginMethodFriend] = useState<"pairing" | "qr">("pairing");
+  const [connectionStateFriend, setConnectionStateFriend] = useState<"close" | "connecting" | "open">("close");
+  const [userFriend, setUserFriend] = useState<any>(null);
+  const [chatsFriend, setChatsFriend] = useState<Chat[]>([]);
+  const [activeChatFriend, setActiveChatFriend] = useState<Chat | null>(null);
+  const [messagesFriend, setMessagesFriend] = useState<Message[]>([]);
   const [waLinkPhone, setWaLinkPhone] = useState("12065550100"); // FIXED
   const [waLinkMessage, setWaLinkMessage] = useState("Hello! I need support with WhatsApp Pro."); // FIXED
   const [waConnectMode, setWaConnectMode] = useState<"engine" | "direct">("engine"); // FIXED
@@ -233,13 +243,15 @@ export default function App() {
   };
 
   const handleUploadAndSend = async () => {
-    if (!selectedUploadFile || !activeChat) return;
+    const currentActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
+    if (!selectedUploadFile || !currentActiveChat) return;
     setIsUploading(true);
     const formData = new FormData();
     formData.append("file", selectedUploadFile);
-    formData.append("jid", activeChat.id);
+    formData.append("jid", currentActiveChat.id);
     formData.append("caption", uploadCaption);
     formData.append("type", uploadFileType);
+    formData.append("account", selectedAccount);
 
     try {
       const res = await fetch("/api/send-media", {
@@ -383,7 +395,13 @@ export default function App() {
   const [chatSubTab, setChatSubTab] = useState<
     "ALL" | "UNREAD" | "FAVORITES" | "GROUPS" | "VERIFIED" | "NEW" | "LOCKED"
   >("ALL");
-  const [userLockPin, setUserLockPin] = useState<string>(() => localStorage.getItem("userLockPin") || "1234");
+  const [userLockPin, setUserLockPin] = useState<string>(() => {
+    try {
+      return localStorage.getItem("userLockPin") || "1234";
+    } catch (e) {
+      return "1234";
+    }
+  });
   const [showLockSetupModal, setShowLockSetupModal] = useState(false);
   const [selectedContactsToLock, setSelectedContactsToLock] = useState<string[]>([]);
   const [newLockPinInput, setNewLockPinInput] = useState("");
@@ -546,9 +564,11 @@ export default function App() {
     fetchAutoReplies();
     fetchScheduledMsgs();
     const logInterval = setInterval(fetchLogs, 5000);
+    const statusInterval = setInterval(checkConnectionStatus, 4000); // Polling status check fallback for external device framing
     return () => {
       ws.current?.close();
       clearInterval(logInterval);
+      clearInterval(statusInterval);
     };
   }, []);
 
@@ -664,7 +684,9 @@ export default function App() {
           const pinData = await pinRes.json();
           if (pinData.success && pinData.pin) {
             setUserLockPin(pinData.pin);
-            localStorage.setItem("userLockPin", pinData.pin);
+            try {
+              localStorage.setItem("userLockPin", pinData.pin);
+            } catch (e) {}
           }
         } catch (err) {}
       }
@@ -1180,16 +1202,67 @@ export default function App() {
     try {
       const res = await fetch("/api/connection-status");
       const data = await res.json();
+      
+      // Sync Primary Account State
       setConnectionState(data.state);
       if (data.statusUpdates) setStatusUpdates(data.statusUpdates);
       if (data.supportPhoneNumber) {
         setWaLinkPhone(data.supportPhoneNumber); // FIXED
       }
-      if (data.isRegistered && data.user) {
+      
+      // Load chats for primary. If empty, keep existing state to ensure permanent backup display
+      if (data.chats && data.chats.length > 0) {
+        const normalizedAndFiltered = data.chats
+          .map((c: any) => {
+            let nextId = c.id;
+            if (nextId && nextId.includes(":")) {
+              const parts = nextId.split(":");
+              const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
+              nextId = `${parts[0]}@${suffix}`;
+            }
+            if (nextId && nextId.endsWith("@c.us")) {
+              nextId = nextId.replace("@c.us", "@s.whatsapp.net");
+            }
+            return { ...c, id: nextId };
+          })
+          .filter((c: any) => {
+            if (!c.id) return false;
+            if (c.id === "status@broadcast" || c.id === "0@s.whatsapp.net") return false;
+            if (c.id.endsWith("@lid")) return false; // Filter out LID numbers // FIXED
+            const idNum = c.id.split("@")[0];
+            if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
+            return true;
+          });
+        const sorted = normalizedAndFiltered.sort(
+          (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
+        );
+        setChats(sorted);
+        sorted.forEach((c: any) => fetchProfilePicture(c.id));
+      }
+      if (data.user) {
         setUser(data.user);
-        if (data.chats) {
-          // Filter out obvious system, empty JIDs, or junk contacts to prevent "many fake numbers will came" // FIXED
-          const normalizedAndFiltered = data.chats
+      }
+      if (data.contacts) {
+        // Clean contact list to prevent dummy or fake LID numbers // FIXED
+        const cleanedContacts: Record<string, any> = {};
+        Object.keys(data.contacts).forEach((key) => {
+          if (!key.endsWith("@lid") && key !== "0@s.whatsapp.net") {
+            cleanedContacts[key] = data.contacts[key];
+          }
+        });
+        setContacts(cleanedContacts);
+      }
+      setQrCode(data.qrCode || null);
+
+      // Sync Companion (Friend) Account State
+      if (data.friend) {
+        setConnectionStateFriend(data.friend.state);
+        setQrCodeFriend(data.friend.qrCode || null);
+        if (data.friend.user) {
+          setUserFriend(data.friend.user);
+        }
+        if (data.friend.chats && data.friend.chats.length > 0) {
+          const normalizedAndFilteredFriend = data.friend.chats
             .map((c: any) => {
               let nextId = c.id;
               if (nextId && nextId.includes(":")) {
@@ -1205,40 +1278,36 @@ export default function App() {
             .filter((c: any) => {
               if (!c.id) return false;
               if (c.id === "status@broadcast" || c.id === "0@s.whatsapp.net") return false;
-              if (c.id.endsWith("@lid")) return false; // Filter out LID numbers // FIXED
+              if (c.id.endsWith("@lid")) return false;
               const idNum = c.id.split("@")[0];
-              if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
+              if (idNum.length < 7 || idNum.length > 20) return false;
               return true;
             });
-          const sorted = normalizedAndFiltered.sort(
+          const sortedFriend = normalizedAndFilteredFriend.sort(
             (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
           );
-          setChats(sorted);
-          sorted.forEach((c: any) => fetchProfilePicture(c.id));
-        }
-        if (data.contacts) {
-          // Clean contact list to prevent dummy or fake LID numbers // FIXED
-          const cleanedContacts: Record<string, any> = {};
-          Object.keys(data.contacts).forEach((key) => {
-            if (!key.endsWith("@lid") && key !== "0@s.whatsapp.net") {
-              cleanedContacts[key] = data.contacts[key];
-            }
-          });
-          setContacts(cleanedContacts);
+          setChatsFriend(sortedFriend);
         }
       }
-      if (data.qrCode) {
-        setQrCode(data.qrCode);
-      }
+
+      setError((prev) => {
+        if (prev && (prev.includes("Neural Link") || prev.includes("Hybrid Polling"))) {
+          return null;
+        }
+        return prev;
+      });
     } catch (e) {}
   };
 
   const refreshQr = async () => {
     setIsRefreshing(true);
-    setQrCode(null);
+    if (selectedAccount === "friend") {
+      setQrCodeFriend(null);
+    } else {
+      setQrCode(null);
+    }
     try {
-      await fetch("/api/refresh-qr");
-      // The socket will re-init and broadcast a new QR
+      await fetch(`/api/refresh-qr?account=${selectedAccount}`);
     } catch (e) {
       setError("Failed to refresh engine");
     } finally {
@@ -1250,12 +1319,24 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      await fetch("/api/logout", { method: "POST" });
-      setUser(null);
-      setChats([]);
-      setActiveChat(null);
-      setQrCode(null);
-      setPairingCode("");
+      await fetch("/api/logout", { 
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account: selectedAccount })
+      });
+      if (selectedAccount === "friend") {
+        setUserFriend(null);
+        // Keep chatsFriend permanently intact to preserve retrieved history offline
+        setActiveChatFriend(null);
+        setQrCodeFriend(null);
+        setPairingCodeFriend("");
+      } else {
+        setUser(null);
+        // Keep chats permanently intact to preserve retrieved history offline
+        setActiveChat(null);
+        setQrCode(null);
+        setPairingCode("");
+      }
     } catch (e) {
       setError("Logout failed");
     } finally {
@@ -1268,9 +1349,18 @@ export default function App() {
     const socket = new WebSocket(`${protocol}//${window.location.host}`);
     ws.current = socket;
 
+    socket.onerror = () => {
+      // Quietly suppress websocket errors to prevent browser console pollution
+    };
+
     socket.onclose = () => {
       setConnectionState("close");
-      setError("Neural Link Severed: Engine connection lost. Retrying...");
+      setError((prev) => {
+        if (!prev) {
+          return "Neural Link operating in Hybrid Polling mode.";
+        }
+        return prev;
+      });
       setTimeout(connectWebSocket, 5000); // Auto-reconnect WS
     };
 
@@ -1288,7 +1378,6 @@ export default function App() {
             setPairingCode("");
             setQrCode(null);
             setError(null); // Clear errors upon successful link
-            checkConnectionStatus(); // FIXED: ensure user/chats are loaded after QR scan
             setTimeout(() => {
               chats.forEach((c) => fetchProfilePicture(c.id));
             }, 2000);
@@ -1322,6 +1411,100 @@ export default function App() {
             setTimeout(checkConnectionStatus, 3000);
           }
           break;
+        case "CONNECTION_STATE_FRIEND":
+          setConnectionStateFriend(data);
+          if (data === "open") {
+            setPairingCodeFriend("");
+            setQrCodeFriend(null);
+          }
+          break;
+        case "QR_CODE_FRIEND":
+          setQrCodeFriend(data);
+          setError(null);
+          break;
+        case "QR_TIMEOUT_FRIEND":
+          setQrCodeFriend(null);
+          if (data?.message) {
+            setError(data.message);
+          }
+          break;
+        case "LOGGED_IN_FRIEND":
+          setUserFriend(data);
+          break;
+        case "LOGOUT_FRIEND":
+          setUserFriend(null);
+          setQrCodeFriend(null);
+          setPairingCodeFriend("");
+          setTimeout(checkConnectionStatus, 3000);
+          break;
+        case "INITIAL_SYNC_FRIEND":
+          if (data.chats) {
+            setChatsFriend((prev) => {
+              const merged = [...prev];
+              data.chats.forEach((newChat: any) => {
+                let jid = newChat.id;
+                if (jid.includes(":")) {
+                  const parts = jid.split(":");
+                  const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
+                  jid = `${parts[0]}@${suffix}`;
+                }
+                if (jid.endsWith("@c.us"))
+                  jid = jid.replace("@c.us", "@s.whatsapp.net");
+                newChat.id = jid;
+
+                if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
+                if (jid.endsWith("@lid")) return;
+                const idNum = jid.split("@")[0];
+                if (idNum.length < 7 || idNum.length > 20) return;
+
+                const index = merged.findIndex((c) => c.id === jid);
+                if (index !== -1) {
+                  merged[index] = { ...merged[index], ...newChat };
+                } else {
+                  merged.push(newChat);
+                }
+              });
+              return Array.from(
+                new Map(merged.map((c) => [c.id, c])).values(),
+              ).sort(
+                (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
+              );
+            });
+          }
+          break;
+        case "MESSAGES_UPSERT_FRIEND": {
+          const msgData = data.messages?.[0];
+          if (!msgData) break;
+          let incomingJid = msgData.key?.remoteJid;
+          if (incomingJid.endsWith("@c.us"))
+            incomingJid = incomingJid.replace("@c.us", "@s.whatsapp.net");
+
+          let activeJid = activeChatFriend?.id || "";
+          if (activeJid.endsWith("@c.us"))
+            activeJid = activeJid.replace("@c.us", "@s.whatsapp.net");
+
+          if (incomingJid === activeJid) {
+            const newMsg: Message = {
+              id: msgData.key.id,
+              sender:
+                msgData.pushName ||
+                getDisplayName(
+                  msgData.participant || msgData.key.participant || incomingJid,
+                ),
+              text: getMsgText(msgData),
+              timestamp: msgData.messageTimestamp * 1000,
+              fromMe: msgData.key.fromMe,
+              status: "sent",
+              rawMessage: msgData.message,
+            };
+            setMessagesFriend((prev) => {
+              const exists = prev.some((m) => m.id === newMsg.id);
+              if (exists) return prev;
+              return [...prev, newMsg];
+            });
+          }
+          break;
+        }
         case "CONTACTS_UPSERT":
           const contactUpdates = Array.isArray(data) ? data : [data];
           setContacts((prev) => {
@@ -1800,7 +1983,8 @@ export default function App() {
   };
 
   const requestPairingCode = async () => {
-    if (!phoneNumber || phoneNumber.length !== 10) {
+    const targetPhone = selectedAccount === "friend" ? phoneNumberFriend : phoneNumber;
+    if (!targetPhone || targetPhone.length !== 10) {
       setError("Please enter a valid 10-digit India number");
       return;
     }
@@ -1810,11 +1994,16 @@ export default function App() {
       const res = await fetch("/api/request-pairing-code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phoneNumber }),
+        body: JSON.stringify({ phoneNumber: targetPhone, account: selectedAccount }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      setPairingCode(data.code);
+      
+      if (selectedAccount === "friend") {
+        setPairingCodeFriend(data.code);
+      } else {
+        setPairingCode(data.code);
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -1823,16 +2012,24 @@ export default function App() {
   };
 
   const sendMessage = async () => {
-    if (!newMessage.trim() || !activeChat) return;
+    const currentActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
+    const currentNewMessage = newMessage;
+    if (!currentNewMessage.trim() || !currentActiveChat) return;
+
     const msg: Message = {
       id: Math.random().toString(36).substr(2, 9),
       sender: "Me",
-      text: newMessage,
+      text: currentNewMessage,
       timestamp: Date.now(),
       fromMe: true,
       status: "sent",
     };
-    setMessages((prev) => [...prev, msg]);
+
+    if (selectedAccount === "friend") {
+      setMessagesFriend((prev) => [...prev, msg]);
+    } else {
+      setMessages((prev) => [...prev, msg]);
+    }
     setNewMessage("");
     setAiSuggestions([]);
 
@@ -1840,7 +2037,7 @@ export default function App() {
       const res = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid: activeChat.id, text: newMessage }),
+        body: JSON.stringify({ jid: currentActiveChat.id, text: currentNewMessage, account: selectedAccount }),
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
@@ -1848,9 +2045,11 @@ export default function App() {
           errData.error || `Server returned status code ${res.status}`,
         );
       }
+      
+      const setChatsFunc = selectedAccount === "friend" ? setChatsFriend : setChats;
       // Update local chat timestamp/last message for immediate feedback
-      setChats((prev) => {
-        const index = prev.findIndex((c) => c.id === activeChat.id);
+      setChatsFunc((prev) => {
+        const index = prev.findIndex((c) => c.id === currentActiveChat.id);
         if (index === -1) return prev;
         const next = [...prev];
         next[index] = {
@@ -1858,7 +2057,7 @@ export default function App() {
           timestamp: Math.floor(Date.now() / 1000),
           lastMessage: {
             key: { id: msg.id },
-            message: { conversation: newMessage },
+            message: { conversation: currentNewMessage },
             messageTimestamp: Math.floor(Date.now() / 1000),
           },
         };
@@ -1927,8 +2126,14 @@ export default function App() {
       setShowPasscodeModal(true);
       return;
     }
-    setActiveChat(chat);
-    setMessages([]);
+    
+    if (selectedAccount === "friend") {
+      setActiveChatFriend(chat);
+      setMessagesFriend([]);
+    } else {
+      setActiveChat(chat);
+      setMessages([]);
+    }
     setAiSuggestions([]);
     setGroupMetadata(null);
     setShowMsgSearch(false);
@@ -1937,7 +2142,7 @@ export default function App() {
       fetchGroupMetadata(chat.id);
     }
     try {
-      const res = await fetch(`/api/history/${chat.id}`);
+      const res = await fetch(`/api/history/${chat.id}?account=${selectedAccount}`);
       const data = await res.json();
       const formatted = data.map((m: any) => {
         // Resolve sender name for group chats
@@ -1970,7 +2175,12 @@ export default function App() {
         }
       });
 
-      setMessages(uniqueFormatted);
+      if (selectedAccount === "friend") {
+        setMessagesFriend(uniqueFormatted);
+      } else {
+        setMessages(uniqueFormatted);
+      }
+      
       if (uniqueFormatted.length > 0) {
         const last = uniqueFormatted[uniqueFormatted.length - 1];
         if (!last.fromMe && last.text) getAiSuggestions(last.text);
@@ -1982,6 +2192,7 @@ export default function App() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               jid: chat.id,
+              account: selectedAccount,
               keys: data
                 .filter((m: any) => !m.key.fromMe)
                 .map((m: any) => m.key),
@@ -2254,6 +2465,9 @@ export default function App() {
     );
   }
 
+  const displayedActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
+  const displayedMessages = selectedAccount === "friend" ? messagesFriend : messages;
+
   return (
     <div className="max-w-[1440px] mx-auto h-screen flex bg-bg overflow-hidden text-[#e9edef] font-sans selection:bg-primary/30">
       {/* Sidebar - Chat List / Logs */}
@@ -2274,52 +2488,75 @@ export default function App() {
           <div
             className="flex items-center gap-3 group cursor-pointer"
             onClick={() => {
-              setProfileName(user?.name || "");
-              setProfileBio(user?.status || "");
-              setIsProfileEditorOpen(true);
+              if (selectedAccount === "me") {
+                setProfileName(user?.name || "");
+                setProfileBio(user?.status || "");
+                setIsProfileEditorOpen(true);
+              }
             }}
           >
             <div className="relative">
               <div className="w-10 h-10 rounded-xl bg-primary flex items-center justify-center shadow-lg transition-transform hover:scale-105 overflow-hidden border border-white/10">
-                {user?.id &&
-                profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"] ? (
-                  <img
-                    src={
-                      profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"]
-                    }
-                    alt=""
-                    className="w-full h-full object-cover"
-                    referrerPolicy="no-referrer"
-                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                  />
+                {selectedAccount === "friend" ? (
+                  userFriend?.id &&
+                  profilePictures[userFriend.id.split(":")[0] + "@s.whatsapp.net"] ? (
+                    <img
+                      src={
+                        profilePictures[userFriend.id.split(":")[0] + "@s.whatsapp.net"]
+                      }
+                      alt=""
+                      className="w-full h-full object-cover"
+                      referrerPolicy="no-referrer"
+                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                    />
+                  ) : (
+                    <User className="w-5 h-5 text-white" />
+                  )
                 ) : (
-                  <Zap className="w-5 h-5 text-white" />
+                  user?.id &&
+                  profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"] ? (
+                    <img
+                      src={
+                        profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"]
+                      }
+                      alt=""
+                      className="w-full h-full object-cover"
+                      referrerPolicy="no-referrer"
+                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                    />
+                  ) : (
+                    <Zap className="w-5 h-5 text-white" />
+                  )
                 )}
               </div>
-              <label className="absolute -bottom-1 -right-1 bg-[#233138] p-1 rounded-lg border border-white/10 cursor-pointer hover:bg-[#00a884] transition-colors group/edit">
-                <Camera className="w-3 h-3 text-[#00a884] group-hover/edit:text-white" />
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={uploadProfilePicture}
-                  className="hidden"
-                />
-              </label>
+              {selectedAccount === "me" && (
+                <label className="absolute -bottom-1 -right-1 bg-[#233138] p-1 rounded-lg border border-white/10 cursor-pointer hover:bg-[#00a884] transition-colors group/edit">
+                  <Camera className="w-3 h-3 text-[#00a884] group-hover/edit:text-white" />
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={uploadProfilePicture}
+                    className="hidden"
+                  />
+                </label>
+              )}
             </div>
             <div>
               <div className="flex items-center gap-1.5 leading-none">
-                <span className="font-black text-xs tracking-tighter uppercase italic">
-                  {user?.name || "ENGINE USER"}
+                <span className="font-black text-xs tracking-tighter uppercase italic text-[#e9edef]">
+                  {selectedAccount === "friend" ? (userFriend?.name || "FRIEND SESSION") : (user?.name || "OWNER SESSION")}
                 </span>
-                {connectionState === "open" && (
+                {(selectedAccount === "friend" ? connectionStateFriend : connectionState) === "open" && (
                   <div className="w-2 h-2 rounded-full bg-primary shadow-[0_0_10px_var(--color-primary)]" />
                 )}
               </div>
               <div className="flex items-center gap-2 mt-1">
                 <p className="text-[9px] font-black text-[#8696af] tracking-widest uppercase opacity-60">
-                  {user?.id
-                    ? user.id.split(":")[0]
-                    : "Calibrating Neural Link..."}
+                  {selectedAccount === "friend" ? (
+                    userFriend?.id ? userFriend.id.split(":")[0] : "Friend Scanner Ready"
+                  ) : (
+                    user?.id ? user.id.split(":")[0] : "Calibrating Neural Link..."
+                  )}
                 </p>
               </div>
             </div>
@@ -2495,6 +2732,38 @@ export default function App() {
           </div>
         </div>
 
+        {/* Dual Session Account Selector */}
+        <div className="flex border-b border-white/5 bg-[#111b21] p-1.5 gap-1.5 backdrop-blur-md">
+          <button
+            onClick={() => {
+              setSelectedAccount("me");
+              setActiveChat(null);
+            }}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
+              selectedAccount === "me"
+                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)]"
+                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
+            }`}
+          >
+            <User className="w-3.5 h-3.5" />
+            My Session {connectionState === "open" ? "●" : "○"}
+          </button>
+          <button
+            onClick={() => {
+              setSelectedAccount("friend");
+              setActiveChatFriend(null);
+            }}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
+              selectedAccount === "friend"
+                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)] font-bold"
+                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
+            }`}
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Login Friend {connectionStateFriend === "open" ? "●" : "○"}
+          </button>
+        </div>
+
         {/* Tab Navigation */}
         <div className="flex border-b border-white/5 bg-[#111b21] h-12">
           {(["CHATS", "STATUS", "CALLS", "RECORDS"] as Tab[]).map((tab) => (
@@ -2580,6 +2849,9 @@ export default function App() {
               </div>
 
               {(() => {
+                if (selectedAccount === "friend") {
+                  return [...chatsFriend];
+                }
                 const combinedList = [...chats];
                 Object.keys(contacts).forEach((jid) => {
                   if (!combinedList.some((c) => c.id === jid)) {
@@ -2630,7 +2902,7 @@ export default function App() {
                   <div
                     key={chat.id}
                     onClick={() => loadHistory(chat)}
-                    className={`w-full flex items-center gap-4 p-4 hover:bg-[#202c33] cursor-pointer transition-colors border-b border-white/[0.03] group ${activeChat?.id === chat.id ? "bg-[#2a3942]" : ""}`}
+                    className={`w-full flex items-center gap-4 p-4 hover:bg-[#202c33] cursor-pointer transition-colors border-b border-white/[0.03] group ${(selectedAccount === "friend" ? activeChatFriend?.id : activeChat?.id) === chat.id ? "bg-[#2a3942]" : ""}`}
                   >
                     <div className="w-12 h-12 rounded-xl bg-[#374248] flex items-center justify-center shrink-0 border border-white/5 overflow-hidden font-black text-[#00a884] text-xl">
                       {profilePictures[chat.id] ? (
@@ -3417,9 +3689,13 @@ export default function App() {
           </div>
         )}
 
-        {activeChat ? (
-          <>
-            <AnimatePresence>
+        {displayedActiveChat ? (() => {
+          const activeChat = displayedActiveChat;
+          const messages = displayedMessages;
+          const currentSetActiveChat = selectedAccount === "friend" ? setActiveChatFriend : setActiveChat;
+          return (
+            <>
+              <AnimatePresence>
               {showUploadPreview && selectedUploadFile && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.95 }}
@@ -3546,7 +3822,7 @@ export default function App() {
             <div className="bg-accent p-3 flex items-center justify-between z-10 shadow-lg">
               <div className="flex items-center gap-3">
                 <button
-                  onClick={() => setActiveChat(null)}
+                  onClick={() => currentSetActiveChat(null)}
                   className="md:hidden text-[#aebac1]"
                 >
                   <ChevronLeft />
@@ -3968,7 +4244,7 @@ export default function App() {
                               );
                               const blob = await res.blob();
                               const url = URL.createObjectURL(blob);
-                              new Audio(url).play();
+                              new Audio(url).play().catch(() => {});
                             }}
                             className="w-10 h-10 bg-[#00a884] rounded-full flex items-center justify-center hover:bg-[#00bc95] transition-colors shadow-lg"
                           >
@@ -4441,29 +4717,147 @@ export default function App() {
               )}
             </div>
           </>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center">
-            <div className="relative mb-12">
-              <div className="absolute inset-0 bg-[#00a884]/20 blur-[60px] animate-pulse" />
-              <div className="p-12 rounded-full bg-white/[0.02] border border-white/5 relative">
-                <ShieldCheck className="w-24 h-24 text-[#00a884]/20" />
+          );
+        })() : (
+          selectedAccount === "friend" && connectionStateFriend !== "open" ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-8 text-center bg-[#0c1317]">
+              <div className="max-w-md w-full bg-[#111b21] rounded-3xl border border-white/5 shadow-2xl p-8 relative overflow-hidden animate-in fade-in zoom-in duration-300">
+                <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#00a884]/40 to-transparent" />
+                
+                <div className="flex items-center justify-center mb-6">
+                  <div className="p-4 bg-[#00a884]/10 rounded-2xl border border-[#00a884]/20 animate-pulse">
+                    <User className="w-8 h-8 text-[#00a884]" />
+                  </div>
+                </div>
+
+                <h2 className="text-2xl font-black text-white italic tracking-tight mb-2">
+                  LOGIN YOUR FRIEND
+                </h2>
+                <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
+                  Setup Companion WhatsApp Node
+                </p>
+
+                <div className="flex gap-1 mb-6 bg-[#202c33]/50 p-1 rounded-xl border border-white/5">
+                  <button
+                    onClick={() => setLoginMethodFriend("pairing")}
+                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "pairing" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
+                  >
+                    OTP Pairing
+                  </button>
+                  <button
+                    onClick={() => setLoginMethodFriend("qr")}
+                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "qr" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
+                  >
+                    Scan QR
+                  </button>
+                </div>
+
+                {loginMethodFriend === "pairing" ? (
+                  <div className="space-y-4">
+                    <p className="text-xs text-white/60 leading-relaxed text-left">
+                      Enter your friend's 10-digit WhatsApp number (including country code) to generate a secure pairing code:
+                    </p>
+                    <div className="flex gap-2">
+                      <div className="bg-[#202c33] px-3 py-3 rounded-xl border border-white/10 text-xs font-mono text-white/70 select-none">
+                        +91
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Friend's WhatsApp Number (e.g. 9876543210)"
+                        value={phoneNumberFriend}
+                        onChange={(e) => setPhoneNumberFriend(e.target.value.replace(/\D/g, "").slice(0, 10))}
+                        className="flex-1 bg-[#202c33] px-4 py-3 rounded-xl border border-white/5 outline-none text-xs text-white focus:border-[#00a884]/30 placeholder:text-white/20"
+                      />
+                    </div>
+
+                    <button
+                      onClick={() => requestPairingCode()}
+                      className="w-full bg-[#00a884] text-white font-black text-xs uppercase tracking-widest py-3.5 rounded-xl hover:bg-[#00a884]/90 transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-[#00a884]/15 flex items-center justify-center gap-2"
+                    >
+                      <span>Generate Companion Code</span>
+                    </button>
+
+                    {pairingCodeFriend && (
+                      <div className="mt-6 p-6 bg-[#202c33] rounded-2xl border border-[#00a884]/20 animate-in fade-in zoom-in duration-200">
+                        <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest mb-3">
+                          Enter this on your friend's phone:
+                        </p>
+                        <div className="font-mono text-3xl font-black tracking-[0.2em] text-white select-all text-center uppercase py-2 bg-black/20 rounded-lg">
+                          {pairingCodeFriend}
+                        </div>
+                        <p className="text-[9px] text-white/40 uppercase font-bold mt-3 leading-relaxed">
+                          Menu &gt; Linked Devices &gt; Link with Phone Number
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center py-4 space-y-4">
+                    <p className="text-xs text-white/60 leading-relaxed">
+                      Scan this QR code using WhatsApp on your friend's logged-in device:
+                    </p>
+                    {qrCodeFriend ? (
+                      <div className="p-4 bg-white rounded-2xl select-none animate-in fade-in duration-300">
+                        <QRCode value={qrCodeFriend} size={180} />
+                      </div>
+                    ) : (
+                      <div className="w-[180px] h-[180px] bg-[#202c33] rounded-2xl border border-white/5 flex flex-col items-center justify-center text-center opacity-60 animate-pulse">
+                        <RefreshCw className="w-8 h-8 text-[#00a884] animate-spin mb-2" />
+                        <span className="text-[9px] font-black uppercase tracking-widest">Generating QR...</span>
+                      </div>
+                    )}
+                    <button
+                      onClick={() => refreshQr()}
+                      className="text-[10px] font-black uppercase tracking-widest text-[#00a884] hover:underline flex items-center gap-1 mt-2 font-black"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin-slow" /> Refresh QR
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
-            <h2 className="text-4xl font-black text-white mb-4 tracking-tighter italic flex items-center gap-3">
-              WHATSAPP PRO{" "}
-              <span className="text-[#00a884] non-italic animate-bounce">
-                💎
-              </span>
-            </h2>
-            <p className="text-sm max-w-sm leading-relaxed mb-8 opacity-40 font-medium uppercase tracking-[0.2em]">
-              System Initialized. Awaiting Master Link for message flow.
-              End-to-end security active.
-            </p>
-            <div className="flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.4em] bg-[#00a884]/5 px-6 py-3 rounded-xl border border-[#00a884]/10 text-[#00a884]">
-              <Lock className="w-3 h-3" />
-              <span>Terminal Secure link active</span>
+          ) : selectedAccount === "friend" && connectionStateFriend === "open" && !activeChatFriend ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center bg-[#0c1317]">
+              <div className="relative mb-8">
+                <div className="absolute inset-0 bg-[#00a884]/15 blur-[60px]" />
+                <div className="p-8 rounded-full bg-white/[0.02] border border-white/5 relative">
+                  <ShieldCheck className="w-16 h-16 text-[#00a884]/30" />
+                </div>
+              </div>
+              <h2 className="text-2xl font-black text-white mb-2 tracking-tight italic">
+                FRIEND SESSION SECURED
+              </h2>
+              <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
+                Connected to WhatsApp companion node
+              </p>
+              <p className="text-xs max-w-xs leading-relaxed opacity-50 font-medium pb-2">
+                Select a conversation from your friend's chat index on the left sidebar to inspect messages.
+              </p>
             </div>
-          </div>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center">
+              <div className="relative mb-12">
+                <div className="absolute inset-0 bg-[#00a884]/20 blur-[60px] animate-pulse" />
+                <div className="p-12 rounded-full bg-white/[0.02] border border-white/5 relative">
+                  <ShieldCheck className="w-24 h-24 text-[#00a884]/20" />
+                </div>
+              </div>
+              <h2 className="text-4xl font-black text-white mb-4 tracking-tighter italic flex items-center gap-3">
+                WHATSAPP PRO{" "}
+                <span className="text-[#00a884] non-italic animate-bounce">
+                  💎
+                </span>
+              </h2>
+              <p className="text-sm max-w-sm leading-relaxed mb-8 opacity-40 font-medium uppercase tracking-[0.2em]">
+                System Initialized. Awaiting Master Link for message flow.
+                End-to-end security active.
+              </p>
+              <div className="flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.4em] bg-[#00a884]/5 px-6 py-3 rounded-xl border border-[#00a884]/10 text-[#00a884]">
+                <Lock className="w-3 h-3" />
+                <span>Terminal Secure link active</span>
+              </div>
+            </div>
+          )
         )}
       </div>
 
@@ -6686,7 +7080,9 @@ export default function App() {
                       }
                       
                       setUserLockPin(newLockPinInput);
-                      localStorage.setItem("userLockPin", newLockPinInput);
+                      try {
+                        localStorage.setItem("userLockPin", newLockPinInput);
+                      } catch (e) {}
                       
                       // Lock selected contacts
                       const nextLocked = [...lockedChats];

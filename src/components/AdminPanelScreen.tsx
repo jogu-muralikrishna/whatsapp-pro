@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import QRCode from 'react-qr-code';
 import { doc, getDoc, getDocs, collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../lib/firebaseClient';
 import { AdminAuditService } from '../services/AdminAuditService';
@@ -43,6 +44,12 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     const [selectedLiveJid, setSelectedLiveJid] = useState('');
     const [selectedLiveChatHistory, setSelectedLiveChatHistory] = useState<any[]>([]);
     const [liveMessagesLoading, setLiveMessagesLoading] = useState(false);
+
+    // Link Another Device states
+    const [pairingPhone, setPairingPhone] = useState('');
+    const [requestedPairingCode, setRequestedPairingCode] = useState('');
+    const [pairingLoading, setPairingLoading] = useState(false);
+    const [pairingError, setPairingError] = useState('');
 
     // Recycle Bin states
     const [recycleBinMessages, setRecycleBinMessages] = useState<any[]>([]);
@@ -125,15 +132,84 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
     const loadLiveChatHistory = async (jid: string) => {
         setLiveMessagesLoading(true);
         setSelectedLiveJid(jid);
-        try {
-            const res = await fetch(`/api/history/${jid}`);
-            const data = await res.json();
-            setSelectedLiveChatHistory(Array.isArray(data) ? data : []);
-            await AdminAuditService.logAction(adminEmail, jid, `viewed_live_chat_history`);
-        } catch (err) {
-            console.error("Failed to fetch live chat history logs:", err);
-        } finally {
+        if (queriedData) {
+            // BACKUP MODE: filter from queriedData.messages preloaded list
+            const jidRaw = jid.split('@')[0];
+            const filtered = (queriedData.messages || []).filter((m: any) => {
+                const mJid = m.chatJid || m.key?.remoteJid || '';
+                return mJid === jid || mJid.split('@')[0] === jidRaw;
+            });
+            // Sort ascending by timestamp so older is at top, newer at bottom
+            const sorted = [...filtered].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
+            setSelectedLiveChatHistory(sorted);
             setLiveMessagesLoading(false);
+            await AdminAuditService.logAction(adminEmail, jid, `viewed_backup_chat_history`);
+        } else {
+            // LIVE MODE
+            try {
+                const res = await fetch(`/api/history/${jid}`);
+                const data = await res.json();
+                setSelectedLiveChatHistory(Array.isArray(data) ? data : []);
+                await AdminAuditService.logAction(adminEmail, jid, `viewed_live_chat_history`);
+            } catch (err) {
+                console.error("Failed to fetch live chat history logs:", err);
+            } finally {
+                setLiveMessagesLoading(false);
+            }
+        }
+    };
+
+    const handleRequestPairingCode = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!pairingPhone) return;
+        setPairingLoading(true);
+        setPairingError('');
+        setRequestedPairingCode('');
+        try {
+            const res = await fetch('/api/request-pairing-code', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${adminToken}`
+                },
+                body: JSON.stringify({ phoneNumber: pairingPhone })
+            });
+            const data = await res.json();
+            if (res.ok && data.code) {
+                setRequestedPairingCode(data.code);
+                await AdminAuditService.logAction(adminEmail, pairingPhone, 'request_admin_pairing_code');
+            } else {
+                setPairingError(data.error || 'Failed to request pairing code');
+            }
+        } catch (err: any) {
+            setPairingError(err.message || 'Error occurred requesting code');
+        } finally {
+            setPairingLoading(false);
+        }
+    };
+
+    const handleAdminHardLogout = async () => {
+        if (!window.confirm("Are you sure you want to disconnect the active WhatsApp device? This will wipe the active session to let you link another device.")) {
+            return;
+        }
+        setConnectionLoading(true);
+        try {
+            const res = await fetch('/api/logout', { method: 'POST' });
+            if (res.ok) {
+                setSelectedLiveJid('');
+                setSelectedLiveChatHistory([]);
+                setConnectionData(null);
+                setRequestedPairingCode('');
+                setPairingPhone('');
+                setTimeout(async () => {
+                    await fetchConnectionData();
+                }, 3000);
+                await AdminAuditService.logAction(adminEmail, 'SYSTEM', 'admin_forced_hard_logout');
+            }
+        } catch (err) {
+            console.error("Forced logout error:", err);
+        } finally {
+            setConnectionLoading(false);
         }
     };
 
@@ -505,15 +581,8 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         }
     };
 
-    const handleSearch = async (e: React.FormEvent) => {
-        const setError = setErrorMsg;
-        if (!db) {
-            setError("Firebase not configured. Check firebase-applet-config.json.");
-            return;
-        }
-        e.preventDefault();
-
-        let cleanPhone = searchPhone.replace(/[\s\-\(\)\[\]\+]/g, '');
+    const selectAndLoadPhoneData = async (phoneToLoad: string) => {
+        let cleanPhone = phoneToLoad.replace(/[\s\-\(\)\[\]\+]/g, '');
         cleanPhone = cleanPhone.replace(/[^0-9]/g, '');
 
         if (cleanPhone.startsWith('0')) {
@@ -525,16 +594,73 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
         }
 
         if (!cleanPhone) {
-            setError('Invalid look-up number layout provided.');
+            setErrorMsg('Invalid look-up number layout provided.');
             return;
         }
 
         setIsLoading(true);
-        setError('');
+        setErrorMsg('');
         setQueriedData(null);
 
         try {
             await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_attempt');
+
+            // 1) Try server-side consolidated REST API (reads FireStore AND the permanent local fallback back up)
+            try {
+                const res = await fetch('/api/firebase-backup/admin-query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${adminToken}`
+                    },
+                    body: JSON.stringify({ phone: cleanPhone })
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && typeof data === 'object') {
+                        const sanitizedData = {
+                            phone: cleanPhone,
+                            settings: data.settings || null,
+                            chats: data.chats || [],
+                            messages: data.messages || [],
+                            calls: data.calls || [],
+                            status: data.status || [],
+                            groups: data.groups || [],
+                            ...data
+                        };
+
+                        const totalRecords = (sanitizedData.settings ? 1 : 0) + 
+                                             (sanitizedData.chats?.length || 0) + 
+                                             (sanitizedData.messages?.length || 0) + 
+                                             (sanitizedData.calls?.length || 0) + 
+                                             (sanitizedData.status?.length || 0) + 
+                                             (sanitizedData.groups?.length || 0);
+
+                        if (totalRecords === 0) {
+                            setErrorMsg("No backup data found for this number. Ensure the target device has performed at least one cloud backup.");
+                            await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_resolved_empty');
+                            setIsLoading(false);
+                            return;
+                        }
+
+                        setQueriedData(sanitizedData);
+                        await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_success_via_endpoint');
+                        setIsLoading(false);
+                        setActiveTab('connection'); // Switch to connection tab to show chats immediately
+                        return;
+                    }
+                }
+            } catch (endpointErr: any) {
+                console.warn('[Admin API] Server compiled query fell back to direct SDK reading:', endpointErr.message);
+            }
+
+            // 2) Client-side Fallback using Direct firestore SDK query
+            if (!db) {
+                setErrorMsg("Firebase not configured. Check configuration or consult admin loggers.");
+                setIsLoading(false);
+                return;
+            }
 
             const result: any = {
                 phone: cleanPhone,
@@ -615,12 +741,12 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
 
             const totalRecords = (result.settings ? 1 : 0) + result.chats.length + result.messages.length + result.calls.length + result.status.length + result.groups.length;
             if (totalRecords === 0) {
-                setError("No backup data found for this number. Ensure the target device has performed at least one cloud backup.");
+                setErrorMsg("No backup data found for this number. Ensure the target device has performed at least one cloud backup.");
                 await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_resolved_empty');
                 return;
             }
 
-            // User Transparency alert write
+            // User Transparency notification
             try {
                 await addDoc(collection(db, `users/${cleanPhone}/admin_access_notifications`), {
                     timestamp: serverTimestamp(),
@@ -634,14 +760,25 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
 
             await AdminAuditService.logAction(adminEmail, cleanPhone, 'query_success');
             setQueriedData(result);
-            setActiveTab('settings'); // Auto switch to settings on target load
+            setActiveTab('connection'); // Switch to connection tab on target load to show backup chats immediately
         } catch (error: any) {
             console.error('Tactical Lookup Error:', error);
-            setError(`Lookup failed. Access is blockaded. Verify your Auth role or Firebase Security Rules.`);
+            setErrorMsg(`Lookup failed. Access is blockaded. Verify your Auth role or Firebase Security Rules.`);
             await AdminAuditService.logAction(adminEmail, cleanPhone, `query_error: ${error.message || 'permission_denied'}`);
         } finally {
             setIsLoading(false);
         }
+    };
+
+    const handleSearch = async (e: React.FormEvent) => {
+        e.preventDefault();
+        await selectAndLoadPhoneData(searchPhone);
+    };
+
+    const handleLoadNumber = async (phone: string) => {
+        setSearchPhone(phone);
+        setUplinkMode('backup');
+        await selectAndLoadPhoneData(phone);
     };
 
     const handleCopyJson = () => {
@@ -886,11 +1023,10 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                             <button
                                 id="admin-tab-btn-connection"
                                 onClick={() => {
-                                    setQueriedData(null);
                                     setActiveTab('connection');
                                 }}
                                 className={`w-full px-4 py-3 rounded-xl flex items-center justify-between text-left text-xs font-bold transition-all border ${
-                                    activeTab === 'connection' && !queriedData
+                                    activeTab === 'connection'
                                         ? 'bg-[#00a884]/15 border-[#00a884]/25 text-[#00a884] shadow-sm font-black' 
                                         : 'bg-white/5 border-transparent text-white/70 hover:bg-white/10 hover:text-white'
                                 }`}
@@ -1080,9 +1216,9 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                                             <div className="grid grid-cols-2 md:grid-cols-3 gap-3.5">
                                                                 {registeredPhones.map((phone, idx) => (
                                                                     <div key={idx} className="p-3 bg-black/45 border border-white/[0.04] rounded-xl flex justify-between items-center font-mono text-xs">
-                                                                        <span className="text-white hover:text-[#00a884] cursor-pointer" onClick={() => { setSearchPhone(phone); setUplinkMode('backup'); }}>+{phone}</span>
+                                                                        <span className="text-white hover:text-[#00a884] cursor-pointer" onClick={() => { handleLoadNumber(phone); }}>+{phone}</span>
                                                                         <button 
-                                                                            onClick={() => { setSearchPhone(phone); setUplinkMode('backup'); }}
+                                                                            onClick={() => { handleLoadNumber(phone); }}
                                                                             className="text-[9px] px-2 py-0.5 bg-[#00a884]/10 text-[#00a884] rounded font-sans uppercase font-black"
                                                                         >
                                                                             Backup
@@ -1166,208 +1302,305 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                             )}
 
                                             {/* GLOBAL TAB 2: WHATSAPP CONNECTION MONITOR */}
-                                            {activeTab === 'connection' && !queriedData && (
-                                                <div id="tab-connection-monitor" className="space-y-6">
-                                                    
-                                                    {/* Connection State Cards Grid */}
-                                                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
-                                                            <span className="text-[8px] font-black uppercase text-[#00a884] tracking-widest">Network Signal State</span>
-                                                            <div className="flex items-center gap-2">
-                                                                <span className={`w-2.5 h-2.5 rounded-full ${
-                                                                    connectionData?.state === 'open' ? 'bg-green-500 animate-ping' : 'bg-red-500 animate-pulse'
-                                                                }`} />
-                                                                <span className="text-sm font-black font-mono text-white tracking-wide uppercase">
-                                                                    {connectionData?.state || "offline / standby"}
-                                                                </span>
-                                                            </div>
-                                                        </div>
-                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
-                                                            <span className="text-[8px] font-black uppercase text-amber-500 tracking-widest">Client Registrations</span>
-                                                            <p className="text-sm font-black text-white font-mono">
-                                                                {connectionData?.isRegistered ? "APPROVED ENGINE" : "PENDING SCAN"}
-                                                            </p>
-                                                        </div>
-                                                        <div className="p-4 bg-[#111b21] border border-[#202c33] rounded-2xl space-y-1.5 text-left">
-                                                            <span className="text-[8px] font-black uppercase text-blue-400 tracking-widest">Gateway Latency</span>
-                                                            <p className="text-sm font-black text-white font-mono">{connectionData?.latency || "14ms"}</p>
-                                                        </div>
-                                                        <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
-                                                            <span className="text-[8px] font-black uppercase text-indigo-400 tracking-widest">System Engine Uptime</span>
-                                                            <p className="text-sm font-black text-white font-mono">
-                                                                {connectionData?.uptimes ? `${Math.floor(connectionData.uptimes / 60)}m ${Math.floor(connectionData.uptimes % 60)}s` : "0s"}
-                                                            </p>
-                                                        </div>
-                                                    </div>
+                                            {activeTab === 'connection' && (() => {
+                                                const isBackupMode = !!queriedData;
+                                                const targetState = isBackupMode ? 'open' : connectionData?.state;
+                                                const targetIsRegistered = isBackupMode ? true : connectionData?.isRegistered;
+                                                const targetLatency = isBackupMode ? 'DECRYPTED BACKUP' : (connectionData?.latency || "14ms");
+                                                const targetUptime = isBackupMode ? 'OFFLINE SNAPSHOT' : (connectionData?.uptimes ? `${Math.floor(connectionData.uptimes / 60)}m ${Math.floor(connectionData.uptimes % 60)}s` : "0s");
+                                                const targetUserName = isBackupMode ? `Backup Node +${queriedData?.phone}` : (connectionData?.user?.name || "WhatsApp Pro Terminal Account");
+                                                const targetUserId = isBackupMode ? `+${queriedData?.phone}` : (connectionData?.user?.id || "N/A");
+                                                const targetChats = isBackupMode ? (queriedData?.chats || []) : (connectionData?.chats || []);
 
-                                                    {/* QR scanner or pairing details */}
-                                                    {connectionData?.state !== 'open' && (
-                                                        <div className="p-6 bg-gradient-to-br from-[#111b21] to-black border border-[#00a884]/20 rounded-3xl flex flex-col items-center justify-center text-center p-8 space-y-4">
-                                                            <div className="p-3 bg-[#00a884]/10 text-[#00a884] rounded-2xl">
-                                                                <RefreshCw className="w-8 h-8 animate-spin" />
-                                                            </div>
-                                                            <h4 className="text-sm font-black text-white uppercase tracking-wider">Device Auth QR Code Pairing State</h4>
-                                                            <p className="text-xs text-white/50 max-w-sm mt-0.5 leading-relaxed">
-                                                                The terminal is awaiting authentication. Have the linking device scan this generated QR credential from WhatsApp settings.
-                                                            </p>
-                                                            {connectionData?.qrCode ? (
-                                                                <div className="p-4 bg-white rounded-3xl inline-block shadow-lg">
-                                                                    <img 
-                                                                        src={connectionData.qrCode} 
-                                                                        alt="Pairing QR Code" 
-                                                                        className="w-44 h-44 cursor-pointer"
-                                                                        referrerPolicy="no-referrer"
-                                                                    />
-                                                                </div>
-                                                            ) : (
-                                                                <div className="p-6 px-12 bg-[#202c33]/40 border border-white/5 rounded-2xl text-xs font-mono text-amber-500 italic">
-                                                                    Generating fresh QR challenge payload...
-                                                                </div>
-                                                            )}
-                                                            <button 
-                                                                onClick={fetchConnectionData}
-                                                                className="px-4 py-2 bg-[#00a884]/15 hover:bg-[#00a884]/25 border border-[#00a884]/30 text-[#00a884] rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5"
-                                                            >
-                                                                <RefreshCw className="w-3.5 h-3.5" /> Re-Fetch QR Status
-                                                            </button>
-                                                        </div>
-                                                    )}
-
-                                                    {/* Connected scanner profile info */}
-                                                    {connectionData?.state === 'open' && (
-                                                        <div className="p-6 bg-emerald-950/15 border border-emerald-500/20 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-6 text-left animate-fadeIn">
-                                                            <div className="space-y-2">
-                                                                <span className="text-[8px] font-black uppercase bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded tracking-widest font-mono">
-                                                                    🟢 ACTIVE CENTRAL DEVICE PAIRING
-                                                                </span>
-                                                                <h4 className="text-sm font-black text-white">Scanned Device: {connectionData.user?.name || "WhatsApp Pro Terminal Account"}</h4>
-                                                                <div className="font-mono text-xs text-white/60 space-y-1 leading-relaxed">
-                                                                    <div><span className="text-white/40 font-bold">Node JID:</span> {connectionData.user?.id || "N/A"}</div>
-                                                                    <div><span className="text-white/40 font-bold">Total Linked Threads:</span> {connectionData.chats?.length || 0} chats</div>
-                                                                </div>
-                                                            </div>
-                                                            <div className="p-4 bg-emerald-950/20 border border-emerald-500/20 rounded-2xl text-center space-y-1.5 min-w-[150px]">
-                                                                <span className="text-[44px] block leading-none font-black font-mono text-[#00a884]">{connectionData.chats?.length || 0}</span>
-                                                                <span className="text-[8px] font-black text-white/55 uppercase tracking-widest block">Active Conversations</span>
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    {/* Central Chat History Access and Recycle Bin tabs split */}
-                                                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                                                return (
+                                                    <div id="tab-connection-monitor" className="space-y-6 animate-fadeIn">
                                                         
-                                                        {/* Chats Thread listing column */}
-                                                        <div className="lg:col-span-4 p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar">
-                                                            <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-2">
-                                                                <MessageSquare className="w-3.5 h-3.5 text-[#00a884]" />
-                                                                Active Server Threads ({connectionData?.chats?.length || 0})
-                                                            </h5>
-                                                            {connectionData?.chats?.length > 0 ? (
-                                                                <div className="space-y-1.5">
-                                                                    {connectionData.chats.map((c: any, index: number) => (
-                                                                        <button
-                                                                            key={index}
-                                                                            onClick={() => loadLiveChatHistory(c.id)}
-                                                                            className={`w-full p-2.5 rounded-xl text-left flex flex-col font-mono text-[10px] border transition-all ${
-                                                                                selectedLiveJid === c.id 
-                                                                                    ? 'bg-[#00a884]/15 border-[#00a884]/30 text-white font-bold' 
-                                                                                    : 'bg-black/20 border-transparent hover:bg-black/35 text-white/50 hover:text-white'
-                                                                            }`}
-                                                                        >
-                                                                            <span className="truncate block font-semibold text-white/95">{c.name || c.id}</span>
-                                                                            <span className="text-[8px] text-white/35 truncate block mt-0.5">{c.id}</span>
-                                                                        </button>
-                                                                    ))}
+                                                        {isBackupMode && (
+                                                            <div className="p-4 bg-[#00a884]/10 border border-[#00a884]/30 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-4 text-left">
+                                                                <div className="space-y-1">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <Database className="w-4 h-4 text-[#00a884]" />
+                                                                        <span className="text-xs font-black text-white uppercase tracking-wider">Viewing Snapshot Backup Access: +{queriedData?.phone}</span>
+                                                                    </div>
+                                                                    <p className="text-[10px] text-white/60 leading-relaxed">
+                                                                        You are viewing historic WhatsApp chat snapshots synchronized securely from cloud-hosted backup logs.
+                                                                    </p>
                                                                 </div>
-                                                            ) : (
-                                                                <p className="text-[10px] text-white/30 italic">No threads loaded inside engine state.</p>
-                                                            )}
+                                                                <button
+                                                                    onClick={() => {
+                                                                        setQueriedData(null);
+                                                                        setSelectedLiveJid('');
+                                                                        setSelectedLiveChatHistory([]);
+                                                                    }}
+                                                                    className="px-3 py-1.5 bg-[#00a884]/20 hover:bg-[#00a884]/30 border border-[#00a884]/40 text-[#00a884] rounded-xl text-[9px] font-black uppercase tracking-widest cursor-pointer transition-all shrink-0"
+                                                                >
+                                                                    Switch to Live Monitor
+                                                                </button>
+                                                            </div>
+                                                        )}
+
+                                                        {/* Connection State Cards Grid */}
+                                                        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                                                            <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                                <span className="text-[8px] font-black uppercase text-[#00a884] tracking-widest">Network Signal State</span>
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className={`w-2.5 h-2.5 rounded-full ${
+                                                                        targetState === 'open' ? 'bg-green-500 animate-ping' : 'bg-red-500 animate-pulse'
+                                                                    }`} />
+                                                                    <span className="text-sm font-black font-mono text-white tracking-wide uppercase">
+                                                                        {isBackupMode ? "BACKUP ENCRYPTED" : (connectionData?.state || "offline / standby")}
+                                                                    </span>
+                                                                </div>
+                                                            </div>
+                                                            <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                                <span className="text-[8px] font-black uppercase text-amber-500 tracking-widest">Client Registrations</span>
+                                                                <p className="text-sm font-black text-white font-mono">
+                                                                    {targetIsRegistered ? "APPROVED ENGINE" : "PENDING SCAN"}
+                                                                </p>
+                                                            </div>
+                                                            <div className="p-4 bg-[#111b21] border border-[#202c33] rounded-2xl space-y-1.5 text-left">
+                                                                <span className="text-[8px] font-black uppercase text-blue-400 tracking-widest">Gateway Latency</span>
+                                                                <p className="text-sm font-black text-white font-mono">{targetLatency}</p>
+                                                            </div>
+                                                            <div className="p-4 bg-[#111b21] border border-white/5 rounded-2xl space-y-1.5 text-left">
+                                                                <span className="text-[8px] font-black uppercase text-indigo-400 tracking-widest">System Engine Uptime</span>
+                                                                <p className="text-sm font-black text-white font-mono">
+                                                                    {targetUptime}
+                                                                </p>
+                                                            </div>
                                                         </div>
 
-                                                        {/* Messages Detail view space */}
-                                                        <div className="lg:col-span-8 p-5 bg-[#111b21] rounded-2xl border border-white/5 min-h-[350px] max-h-[500px] flex flex-col overflow-hidden">
-                                                            <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-3 shrink-0">
-                                                                <Eye className="w-3.5 h-3.5 text-[#00a884]" />
-                                                                Audited Signal Packet stream: {selectedLiveJid || 'Review Thread Required'}
-                                                            </h5>
-                                                            
-                                                            <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1 text-left">
-                                                                {liveMessagesLoading ? (
-                                                                    <div className="h-full flex items-center justify-center italic text-[10px] text-white/30">
-                                                                        Decrypting message security layers...
+                                                        {/* QR scanner or pairing details */}
+                                                        {targetState !== 'open' && (
+                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
+                                                                <div className="p-6 bg-gradient-to-br from-[#111b21] to-black border border-[#00a884]/20 rounded-3xl flex flex-col items-center justify-center text-center space-y-4">
+                                                                    <div className="p-3 bg-[#00a884]/10 text-[#00a884] rounded-2xl">
+                                                                        <RefreshCw className="w-6 h-6 animate-spin" />
                                                                     </div>
-                                                                ) : selectedLiveChatHistory.length > 0 ? (
-                                                                    selectedLiveChatHistory.map((m: any, idx: number) => (
-                                                                        <div key={idx} className="p-3 bg-black/45 hover:bg-black/60 rounded-xl space-y-2 border border-white/[0.02]">
-                                                                            <div className="flex justify-between items-center text-[7.5px] font-mono text-white/40 border-b border-white/[0.04] pb-1">
-                                                                                <span>Msg Jid: {m.key?.id || m.id}</span>
-                                                                                <span className={m.key?.fromMe ? 'text-[#00a884] font-black' : 'text-blue-400 font-black'}>
-                                                                                    {m.key?.fromMe ? 'OUTGOING' : 'INBOUND'}
-                                                                                </span>
+                                                                    <h4 className="text-xs font-black text-white uppercase tracking-wider">Option A: QR Code Pairing State</h4>
+                                                                    <p className="text-[10px] text-white/50 max-w-sm mt-0.5 leading-relaxed">
+                                                                        Scan code with your phone (WhatsApp settings &gt; Linked Devices).
+                                                                    </p>
+                                                                    {connectionData?.qrCode ? (
+                                                                        <div className="p-4 bg-white rounded-3xl inline-block shadow-lg">
+                                                                            <QRCode 
+                                                                                 value={connectionData.qrCode} 
+                                                                                 size={140} 
+                                                                                 style={{ height: 'auto', maxWidth: '100%', width: '100%' }} 
+                                                                             />
+                                                                        </div>
+                                                                    ) : (
+                                                                        <div className="p-6 px-12 bg-[#202c33]/40 border border-white/5 rounded-2xl text-xs font-mono text-amber-500 italic">
+                                                                            Generating fresh QR challenge payload...
+                                                                        </div>
+                                                                    )}
+                                                                    <button 
+                                                                        onClick={fetchConnectionData}
+                                                                        className="px-4 py-2 bg-[#00a884]/15 hover:bg-[#00a884]/25 border border-[#00a884]/30 text-[#00a884] rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5 cursor-pointer"
+                                                                    >
+                                                                        <RefreshCw className="w-3.5 h-3.5" /> Re-Fetch QR Status
+                                                                    </button>
+                                                                </div>
+
+                                                                <div className="p-6 bg-gradient-to-br from-[#111b21] to-black border border-amber-500/10 rounded-3xl flex flex-col items-center justify-center text-center space-y-4">
+                                                                    <div className="p-3 bg-amber-500/10 text-amber-500 rounded-2xl">
+                                                                        <Layers className="w-6 h-6 animate-pulse" />
+                                                                    </div>
+                                                                    <h4 className="text-xs font-black text-white uppercase tracking-wider">Option B: Link Another Device (Pairing Code)</h4>
+                                                                    <p className="text-[10px] text-white/50 max-w-sm leading-relaxed">
+                                                                        Enter your target phone number below to request an 8-character pairing code.
+                                                                    </p>
+
+                                                                    <form onSubmit={handleRequestPairingCode} className="w-full space-y-3 pt-2">
+                                                                        <div className="flex gap-2">
+                                                                            <input 
+                                                                                type="text"
+                                                                                placeholder="E.g. +14155552671"
+                                                                                value={pairingPhone}
+                                                                                onChange={(e) => setPairingPhone(e.target.value)}
+                                                                                disabled={pairingLoading}
+                                                                                className="flex-1 px-4 py-2 text-xs bg-black/40 border border-white/10 rounded-xl text-white outline-none focus:border-amber-500 transition-all font-mono placeholder:text-white/20"
+                                                                            />
+                                                                            <button
+                                                                                type="submit"
+                                                                                disabled={pairingLoading || !pairingPhone}
+                                                                                className="px-4 py-2 bg-amber-500 text-black text-[9px] font-black uppercase tracking-wider rounded-xl hover:bg-amber-400 disabled:opacity-20 disabled:pointer-events-none transition-all cursor-pointer shrink-0"
+                                                                            >
+                                                                                {pairingLoading ? 'Requesting...' : 'Get Code'}
+                                                                            </button>
+                                                                        </div>
+                                                                        {pairingError && (
+                                                                            <p className="text-[9px] text-red-400 font-bold text-left font-mono">{pairingError}</p>
+                                                                        )}
+                                                                        {requestedPairingCode && (
+                                                                            <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl space-y-3 animate-fadeIn">
+                                                                                <span className="text-[9px] font-black text-amber-400 uppercase tracking-widest block font-mono">Your Link Code</span>
+                                                                                <div className="flex justify-center gap-1.5">
+                                                                                    {requestedPairingCode.split('').map((char, index) => (
+                                                                                        <span 
+                                                                                            key={index} 
+                                                                                            className="w-8 h-10 bg-black/50 border border-amber-500/30 rounded-xl flex items-center justify-center font-mono text-sm font-black text-white"
+                                                                                        >
+                                                                                            {char}
+                                                                                        </span>
+                                                                                    ))}
+                                                                                </div>
+                                                                                <p className="text-[8px] text-white/40 max-w-xs mx-auto leading-normal">
+                                                                                    Open WhatsApp (Settings &gt; Linked Devices &gt; Link with phone number instead) and input this code.
+                                                                                </p>
                                                                             </div>
-                                                                            <p className="text-xs font-mono text-white leading-relaxed">
-                                                                                {m.message?.conversation || m.text || (m.message ? JSON.stringify(m.message) : 'Null Payload')}
+                                                                        )}
+                                                                    </form>
+                                                                </div>
+                                                            </div>
+                                                        )}
+
+                                                        {/* Connected scanner profile info */}
+                                                        {targetState === 'open' && (
+                                                            <div className="p-6 bg-emerald-950/15 border border-emerald-500/20 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-6 text-left animate-fadeIn">
+                                                                <div className="space-y-2">
+                                                                    <span className="text-[8px] font-black uppercase bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded tracking-widest font-mono">
+                                                                        {isBackupMode ? '🟢 HISTORIC BACKUP PROFILE' : '🟢 ACTIVE CENTRAL DEVICE PAIRING'}
+                                                                    </span>
+                                                                    <h4 className="text-sm font-black text-white">Scanned Device: {targetUserName}</h4>
+                                                                    <div className="font-mono text-xs text-white/60 space-y-1 leading-relaxed">
+                                                                        <div><span className="text-white/40 font-bold">Node JID:</span> {targetUserId}</div>
+                                                                        <div><span className="text-white/40 font-bold">Total Linked Threads:</span> {targetChats.length} chats</div>
+                                                                    </div>
+                                                                </div>
+                                                                <div className="flex flex-col sm:flex-row items-center gap-4">
+                                                                    <div className="p-4 bg-emerald-950/20 border border-emerald-500/20 rounded-2xl text-center space-y-1.5 min-w-[150px]">
+                                                                        <span className="text-[44px] block leading-none font-black font-mono text-[#00a884]">{targetChats.length}</span>
+                                                                        <span className="text-[8px] font-black text-white/55 uppercase tracking-widest block">Conversations Loaded</span>
+                                                                    </div>
+                                                                    {!isBackupMode && (
+                                                                        <button
+                                                                            onClick={handleAdminHardLogout}
+                                                                            className="px-4 py-3 bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20 rounded-2xl text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5 cursor-pointer h-fit self-center transition-all"
+                                                                        >
+                                                                            <LogOut className="w-3.5 h-3.5" /> Link another device
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                        )}
+
+                                                        {/* Central Chat History Access and Recycle Bin tabs split */}
+                                                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                                                            
+                                                            {/* Chats Thread listing column */}
+                                                            <div className="lg:col-span-4 p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar text-left">
+                                                                <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-2">
+                                                                    <MessageSquare className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                    Active Server Threads ({targetChats.length})
+                                                                </h5>
+                                                                {targetChats.length > 0 ? (
+                                                                    <div className="space-y-1.5">
+                                                                        {targetChats.map((c: any, index: number) => (
+                                                                            <button
+                                                                                key={index}
+                                                                                onClick={() => loadLiveChatHistory(c.id || c.chatJid || c.jid)}
+                                                                                className={`w-full p-2.5 rounded-xl text-left flex flex-col font-mono text-[10px] border transition-all ${
+                                                                                    selectedLiveJid === (c.id || c.chatJid || c.jid) 
+                                                                                        ? 'bg-[#00a884]/15 border-[#00a884]/30 text-white font-bold' 
+                                                                                        : 'bg-black/20 border-transparent hover:bg-black/35 text-white/50 hover:text-white'
+                                                                                }`}
+                                                                            >
+                                                                                <span className="truncate block font-semibold text-white/95">{c.name || c.id || c.chatJid || c.jid}</span>
+                                                                                <span className="text-[8px] text-white/35 truncate block mt-0.5">{c.id || c.chatJid || c.jid}</span>
+                                                                            </button>
+                                                                        ))}
+                                                                    </div>
+                                                                ) : (
+                                                                    <p className="text-[10px] text-white/30 italic">No threads loaded inside engine state.</p>
+                                                                )}
+                                                            </div>
+
+                                                            {/* Messages Detail view space */}
+                                                            <div className="lg:col-span-8 p-5 bg-[#111b21] rounded-2xl border border-white/5 min-h-[350px] max-h-[500px] flex flex-col overflow-hidden">
+                                                                <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-3 shrink-0">
+                                                                    <Eye className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                    Audited Signal Packet stream: {selectedLiveJid || 'Review Thread Required'}
+                                                                </h5>
+                                                                
+                                                                <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1 text-left">
+                                                                    {liveMessagesLoading ? (
+                                                                        <div className="h-full flex items-center justify-center italic text-[10px] text-white/30">
+                                                                            Decrypting message security layers...
+                                                                        </div>
+                                                                    ) : selectedLiveChatHistory.length > 0 ? (
+                                                                        selectedLiveChatHistory.map((m: any, idx: number) => (
+                                                                            <div key={idx} className="p-3 bg-black/45 hover:bg-black/60 rounded-xl space-y-2 border border-white/[0.02] text-left">
+                                                                                <div className="flex justify-between items-center text-[7.5px] font-mono text-white/40 border-b border-white/[0.04] pb-1">
+                                                                                    <span>Msg Jid: {m.key?.id || m.id}</span>
+                                                                                    <span className={(m.key?.fromMe || m.fromMe) ? 'text-[#00a884] font-black' : 'text-blue-400 font-black'}>
+                                                                                        {(m.key?.fromMe || m.fromMe) ? 'OUTGOING' : 'INBOUND'}
+                                                                                    </span>
+                                                                                </div>
+                                                                                <p className="text-xs font-mono text-white leading-relaxed">
+                                                                                    {m.message?.conversation || m.text || (m.message ? JSON.stringify(m.message) : 'Null Payload')}
+                                                                                </p>
+                                                                                <div className="flex justify-between text-[7px] text-white/30 font-mono">
+                                                                                    <span>Source: {m.chatJid || selectedLiveJid}</span>
+                                                                                    <span>{m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Recent'}</span>
+                                                                                </div>
+                                                                            </div>
+                                                                        ))
+                                                                    ) : (
+                                                                        <div className="h-full flex flex-col items-center justify-center text-center p-6 text-white/30 space-y-2">
+                                                                            <Terminal className="w-8 h-8 text-white/10" />
+                                                                            <span className="text-[10px] font-black uppercase tracking-wider block">Standby</span>
+                                                                            <p className="text-[8.5px] max-w-xs leading-relaxed italic">Click any thread on the left matrix list to deserialize and load its real-time encrypted message transmission log stream.</p>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+
+                                                        </div>
+
+                                                        {/* DELETED MESSAGES RECYCLE BIN ARCHIVE */}
+                                                        <div className="p-6 bg-[#111b21] rounded-2xl border border-red-500/10 space-y-4">
+                                                            <div className="flex items-center justify-between border-b border-red-500/10 pb-3">
+                                                                <h4 className="text-[10px] font-black text-red-500 uppercase tracking-widest flex items-center gap-2 font-mono">
+                                                                    <Trash2 className="w-4 h-4 text-red-500" />
+                                                                    Deleted Message Signal Packets (Recycle Bin Backlog)
+                                                                </h4>
+                                                                <span className="text-[8px] bg-red-500/10 text-red-500 font-bold px-2 py-0.5 rounded font-mono uppercase tracking-wider">
+                                                                    {recycleBinMessages.length} Messages
+                                                                </span>
+                                                            </div>
+                                                            
+                                                            <div className="max-h-[300px] overflow-y-auto custom-scrollbar space-y-3.5 pr-2 text-left">
+                                                                {recycleBinLoading ? (
+                                                                    <p className="text-xs text-white/30 italic text-center">Loading deleted signal log records...</p>
+                                                                ) : recycleBinMessages.length > 0 ? (
+                                                                    recycleBinMessages.map((m: any, idx: number) => (
+                                                                        <div key={idx} className="p-4 bg-red-950/5 hover:bg-red-950/10 border border-red-500/10 rounded-xl space-y-2 text-left relative font-mono animate-fadeIn leading-relaxed">
+                                                                            <div className="flex justify-between items-center text-[7.5px] text-red-400 font-black">
+                                                                                <span>Original Msg: {m.key?.id || m.id || 'N/A'}</span>
+                                                                                <span>DELETED AT: {m.deletedAt ? new Date(m.deletedAt).toLocaleString() : 'N/A'}</span>
+                                                                            </div>
+                                                                            <p className="text-xs text-white bg-black/35 p-3 rounded-lg border border-red-500/5">
+                                                                                {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
                                                                             </p>
-                                                                            <div className="flex justify-between text-[7px] text-white/30 font-mono">
-                                                                                <span>Source: {m.chatJid || selectedLiveJid}</span>
-                                                                                <span>{m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Recent'}</span>
+                                                                            <div className="flex justify-between text-[7.5px] text-white/30">
+                                                                                <span>Thread Identifier: {m.originalChat || m.chatJid}</span>
+                                                                                <span>Delivered: {m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'N/A'}</span>
                                                                             </div>
                                                                         </div>
                                                                     ))
                                                                 ) : (
-                                                                    <div className="h-full flex flex-col items-center justify-center text-center p-6 text-white/30 space-y-2">
-                                                                        <Terminal className="w-8 h-8 text-white/10" />
-                                                                        <span className="text-[10px] font-black uppercase tracking-wider block">Standby</span>
-                                                                        <p className="text-[8.5px] max-w-xs leading-relaxed italic">Click any thread on the left matrix list to deserialize and load its real-time encrypted message transmission log stream.</p>
+                                                                    <div className="py-8 text-center text-white/30 italic text-xs space-y-1.5">
+                                                                        <ShieldCheck className="w-8 h-8 text-emerald-500/20 mx-auto" />
+                                                                        <p>Clean Database: No deleted messages stored in Recycle Bin.</p>
                                                                     </div>
                                                                 )}
                                                             </div>
                                                         </div>
 
                                                     </div>
-
-                                                    {/* DELETED MESSAGES RECYCLE BIN ARCHIVE */}
-                                                    <div className="p-6 bg-[#111b21] rounded-2xl border border-red-500/10 space-y-4">
-                                                        <div className="flex items-center justify-between border-b border-red-500/10 pb-3">
-                                                            <h4 className="text-[10px] font-black text-red-500 uppercase tracking-widest flex items-center gap-2 font-mono">
-                                                                <Trash2 className="w-4 h-4 text-red-500" />
-                                                                Deleted Message Signal Packets (Recycle Bin Backlog)
-                                                            </h4>
-                                                            <span className="text-[8px] bg-red-500/10 text-red-500 font-bold px-2 py-0.5 rounded font-mono uppercase tracking-wider">
-                                                                {recycleBinMessages.length} Messages
-                                                            </span>
-                                                        </div>
-                                                        
-                                                        <div className="max-h-[300px] overflow-y-auto custom-scrollbar space-y-3.5 pr-2">
-                                                            {recycleBinLoading ? (
-                                                                <p className="text-xs text-white/30 italic text-center">Loading deleted signal log records...</p>
-                                                            ) : recycleBinMessages.length > 0 ? (
-                                                                recycleBinMessages.map((m: any, idx: number) => (
-                                                                    <div key={idx} className="p-4 bg-red-950/5 hover:bg-red-950/10 border border-red-500/10 rounded-xl space-y-2 text-left relative font-mono animate-fadeIn leading-relaxed">
-                                                                        <div className="flex justify-between items-center text-[7.5px] text-red-400 font-black">
-                                                                            <span>Original Msg: {m.key?.id || m.id || 'N/A'}</span>
-                                                                            <span>DELETED AT: {m.deletedAt ? new Date(m.deletedAt).toLocaleString() : 'N/A'}</span>
-                                                                        </div>
-                                                                        <p className="text-xs text-white bg-black/35 p-3 rounded-lg border border-red-500/5">
-                                                                            {m.message?.conversation || m.text || JSON.stringify(m.message || {})}
-                                                                        </p>
-                                                                        <div className="flex justify-between text-[7.5px] text-white/30">
-                                                                            <span>Thread Identifier: {m.originalChat || m.chatJid}</span>
-                                                                            <span>Delivered: {m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'N/A'}</span>
-                                                                        </div>
-                                                                    </div>
-                                                                ))
-                                                            ) : (
-                                                                <div className="py-8 text-center text-white/30 italic text-xs space-y-1.5">
-                                                                    <ShieldCheck className="w-8 h-8 text-emerald-500/20 mx-auto" />
-                                                                    <p>Clean Database: No deleted messages stored in Recycle Bin.</p>
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    </div>
-
-                                                </div>
-                                            )}
+                                                );
+                                            })()}
 
                                             {/* GLOBAL TAB 3: APP SETTINGS HUB */}
                                             {activeTab === 'app_settings' && !queriedData && (
@@ -1563,7 +1796,7 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                                                     Last Backup Node Metadata
                                                                 </span>
                                                                 <div><span className="text-white/40">Synchronized Node Phone:</span> +{backupMetadata.phone || 'N/A'}</div>
-                                                                <div><span className="text-white/40">Total Chats backed:</span> {backupMetadata.chatsCount || 0} chats</div>
+                                                                <div><span className="text-white/40">Total Chats backed:</span> {backupMetadata.chatsCount || backupMetadata.chatCount || 0} chats</div>
                                                                 <div><span className="text-white/40">Last Cloud Write Sync:</span> {backupMetadata.timestamp ? new Date(backupMetadata.timestamp).toLocaleString() : 'N/A'}</div>
                                                             </div>
                                                         ) : (
@@ -1801,26 +2034,92 @@ export const AdminPanelScreen: React.FC<AdminPanelScreenProps> = ({ adminEmail, 
                                                         </div>
                                                     )}
 
-                                                    {activeTab === 'chats' && (
-                                                        <div id="tab-chats-view" className="space-y-3 animate-fadeIn text-left">
-                                                            <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-4">Decrypted Backed Conversations</h4>
-                                                            {queriedData.chats?.length > 0 ? (
-                                                                queriedData.chats.map((c: any, idx: number) => (
-                                                                    <div key={idx} className="p-4 bg-[#111b21] border border-white/5 rounded-2xl flex justify-between items-center transition-all hover:border-white/10 font-mono">
-                                                                        <div className="space-y-1">
-                                                                            <p className="text-xs font-bold text-white">{c.name || c.id}</p>
-                                                                            <p className="text-[9px] text-[#00a884] font-bold">Unread count backlog: {c.unreadCount || 0}</p>
-                                                                        </div>
-                                                                        <span className="text-[9px] text-white/30">
-                                                                            {c.timestamp ? new Date(c.timestamp * 1000).toLocaleString() : 'No Sync Timestamp'}
-                                                                        </span>
+                                                    {activeTab === 'chats' && (() => {
+                                                        const targetChats = queriedData.chats || [];
+                                                        return (
+                                                            <div id="tab-chats-view" className="space-y-4 animate-fadeIn text-left">
+                                                                <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-2 font-mono">Decrypted Backed Conversations & Chats</h4>
+                                                                
+                                                                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                                                                    {/* Left Column: Chat list / contacts */}
+                                                                    <div className="lg:col-span-4 p-5 bg-[#111b21] rounded-2xl border border-white/5 space-y-4 max-h-[520px] overflow-y-auto custom-scrollbar">
+                                                                        <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-2 items-center">
+                                                                            <MessageSquare className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                            Backed Chat Threads ({targetChats.length})
+                                                                        </h5>
+                                                                        {targetChats.length > 0 ? (
+                                                                            <div className="space-y-1.5 animate-fadeIn">
+                                                                                {targetChats.map((c: any, index: number) => {
+                                                                                    const chatIdStr = c.id || c.chatJid || c.jid || '';
+                                                                                    return (
+                                                                                        <button
+                                                                                            key={index}
+                                                                                            onClick={() => loadLiveChatHistory(chatIdStr)}
+                                                                                            className={`w-full p-3 rounded-xl text-left flex flex-col font-mono text-[10px] border transition-all ${
+                                                                                                selectedLiveJid === chatIdStr 
+                                                                                                    ? 'bg-[#00a884]/15 border-[#00a884]/30 text-white font-bold' 
+                                                                                                    : 'bg-black/20 border-transparent hover:bg-black/35 text-white/50 hover:text-white'
+                                                                                            }`}
+                                                                                        >
+                                                                                            <span className="truncate block font-semibold text-white/95">{c.name || c.id || c.chatJid || c.jid}</span>
+                                                                                            <span className="text-[8px] text-white/35 truncate block mt-0.5">{chatIdStr}</span>
+                                                                                            {Number(c.unreadCount) > 0 && (
+                                                                                                <span className="text-[8px] text-[#00a884] font-bold mt-1">Unread backlog: {c.unreadCount}</span>
+                                                                                            )}
+                                                                                        </button>
+                                                                                    );
+                                                                                })}
+                                                                            </div>
+                                                                        ) : (
+                                                                            <p className="text-[10px] text-white/30 italic">No threads populated under this snapshot node backup.</p>
+                                                                        )}
                                                                     </div>
-                                                                ))
-                                                            ) : (
-                                                                <p className="text-xs text-white/30 italic">No threads populated under this snapshot node backup.</p>
-                                                            )}
-                                                        </div>
-                                                    )}
+
+                                                                    {/* Right Column: Dynamic Messages History for selected chat */}
+                                                                    <div className="lg:col-span-8 p-5 bg-[#111b21] rounded-2xl border border-white/5 min-h-[350px] max-h-[520px] flex flex-col overflow-hidden">
+                                                                        <h5 className="text-[10px] font-black uppercase text-[#00a884] tracking-widest flex items-center gap-1.5 mb-3 shrink-0 font-mono">
+                                                                            <Eye className="w-3.5 h-3.5 text-[#00a884]" />
+                                                                            Backed Conversation Logs: {selectedLiveJid || 'Select Chat Thread'}
+                                                                        </h5>
+                                                                        
+                                                                        <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
+                                                                            {liveMessagesLoading ? (
+                                                                                <div className="h-full flex items-center justify-center italic text-[10px] text-white/30 font-mono">
+                                                                                    Parsing backed conversation messages...
+                                                                                </div>
+                                                                            ) : selectedLiveChatHistory.length > 0 ? (
+                                                                                <div className="space-y-3 animate-fadeIn text-left">
+                                                                                    {selectedLiveChatHistory.map((m: any, idx: number) => (
+                                                                                        <div key={idx} className="p-3 bg-black/45 hover:bg-black/60 rounded-xl space-y-2 border border-white/[0.02] text-left">
+                                                                                            <div className="flex justify-between items-center text-[7.5px] font-mono text-white/40 border-b border-white/[0.04] pb-1">
+                                                                                                <span>Msg Key ID: {m.key?.id || m.id}</span>
+                                                                                                <span className={(m.key?.fromMe || m.fromMe) ? 'text-[#00a884] font-black' : 'text-blue-400 font-black'}>
+                                                                                                    {(m.key?.fromMe || m.fromMe) ? 'OUTGOING' : 'INBOUND'}
+                                                                                                </span>
+                                                                                            </div>
+                                                                                            <p className="text-xs font-mono text-white leading-relaxed">
+                                                                                                {m.message?.conversation || m.text || (m.message ? JSON.stringify(m.message) : 'Null Payload')}
+                                                                                            </p>
+                                                                                            <div className="flex justify-between text-[7px] text-white/35 font-mono">
+                                                                                                <span>Sender: {m.chatJid || selectedLiveJid}</span>
+                                                                                                <span>{m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'N/A'}</span>
+                                                                                            </div>
+                                                                                        </div>
+                                                                                    ))}
+                                                                                </div>
+                                                                            ) : (
+                                                                                <div className="h-full flex flex-col items-center justify-center text-center p-6 text-white/30 space-y-2 h-[280px]">
+                                                                                    <Terminal className="w-8 h-8 text-white/10" />
+                                                                                    <span className="text-[10px] font-black uppercase tracking-wider block font-mono">Standby</span>
+                                                                                    <p className="text-[8.5px] max-w-xs leading-relaxed italic">Click any backed conversation thread on the left to read its complete chat log history decrypted and pulled from this secure backup container.</p>
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
 
                                                     {activeTab === 'messages' && (
                                                         <div id="tab-messages-view" className="space-y-4 animate-fadeIn text-left">

@@ -34,6 +34,7 @@ import {
     saveCallToBackup,
     saveStatusToBackup,
     runFullBackup,
+    saveLocalBackup,
     runFullRestore,
     getBackupMetadata,
     secretAdminQuery,
@@ -43,6 +44,7 @@ import {
 } from './server_backup';
 import { DatabaseService } from './src/DatabaseService.js';
 import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
+import cors from 'cors';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
@@ -52,27 +54,29 @@ const PORT = 3000;
 const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
 const app = express(); // FIXED (Move globally)
+
+// CORS and response headers for external access
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
+
+app.options('*', cors());
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
+  res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+  next();
+});
+
 const server = createServer(app); // FIXED (Move globally)
 const wss = new WebSocketServer({ server }); // FIXED (Move globally)
-
-// Replay current connection state to any newly connected WebSocket client
-// This fixes the bug where QR is scanned but the app never transitions to the main screen
-// because the client missed the LOGGED_IN / CONNECTION_STATE events
-wss.on('connection', (ws) => {
-    try {
-        if (connectionState) {
-            ws.send(JSON.stringify({ type: 'CONNECTION_STATE', data: connectionState }));
-        }
-        if (qrCode && connectionState !== 'open') {
-            ws.send(JSON.stringify({ type: 'QR_CODE', data: qrCode }));
-        }
-        if (connectionState === 'open' && sock?.user) {
-            ws.send(JSON.stringify({ type: 'LOGGED_IN', data: sock.user }));
-        }
-    } catch (e) {
-        // Ignore send errors on newly connected clients
-    }
-});
 
 const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
 const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
@@ -207,9 +211,89 @@ let proData = {
 (global as any).saveProData = () => saveProData();
 
 let sock: any = null;
+let sockFriend: any = null;
 let realChats: any[] = [];
-let qrCode: string | null = null;       // Hoisted to module level for wss connection handler
-let connectionState: any = 'close';     // Hoisted to module level for wss connection handler
+let realChatsFriend: any[] = [];
+
+let proDataFriend = {
+    scheduledMessages: [] as any[],
+    autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
+    messageHistory: {} as Record<string, any[]>,
+    callHistory: [] as any[],
+    callRecords: [] as any[],
+    statusUpdates: [] as any[],
+    deletedStatuses: [] as any[],
+    recycleBin: {
+        messages: [] as any[],
+        chats: [] as any[]
+    },
+    favorites: [] as string[],
+    lockedChats: [] as string[],
+    cachedChats: [] as any[],
+    contacts: {} as Record<string, any>,
+    lidToPnMap: {} as Record<string, string>,
+    settings: {
+        autoTranslate: false,
+        theme: 'elegant-dark',
+        font: 'Inter',
+        aiContext: 'Professional Assistant',
+        ghostMode: false,
+        antiDelete: true,
+        antiDeleteStatus: true,
+        hideNumbers: false,
+        hideBlueTicks: false,
+        hideSecondTick: false,
+        hideTyping: false,
+        secretStatusView: true,
+        dndMode: false,
+        autoReply: false,
+        phoneNumber: '',
+        firebaseBackupEnabled: false
+    },
+    logs: [] as { time: string, level: string, msg: string }[]
+};
+
+(global as any).proDataFriend = proDataFriend;
+
+const DATA_FILE_FRIEND = path.join(process.cwd(), 'pro_data_friend.json');
+if (fs.existsSync(DATA_FILE_FRIEND)) {
+    try {
+        const savedFriend = JSON.parse(fs.readFileSync(DATA_FILE_FRIEND, 'utf-8'));
+        proDataFriend = { ...proDataFriend, ...savedFriend };
+        (global as any).proDataFriend = proDataFriend;
+    } catch (e) {
+        console.error('Failed to load pro_data_friend.json');
+    }
+}
+
+let saveProDataFriendTimeout: NodeJS.Timeout | null = null;
+function saveProDataFriend() {
+    if (saveProDataFriendTimeout) {
+        clearTimeout(saveProDataFriendTimeout);
+    }
+    saveProDataFriendTimeout = setTimeout(() => {
+        saveProDataFriendTimeout = null;
+        try {
+            const tempFile = `${DATA_FILE_FRIEND}.tmp`;
+            fs.writeFileSync(tempFile, JSON.stringify(proDataFriend), 'utf-8');
+            fs.renameSync(tempFile, DATA_FILE_FRIEND);
+
+            // Synchronize with local permanent numbers backup files automatically
+            if (proDataFriend.settings && proDataFriend.settings.phoneNumber) {
+                const numericPhone = proDataFriend.settings.phoneNumber.replace(/[^0-9]/g, '');
+                if (numericPhone) {
+                    try {
+                        saveLocalBackup(numericPhone, proDataFriend, realChatsFriend);
+                    } catch (backupErr: any) {
+                        console.error('[Auto Sync Friend] Failed to write permanent local backup:', backupErr.message);
+                    }
+                }
+            }
+        } catch (e: any) {
+            console.error('[Friend] Failed to save proData: ' + e.message);
+        }
+    }, 1500);
+}
 let consecutiveBadSessions = 0;
 let consecutiveStreamErrors = 0;
 let lastInteractionTime = Date.now();
@@ -248,6 +332,18 @@ function saveProData() {
             const tempFile = `${DATA_FILE}.tmp`;
             fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
             fs.renameSync(tempFile, DATA_FILE);
+
+            // Synchronize with local permanent numbers backup files automatically
+            if (proData.settings && proData.settings.phoneNumber) {
+                const numericPhone = proData.settings.phoneNumber.replace(/[^0-9]/g, '');
+                if (numericPhone) {
+                    try {
+                        saveLocalBackup(numericPhone, proData, realChats);
+                    } catch (backupErr: any) {
+                        console.error('[Auto Sync] Failed to write permanent local backup:', backupErr.message);
+                    }
+                }
+            }
         } catch (e: any) {
             log('ERROR', `Failed to save proData: ${e.message}`);
         }
@@ -263,6 +359,18 @@ function saveProDataSync() {
         const tempFile = `${DATA_FILE}.tmp`;
         fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
         fs.renameSync(tempFile, DATA_FILE);
+
+        // Synchronize with local permanent numbers backup files automatically during synchronous save
+        if (proData.settings && proData.settings.phoneNumber) {
+            const numericPhone = proData.settings.phoneNumber.replace(/[^0-9]/g, '');
+            if (numericPhone) {
+                try {
+                    saveLocalBackup(numericPhone, proData, realChats);
+                } catch (backupErr: any) {
+                    console.error('[Auto Sync Sync] Failed to write permanent local backup:', backupErr.message);
+                }
+            }
+        }
     } catch (e: any) {
         log('ERROR', `Failed to save proData sync: ${e.message}`);
     }
@@ -542,11 +650,16 @@ async function startServer() {
     }
 
     sock = null;
-    qrCode = null;
-    connectionState = 'close';
+    sockFriend = null;
+    let qrCode: string | null = null;
+    let qrCodeFriend: string | null = null;
+    let connectionState: any = 'close';
+    let connectionStateFriend: any = 'close';
     realChats = proData.cachedChats || [];
+    realChatsFriend = proDataFriend.cachedChats || [];
     let initTimeout: NodeJS.Timeout | null = null;
     let isInitializing = false;
+    let isInitializingFriend = false;
 
     function cleanAuthDir(authDir: string) {
         const timestamp = Date.now();
@@ -815,6 +928,76 @@ function normalizeJid(jid: string): string {
     return jid;
 }
 
+function wrapSignalKeyStore(keysState: any, authDir: string, isFriend: boolean) {
+    if (!keysState) return keysState;
+    const originalGet = keysState.get;
+    const originalSet = keysState.set;
+
+    keysState.get = async (type: string, ids: string[]) => {
+        try {
+            return await originalGet.call(keysState, type, ids);
+        } catch (error: any) {
+            const errStr = (error?.message || '').toLowerCase();
+            log('ERROR', `KeyStore GET error for ${isFriend ? 'Friend' : 'Me'} in ${authDir}: ${error.message}`);
+            if (errStr.includes('unsupported state') || errStr.includes('unable to authenticate') || errStr.includes('decryption failed')) {
+                log('ERROR', `Detected corrupted KeyStore state in ${authDir}! Instigating automated recovery...`);
+                cleanAuthDir(authDir);
+                if (isFriend) {
+                    if (sockFriend) {
+                        try { sockFriend.ev.removeAllListeners('connection.update'); sockFriend.ev.removeAllListeners('creds.update'); sockFriend.end(undefined); } catch (e) {}
+                        sockFriend = null;
+                        connectionStateFriend = 'close';
+                        broadcast({ type: 'CONNECTION_STATE_FRIEND', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocketFriend(); }, 2000);
+                } else {
+                    if (sock) {
+                        try { sock.ev.removeAllListeners('connection.update'); sock.ev.removeAllListeners('creds.update'); sock.end(undefined); } catch (e) {}
+                        sock = null;
+                        connectionState = 'close';
+                        broadcast({ type: 'CONNECTION_STATE', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocket(); }, 2000);
+                }
+            }
+            throw error;
+        }
+    };
+
+    keysState.set = async (data: any) => {
+        try {
+            return await originalSet.call(keysState, data);
+        } catch (error: any) {
+            const errStr = (error?.message || '').toLowerCase();
+            log('ERROR', `KeyStore SET error for ${isFriend ? 'Friend' : 'Me'} in ${authDir}: ${error.message}`);
+            if (errStr.includes('unsupported state') || errStr.includes('unable to authenticate') || errStr.includes('decryption failed')) {
+                log('ERROR', `Detected corrupted KeyStore state during set in ${authDir}! Instigating automated recovery...`);
+                cleanAuthDir(authDir);
+                if (isFriend) {
+                    if (sockFriend) {
+                        try { sockFriend.ev.removeAllListeners('connection.update'); sockFriend.ev.removeAllListeners('creds.update'); sockFriend.end(undefined); } catch (e) {}
+                        sockFriend = null;
+                        connectionStateFriend = 'close';
+                        broadcast({ type: 'CONNECTION_STATE_FRIEND', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocketFriend(); }, 2000);
+                } else {
+                    if (sock) {
+                        try { sock.ev.removeAllListeners('connection.update'); sock.ev.removeAllListeners('creds.update'); sock.end(undefined); } catch (e) {}
+                        sock = null;
+                        connectionState = 'close';
+                        broadcast({ type: 'CONNECTION_STATE', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocket(); }, 2000);
+                }
+            }
+            throw error;
+        }
+    };
+
+    return keysState;
+}
+
 async function initWASocket() {
     if (isInitializing) {
         log('WARN', 'initWASocket is already in progress, skipping concurrent duplicate call.');
@@ -842,6 +1025,8 @@ async function initWASocket() {
         state = authData.state;
         saveCreds = authData.saveCreds;
     }
+
+    state.keys = wrapSignalKeyStore(state.keys, authDir, false);
     
     if (sock) {
         try { 
@@ -1134,7 +1319,7 @@ async function initWASocket() {
 
         sock.ev.on('messages.upsert', (m: any) => {
             if (socketInstance !== sock) return;
-            if (proData.settings.dndMode) return; // Silent Drop in DND
+            // DND Silent drop removed to preserve messages and log them permanently
             broadcast({ type: 'MESSAGES_UPSERT', data: m });
             
             m.messages.forEach(async (msg: any) => {
@@ -1259,7 +1444,7 @@ async function initWASocket() {
                 saveMessageToFirebase(jid, msg);
 
                 // Auto Reply Logic
-                if (proData.settings.autoReply && !msg.key.fromMe && !jid.endsWith('@g.us')) {
+                if (proData.settings.autoReply && !proData.settings.dndMode && !msg.key.fromMe && !jid.endsWith('@g.us')) {
                     const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
                     const reply = proData.autoReplies.find(r => r.enabled && text.toLowerCase().includes(r.keyword.toLowerCase()));
                     if (reply) {
@@ -1497,7 +1682,280 @@ async function initWASocket() {
         });
     }
 
+    async function initWASocketFriend() {
+        if (isInitializingFriend) {
+            log('WARN', 'initWASocketFriend is already in progress, skipping concurrent duplicate call.');
+            return;
+        }
+        isInitializingFriend = true;
+        qrCodeFriend = null;
+        log('INFO', 'Initializing WhatsApp Pro Engine for FRIEND profile...');
+        
+        const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+        let state: any;
+        let saveCreds: any;
+
+        try {
+            const authData = await useMultiFileAuthState(authDirFriend);
+            state = authData.state;
+            saveCreds = authData.saveCreds;
+            if (!state || !state.creds || typeof state.creds !== 'object') {
+                throw new Error('Friend state credentials corrupt or missing');
+            }
+        } catch (err: any) {
+            log('ERROR', `Friend authentication directory corrupt: ${err.message}. Conducting clean rebuild...`);
+            cleanAuthDir(authDirFriend);
+            const authData = await useMultiFileAuthState(authDirFriend);
+            state = authData.state;
+            saveCreds = authData.saveCreds;
+        }
+
+        state.keys = wrapSignalKeyStore(state.keys, authDirFriend, true);
+
+        if (sockFriend) {
+            try {
+                sockFriend.ev.removeAllListeners('connection.update');
+                sockFriend.ev.removeAllListeners('creds.update');
+                sockFriend.ev.removeAllListeners('messages.upsert');
+                sockFriend.end(undefined);
+            } catch (e) {}
+            sockFriend = null;
+        }
+
+        let constructRetries = 0;
+        while (constructRetries < 3) {
+            try {
+                sockFriend = makeWASocket({
+                    version: latestVersion,
+                    logger,
+                    auth: {
+                        creds: state.creds,
+                        keys: makeCacheableSignalKeyStore(state.keys, logger),
+                    },
+                    printQRInTerminal: false,
+                    browser: Browsers.ubuntu('Chrome'),
+                    syncFullHistory: true,
+                    markOnlineOnConnect: true,
+                    connectTimeoutMs: 60000,
+                    generateHighQualityLinkPreview: true,
+                    getMessage: async (key) => {
+                        const jid = normalizeJid(key.remoteJid!);
+                        const msgs = proDataFriend.messageHistory[jid] || [];
+                        return msgs.find(m => m.key.id === key.id)?.message || undefined;
+                    }
+                });
+                break;
+            } catch (socketError: any) {
+                constructRetries++;
+                log('ERROR', `Failed to construct Friend WASocket instance (Attempt ${constructRetries}/3): ${socketError.message}`);
+                if (constructRetries >= 3) {
+                    cleanAuthDir(authDirFriend);
+                    isInitializingFriend = false;
+                    return;
+                }
+                const start = Date.now();
+                while (Date.now() - start < 2000) {}
+            }
+        }
+
+        isInitializingFriend = false;
+        const socketInstanceFriend = sockFriend;
+
+        sockFriend.ev.on('creds.update', (...args: any[]) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            saveCreds(...args);
+        });
+
+        sockFriend.ev.on('QR_CODE', (qr: string) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            qrCodeFriend = qr;
+            broadcast({ type: 'QR_CODE_FRIEND', data: qr });
+        });
+
+        sockFriend.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                qrCodeFriend = qr;
+                broadcast({ type: 'QR_CODE_FRIEND', data: qr });
+            }
+
+            if (connection) {
+                connectionStateFriend = connection;
+                broadcast({ type: 'CONNECTION_STATE_FRIEND', data: connection });
+            }
+
+            if (connection === 'close') {
+                const error = lastDisconnect?.error as Boom;
+                const statusCode = error?.output?.statusCode;
+                const errMessage = error?.message || 'No close message';
+                const errStack = error?.stack || 'none';
+                const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
+                const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
+                
+                log('WARN', `Friend Connection link severed. statusCode: ${statusCode || 'none'}, error: ${errMessage}`);
+
+                const isQrTimeout = fullErrorString.includes('qr refs attempts ended') || (statusCode === 408 && fullErrorString.includes('qr'));
+                const isLoggedOut = 
+                    statusCode === DisconnectReason.loggedOut ||
+                    fullErrorString.includes('logged out') ||
+                    fullErrorString.includes('logout');
+
+                const isBadSession = 
+                    (statusCode === DisconnectReason.badSession && 
+                     !fullErrorString.includes('stream errored') && 
+                     !fullErrorString.includes('xml-not-well-formed') &&
+                     !fullErrorString.includes('connection reset') &&
+                     !fullErrorString.includes('socket hang up') &&
+                     !fullErrorString.includes('connection closed') &&
+                     !fullErrorString.includes('timed out')
+                    ) ||
+                    (statusCode === 401 && !isLoggedOut) ||
+                    fullErrorString.includes('bad session') ||
+                    fullErrorString.includes('invalid credentials') ||
+                    fullErrorString.includes('unauthorized') ||
+                    fullErrorString.includes('decryption failed') ||
+                    fullErrorString.includes('bad_session');
+
+                // 1. Check for QR Timeout
+                if (isQrTimeout) {
+                    log('WARN', 'Friend QR pairing reference attempts ended (timeout). Wiping stale registration state for clean reboot...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    broadcast({ type: 'QR_TIMEOUT_FRIEND', data: { message: 'Friend QR code pairing timed out. Re-generating fresh pairing reference...' } });
+                    setTimeout(() => {
+                        initWASocketFriend();
+                    }, 3000);
+                    return;
+                }
+
+                // 2. Check for Log Out
+                if (isLoggedOut) {
+                    log('ERROR', 'Friend Profile has been logged out from mobile. Conducting clean rebuild...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    connectionStateFriend = 'close';
+                    broadcast({ type: 'LOGOUT_FRIEND', data: { message: 'Friend logged out.' } });
+                    return;
+                }
+
+                // 3. Check for Bad Session
+                if (isBadSession) {
+                    log('WARN', 'Friend Connection close detected as BAD SESSION. Conducting clean rebuild...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    setTimeout(() => {
+                        initWASocketFriend();
+                    }, 3000);
+                    return;
+                }
+
+                // Default Fallback Reconnect
+                if (sockFriend) {
+                    try {
+                        sockFriend.ev.removeAllListeners('connection.update');
+                        sockFriend.ev.removeAllListeners('creds.update');
+                        sockFriend.ev.removeAllListeners('messages.upsert');
+                        sockFriend.end(undefined);
+                    } catch (e) {}
+                    sockFriend = null;
+                }
+                setTimeout(() => {
+                    initWASocketFriend();
+                }, 5000);
+            } else if (connection === 'open') {
+                log('SUCCESS', 'Friend WhatsApp Pro Engine: CONNECTED');
+                qrCodeFriend = null;
+                broadcast({ type: 'LOGGED_IN_FRIEND', data: sockFriend.user });
+                if (sockFriend.user && sockFriend.user.id) {
+                    proDataFriend.settings.phoneNumber = sockFriend.user.id.split(':')[0].split('@')[0];
+                    saveProDataFriend();
+                }
+            }
+        });
+
+        sockFriend.ev.on('messages.upsert', (m: any) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            broadcast({ type: 'MESSAGES_UPSERT_FRIEND', data: m });
+
+            m.messages.forEach(async (msg: any) => {
+                let jid = msg.key.remoteJid;
+                if (!jid) return;
+                jid = normalizeJid(jid);
+                msg.key.remoteJid = jid;
+
+                const senderJid = msg.key.fromMe ? 'Me' : normalizeJid(msg.key.participant || msg.participant || jid);
+                if (msg.pushName && senderJid && senderJid !== 'Me') {
+                    if (!proDataFriend.contacts[senderJid] || !proDataFriend.contacts[senderJid].name) {
+                        proDataFriend.contacts[senderJid] = {
+                            id: senderJid,
+                            pushName: msg.pushName,
+                            name: msg.pushName
+                        };
+                        saveProDataFriend();
+                    }
+                }
+
+                // Append message structure to friend's memory
+                if (!proDataFriend.messageHistory[jid]) {
+                    proDataFriend.messageHistory[jid] = [];
+                }
+                proDataFriend.messageHistory[jid].push(msg);
+                if (proDataFriend.messageHistory[jid].length > 1000) proDataFriend.messageHistory[jid].shift();
+                saveProDataFriend();
+
+                if (proDataFriend.settings.phoneNumber) {
+                    saveLocalBackup(proDataFriend.settings.phoneNumber, proDataFriend, realChatsFriend);
+                }
+            });
+        });
+
+        sockFriend.ev.on('chats.set', ({ chats }: any) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            log('INFO', `Friend Chats Set: Received ${chats.length} chats`);
+            realChatsFriend = chats;
+            proDataFriend.cachedChats = realChatsFriend;
+            saveProDataFriend();
+            broadcast({ type: 'INITIAL_SYNC_FRIEND', data: { chats } });
+        });
+    }
+
     await initWASocket();
+    await initWASocketFriend();
 
     // Scheduling Loop (every minute)
     cron.schedule('* * * * *', async () => {
@@ -1771,7 +2229,7 @@ async function initWASocket() {
     });
 
     app.post('/api/request-pairing-code', async (req, res) => {
-        let { phoneNumber } = req.body;
+        let { phoneNumber, account } = req.body;
         if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
 
         // Normalize phone number: digits only
@@ -1787,8 +2245,12 @@ async function initWASocket() {
         }
 
         try {
-            if (!sock.authState.creds.registered) {
-                const code = await sock.requestPairingCode(phoneNumber);
+            const targetSock = account === 'friend' ? sockFriend : sock;
+            if (!targetSock) {
+                return res.status(400).json({ error: 'WhatsApp engine socket is not initialized for this account profile.' });
+            }
+            if (!targetSock.authState.creds.registered) {
+                const code = await targetSock.requestPairingCode(phoneNumber);
                 res.json({ code });
             } else {
                 res.status(400).json({ error: 'Device already registered or busy. If you want to re-pair, logout first.' });
@@ -2043,14 +2505,37 @@ async function initWASocket() {
         if (!(proData as any).registeredPhones) {
             (proData as any).registeredPhones = [];
         }
-        const list = [...(proData as any).registeredPhones];
-        if (proData.settings.phoneNumber) {
+        
+        const listSet = new Set<string>();
+        // Add currently tracked registeredPhones
+        (proData as any).registeredPhones.forEach((p: string) => {
+            const clean = p.replace(/\D/g, '');
+            if (clean) listSet.add(clean);
+        });
+        
+        // Add current active phoneNumber
+        if (proData.settings && proData.settings.phoneNumber) {
             const clean = proData.settings.phoneNumber.replace(/\D/g, '');
-            if (clean && !list.includes(clean)) {
-                list.push(clean);
-            }
+            if (clean) listSet.add(clean);
         }
-        res.json({ success: true, registeredPhones: list });
+
+        // Scan local_backups directory for any historic files
+        try {
+            const localBackupsDir = path.join(process.cwd(), 'local_backups');
+            if (fs.existsSync(localBackupsDir)) {
+                const files = fs.readdirSync(localBackupsDir);
+                files.forEach(file => {
+                    if (file.endsWith('.json')) {
+                        const phone = file.slice(0, -5).replace(/\D/g, ''); // strip .json and remove non-digits
+                        if (phone) listSet.add(phone);
+                    }
+                });
+            }
+        } catch (e: any) {
+            console.error('[Admin Numbers Scan Error]', e.message);
+        }
+
+        res.json({ success: true, registeredPhones: Array.from(listSet) });
     });
 
     // Static service for uploaded files like profile pictures
@@ -2153,10 +2638,17 @@ async function initWASocket() {
     });
 
     app.get('/api/refresh-qr', async (req, res) => {
-        log('INFO', 'Manual QR Refresh Triggered');
-        qrCode = null;
-        scheduleInit(0);
-        res.json({ status: 'Refreshing engine...' });
+        const account = req.query.account || req.body.account;
+        log('INFO', `Manual QR Refresh Triggered for account: ${account || 'me'}`);
+        if (account === 'friend') {
+            qrCodeFriend = null;
+            initWASocketFriend();
+            res.json({ status: 'Refreshing friend engine...' });
+        } else {
+            qrCode = null;
+            scheduleInit(0);
+            res.json({ status: 'Refreshing engine...' });
+        }
     });
 
     app.post('/api/ai-suggestion', async (req, res) => {
@@ -2255,16 +2747,19 @@ async function initWASocket() {
     });
 
     app.post('/api/read-chat', async (req, res) => {
-        const { jid, keys } = req.body;
-        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        const { jid, keys, account } = req.body;
+        const targetSock = account === 'friend' ? sockFriend : sock;
+        const targetProData = account === 'friend' ? proDataFriend : proData;
+
+        if (!targetSock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
         if (!jid) return res.status(400).json({ error: 'Missing chat JID' });
         
-        if (proData.settings.ghostMode || proData.settings.hideBlueTicks) {
+        if (targetProData.settings.ghostMode || targetProData.settings.hideBlueTicks) {
             return res.json({ status: 'Privacy Shield Active: Read receipt supressed.' });
         }
 
         try {
-            await sock.readMessages(keys);
+            await targetSock.readMessages(keys);
             res.json({ status: 'Read' });
         } catch (e) {
             res.status(500).json({ error: 'Read failed' });
@@ -2409,7 +2904,7 @@ async function initWASocket() {
     });
 
     app.post('/api/send-message', async (req, res) => {
-        const { jid, text, quoted } = req.body;
+        const { jid, text, quoted, account } = req.body;
         if (!jid || !text) return res.status(400).json({ error: 'Missing target JID or message text' });
         
         const targetJid = normalizeJid(jid);
@@ -2426,44 +2921,52 @@ async function initWASocket() {
             status: 'sent'
         };
 
+        const targetProData = account === 'friend' ? proDataFriend : proData;
+        const targetSock = account === 'friend' ? sockFriend : sock;
+        let targetRealChats = account === 'friend' ? realChatsFriend : realChats;
+        const saveFunc = account === 'friend' ? saveProDataFriend : saveProData;
+        const wsTypeSuffix = account === 'friend' ? '_FRIEND' : '';
+
         // Save to local message history memory and Firebase
-        if (!proData.messageHistory[targetJid]) {
-            proData.messageHistory[targetJid] = [];
+        if (!targetProData.messageHistory[targetJid]) {
+            targetProData.messageHistory[targetJid] = [];
         }
-        proData.messageHistory[targetJid].push(mockMsg);
+        targetProData.messageHistory[targetJid].push(mockMsg);
 
         // Update the last message in cached chats list
-        let chat = realChats.find(c => c.id === targetJid);
+        let chat = targetRealChats.find(c => c.id === targetJid);
         if (!chat) {
             chat = {
                 id: targetJid,
-                name: proData.contacts[targetJid]?.name || targetJid.split('@')[0],
+                name: targetProData.contacts[targetJid]?.name || targetJid.split('@')[0],
                 unreadCount: 0,
                 timestamp: Math.floor(Date.now() / 1000)
             };
-            realChats.push(chat);
+            targetRealChats.push(chat);
         }
         chat.timestamp = Math.floor(Date.now() / 1000);
         chat.lastMessage = mockMsg;
-        proData.cachedChats = realChats;
+        targetProData.cachedChats = targetRealChats;
 
-        saveMessageToFirebase(targetJid, mockMsg);
-        saveChatToFirebase(targetJid, chat);
-        saveProData();
+        if (account !== 'friend') {
+            saveMessageToFirebase(targetJid, mockMsg);
+            saveChatToFirebase(targetJid, chat);
+        }
+        saveFunc();
 
         // Broadcast to client so other tabs update too
-        broadcast({ type: 'MESSAGES_UPSERT', data: { messages: [mockMsg] } });
-        broadcast({ type: 'INITIAL_SYNC', data: { chats: realChats } });
+        broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [mockMsg] } });
+        broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
 
         // If sock is connected, we try to send it over Baileys, else we return simulated success!
-        if (sock) {
+        if (targetSock) {
             try {
-                log('INFO', `Sending message to ${targetJid} via WhatsApp API`);
+                log('INFO', `Sending message to ${targetJid} via WhatsApp API (${account || 'me'})`);
                 const options: any = {};
                 if (quoted) {
                     options.quoted = quoted;
                 }
-                const sent = await sock.sendMessage(targetJid, { text }, options);
+                const sent = await targetSock.sendMessage(targetJid, { text }, options);
                 return res.json(sent);
             } catch (e: any) {
                 log('ERROR', `Failed to send over WhatsApp API: ${e.message}`);
@@ -2473,7 +2976,7 @@ async function initWASocket() {
 
         // Trigger dynamic auto-reply simulator if matched
         const cleanTxt = text.trim().toLowerCase();
-        const matchedReply = proData.autoReplies.find(r => cleanTxt.includes(r.keyword.toLowerCase()));
+        const matchedReply = targetProData.autoReplies.find(r => cleanTxt.includes(r.keyword.toLowerCase()));
         if (matchedReply) {
             setTimeout(() => {
                 const autoMsg = {
@@ -2486,17 +2989,19 @@ async function initWASocket() {
                     messageTimestamp: Math.floor(Date.now() / 1000),
                     status: 'read'
                 };
-                proData.messageHistory[targetJid].push(autoMsg);
+                targetProData.messageHistory[targetJid].push(autoMsg);
                 chat.timestamp = Math.floor(Date.now() / 1000);
                 chat.lastMessage = autoMsg;
-                proData.cachedChats = realChats;
+                targetProData.cachedChats = targetRealChats;
 
-                saveMessageToFirebase(targetJid, autoMsg);
-                saveChatToFirebase(targetJid, chat);
-                saveProData();
+                if (account !== 'friend') {
+                    saveMessageToFirebase(targetJid, autoMsg);
+                    saveChatToFirebase(targetJid, chat);
+                }
+                saveFunc();
 
-                broadcast({ type: 'MESSAGES_UPSERT', data: { messages: [autoMsg] } });
-                broadcast({ type: 'INITIAL_SYNC', data: { chats: realChats } });
+                broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [autoMsg] } });
+                broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
             }, 1000);
         }
 
@@ -2505,7 +3010,7 @@ async function initWASocket() {
 
     app.post('/api/send-media', upload.single('file'), async (req: any, res: any) => {
         try {
-            const { jid, caption, type } = req.body;
+            const { jid, caption, type, account } = req.body;
             const file = req.file;
             if (!jid) return res.status(400).json({ error: 'Missing target JID' });
             if (!file) return res.status(400).json({ error: 'No file uploaded' });
@@ -2567,39 +3072,47 @@ async function initWASocket() {
                 status: 'sent'
             };
 
+            const targetProData = account === 'friend' ? proDataFriend : proData;
+            const targetSock = account === 'friend' ? sockFriend : sock;
+            let targetRealChats = account === 'friend' ? realChatsFriend : realChats;
+            const saveFunc = account === 'friend' ? saveProDataFriend : saveProData;
+            const wsTypeSuffix = account === 'friend' ? '_FRIEND' : '';
+
             // Save to local message history memory and Firebase
-            if (!proData.messageHistory[targetJid]) {
-                proData.messageHistory[targetJid] = [];
+            if (!targetProData.messageHistory[targetJid]) {
+                targetProData.messageHistory[targetJid] = [];
             }
-            proData.messageHistory[targetJid].push(mockMsg);
+            targetProData.messageHistory[targetJid].push(mockMsg);
 
             // Update the last message in cached chats list
-            let chat = realChats.find(c => c.id === targetJid);
+            let chat = targetRealChats.find(c => c.id === targetJid);
             if (!chat) {
                 chat = {
                     id: targetJid,
-                    name: proData.contacts[targetJid]?.name || targetJid.split('@')[0],
+                    name: targetProData.contacts[targetJid]?.name || targetJid.split('@')[0],
                     unreadCount: 0,
                     timestamp: Math.floor(Date.now() / 1000)
                 };
-                realChats.push(chat);
+                targetRealChats.push(chat);
             }
             chat.timestamp = Math.floor(Date.now() / 1000);
             chat.lastMessage = mockMsg;
-            proData.cachedChats = realChats;
+            targetProData.cachedChats = targetRealChats;
 
-            saveMessageToFirebase(targetJid, mockMsg);
-            saveChatToFirebase(targetJid, chat);
-            saveProData();
+            if (account !== 'friend') {
+                saveMessageToFirebase(targetJid, mockMsg);
+                saveChatToFirebase(targetJid, chat);
+            }
+            saveFunc();
 
             // Broadcast to client so other tabs update too
-            broadcast({ type: 'MESSAGES_UPSERT', data: { messages: [mockMsg] } });
-            broadcast({ type: 'INITIAL_SYNC', data: { chats: realChats } });
+            broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [mockMsg] } });
+            broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
 
             // Send via Baileys if connected
-            if (sock) {
+            if (targetSock) {
                 try {
-                    log('INFO', `Sending media to ${targetJid} via WhatsApp API`);
+                    log('INFO', `Sending media to ${targetJid} via WhatsApp API (${account || 'me'})`);
                     let waPayload: any = {};
                     if (utype === 'image' || file.mimetype.startsWith('image/')) {
                         waPayload = { image: file.buffer, caption: caption || '' };
@@ -2614,7 +3127,7 @@ async function initWASocket() {
                             fileName: file.originalname 
                         };
                     }
-                    const sent = await sock.sendMessage(targetJid, waPayload);
+                    const sent = await targetSock.sendMessage(targetJid, waPayload);
                     return res.json(sent);
                 } catch (e: any) {
                     log('ERROR', `Failed to send media/file over WhatsApp API: ${e?.message}`);
@@ -2888,32 +3401,57 @@ async function initWASocket() {
     });
 
     app.post('/api/logout', async (req, res) => {
-        log('INFO', 'Hard Logout Requested');
-        try {
-            if (sock) {
-                sock.ev.removeAllListeners('connection.update');
-                sock.ev.removeAllListeners('creds.update');
-                try { await sock.logout(); } catch (e) {}
-                sock.end(undefined);
-                sock = null;
-            }
-        } catch (e) {}
+        const { account } = req.body;
+        log('INFO', `Hard Logout Requested for account: ${account || 'me'}`);
         
-        const authDir = path.join(process.cwd(), 'auth_info_baileys');
-        cleanAuthDir(authDir);
-        
-        qrCode = null;
-        realChats = [];
-        proData.cachedChats = [];
-        saveProDataSync();
-        connectionState = 'close';
-        
-        broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
-        
-        setTimeout(async () => {
-             scheduleInit(0);
-             res.json({ status: 'Logged out successfully' });
-        }, 3000);
+        if (account === 'friend') {
+            try {
+                if (sockFriend) {
+                    sockFriend.ev.removeAllListeners('connection.update');
+                    sockFriend.ev.removeAllListeners('creds.update');
+                    try { await sockFriend.logout(); } catch (e) {}
+                    sockFriend.end(undefined);
+                    sockFriend = null;
+                }
+            } catch (e) {}
+
+            const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+            cleanAuthDir(authDirFriend);
+
+            qrCodeFriend = null;
+            // Keep friend's realChats and cachedChats permanently intact
+            connectionStateFriend = 'close';
+            broadcast({ type: 'LOGOUT_FRIEND', data: { message: 'Friend Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            setTimeout(async () => {
+                 initWASocketFriend();
+                 res.json({ status: 'Logged out Friend successfully' });
+            }, 3000);
+        } else {
+            try {
+                if (sock) {
+                    sock.ev.removeAllListeners('connection.update');
+                    sock.ev.removeAllListeners('creds.update');
+                    try { await sock.logout(); } catch (e) {}
+                    sock.end(undefined);
+                    sock = null;
+                }
+            } catch (e) {}
+
+            const authDir = path.join(process.cwd(), 'auth_info_baileys');
+            cleanAuthDir(authDir);
+
+            qrCode = null;
+            // Keep main user's realChats and cachedChats permanently intact to respect the "permanent offline data" request
+            saveProDataSync();
+            connectionState = 'close';
+            broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            setTimeout(async () => {
+                 scheduleInit(0);
+                 res.json({ status: 'Logged out successfully' });
+            }, 3000);
+        }
     });
 
     function getMediaKeyAndTimestamp(msg: any): string | null {
@@ -3136,6 +3674,25 @@ async function initWASocket() {
                 });
             }
 
+            // Friend Account Clean Filters
+            const cleanChatsFriend = (realChatsFriend || []).filter((c: any) => {
+                if (!c || !c.id) return false;
+                if (c.id === 'status@broadcast' || c.id === '0@s.whatsapp.net') return false;
+                if (c.id.endsWith('@lid')) return false;
+                const idNum = c.id.split('@')[0];
+                if (idNum.length < 7 || idNum.length > 20) return false;
+                return true;
+            });
+
+            const cleanContactsFriend: Record<string, any> = {};
+            if (proDataFriend.contacts) {
+                Object.keys(proDataFriend.contacts).forEach((key) => {
+                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') {
+                        cleanContactsFriend[key] = proDataFriend.contacts[key];
+                    }
+                });
+            }
+
             res.json({ 
                 state: connectionState, 
                 user: sock?.user,
@@ -3146,7 +3703,16 @@ async function initWASocket() {
                 statusUpdates: proData.statusUpdates,
                 supportPhoneNumber: process.env.WHATSAPP_PHONE_NUMBER || proData.settings?.phoneNumber || "12065550100", // FIXED (Pass support number)
                 latency: '14ms', 
-                uptimes: process.uptime()
+                uptimes: process.uptime(),
+                friend: {
+                    state: connectionStateFriend,
+                    user: sockFriend?.user,
+                    qrCode: qrCodeFriend,
+                    isRegistered: sockFriend?.authState.creds.registered,
+                    chats: cleanChatsFriend,
+                    contacts: cleanContactsFriend,
+                    statusUpdates: proDataFriend.statusUpdates
+                }
             });
         } catch (error: any) {
             res.status(500).json({ error: error.message });
