@@ -50,7 +50,7 @@ const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fil
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 const logger = pino({ level: 'silent' });
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
 
 const app = express(); // FIXED (Move globally)
