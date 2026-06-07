@@ -1346,11 +1346,18 @@ export default function App() {
 
   const connectWebSocket = () => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    // FIXED: Use VITE_BACKEND_WS_URL env var so WebSocket goes directly to backend
+    // (Vercel cannot proxy WebSocket — this was why QR never loaded on Vercel+Railway split)
+    const backendWsUrl = import.meta.env.VITE_BACKEND_WS_URL
+      ? import.meta.env.VITE_BACKEND_WS_URL
+      : `${protocol}//${window.location.host}`;
+    const socket = new WebSocket(backendWsUrl);
     ws.current = socket;
 
-    socket.onerror = () => {
-      // Quietly suppress websocket errors to prevent browser console pollution
+    socket.onerror = (err) => {
+      // FIXED: Log WS errors instead of silently swallowing them
+      // Frontend will automatically fall back to HTTP polling for QR
+      console.warn("[WhatsApp Pro] WebSocket connection failed. Falling back to polling mode.", err);
     };
 
     socket.onclose = () => {
