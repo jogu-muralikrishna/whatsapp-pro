@@ -1,7239 +1,4115 @@
-import React, { useState, useEffect, useRef } from "react";
+import express from 'express';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import makeWASocket, { 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore,
+    WAConnectionState,
+    ConnectionState,
+    Browsers,
+    downloadMediaMessage
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import { Boom } from '@hapi/boom';
+import cron from 'node-cron';
+import sharp from 'sharp';
+import { parseISO, isAfter } from 'date-fns';
+import { GoogleGenAI } from "@google/genai";
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore/lite';
+import { 
+    firebase_cloud_system_enabled, 
+    firebase_backup_enabled,
+    setFirebaseEnabledState,
+    saveSettingsToBackup,
+    saveChatToBackup,
+    saveMessageToBackup,
+    saveCallToBackup,
+    saveStatusToBackup,
+    runFullBackup,
+    saveLocalBackup,
+    runFullRestore,
+    getBackupMetadata,
+    secretAdminQuery,
+    buildFirestorePath,
+    checkQuotaError,
+    isSyncPermitted
+} from './server_backup';
+import { DatabaseService } from './src/DatabaseService.js';
+import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
+import cors from 'cors';
+import { randomUUID } from 'crypto';
 
-// ── Multi-user: generate/retrieve a persistent session ID for this browser ──
-function getSessionId(): string {
-  let sid = localStorage.getItem('wp_session_id');
-  if (!sid) {
-    sid = crypto.randomUUID();
-    localStorage.setItem('wp_session_id', sid);
-  }
-  return sid;
-}
-const SESSION_ID = getSessionId();
+const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
+const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
-// ── API fetch wrapper: automatically adds x-session-id to every request ──
-async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(options.headers || {});
-  headers.set('x-session-id', SESSION_ID);
-  return fetch(url, { ...options, headers });
-}
-import {
-  Phone,
-  Send,
-  Search,
-  Plus,
-  Clock,
-  Settings,
-  MoreVertical,
-  ChevronLeft,
-  ChevronRight,
-  Monitor,
-  Zap,
-  Trash2,
-  Lock,
-  Unlock,
-  Star,
-  Check,
-  QrCode as QrCodeIcon,
-  RefreshCw,
-  MessageSquare,
-  MessageCircle,
-  User,
-  Camera,
-  Video,
-  X,
-  Sparkles,
-  ShieldCheck,
-  Shield,
-  ShieldAlert,
-  Activity,
-  History,
-  FileText,
-  Download,
-  Image as ImageIcon,
-  PlayCircle,
-  Music,
-  Paperclip,
-  Mic,
-  Square,
-  Forward,
-  Pause,
-  Play,
-  Smile,
-  MicOff,
-  PhoneOff,
-  Edit,
-} from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
-import { format } from "date-fns";
-import QRCode from "react-qr-code";
-import { SecretAdminPanel } from "./components/SecretAdminPanel";
-import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
-import { db as clientDb } from "./lib/firebaseClient";
+const logger = pino({ level: 'silent' });
+const BASE_DATA_DIR = process.env.DATA_DIR || process.cwd();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DATA_FILE = path.join(BASE_DATA_DIR, 'pro_data.json');
 
-const API_BASE = "";
-const WS_BASE = "";
+// ═══════════════════════════════════════════════════════════════
+// MULTI-USER SESSION REGISTRY
+// Each browser gets a unique sessionId (UUID) via X-Session-ID header.
+// All state (sock, proData, qrCode, realChats, etc.) lives inside
+// the session object — completely isolated per user.
+// ═══════════════════════════════════════════════════════════════
+const sessions = new Map<string, any>();
 
-function maskAdminEmail(email: string): string {
-  if (!email) return "Authorized Administrator";
-  if (!email.includes("@")) return "Authorized Administrator";
-  const [local, domain] = email.split("@");
-  if (local.length <= 3) {
-    return `${local[0]}***@${domain}`;
-  }
-  return `${local.substring(0, 3)}***${local.slice(-1)}@${domain}`;
-}
-
-function safeFormat(
-  dateVal: any,
-  formatStr: string,
-  fallback: string = "",
-): string {
-  if (dateVal === undefined || dateVal === null) return fallback;
-  try {
-    let d: Date;
-    if (typeof dateVal === "number") {
-      const val = dateVal < 100000000000 ? dateVal * 1000 : dateVal;
-      d = new Date(val);
-    } else {
-      d = new Date(dateVal);
+function getOrCreateSession(sessionId: string): any {
+    if (sessions.has(sessionId)) return sessions.get(sessionId);
+    const sessDir = path.join(BASE_DATA_DIR, 'sessions', sessionId);
+    fs.mkdirSync(sessDir, { recursive: true });
+    const session: any = {
+        id: sessionId,
+        dir: sessDir,
+        sock: null,
+        sockFriend: null,
+        realChats: [],
+        realChatsFriend: [],
+        qrCode: null,
+        qrCodeFriend: null,
+        connectionState: 'close',
+        connectionStateFriend: 'close',
+        wsClients: new Set<WebSocket>(),
+        isInitializing: false,
+        isInitializingFriend: false,
+        initTimeout: null,
+        consecutiveBadSessions: 0,
+        consecutiveStreamErrors: 0,
+        lastInteractionTime: Date.now(),
+        healthCheckInterval: null,
+        proData: createDefaultProData(),
+        proDataFriend: createDefaultProData(),
+        saveProDataTimeout: null,
+        saveProDataFriendTimeout: null,
+    };
+    // Load persisted data if exists
+    const dataFile = path.join(sessDir, 'pro_data.json');
+    if (fs.existsSync(dataFile)) {
+        try { session.proData = { ...session.proData, ...JSON.parse(fs.readFileSync(dataFile, 'utf-8')) }; } catch(e) {}
     }
-    if (isNaN(d.getTime())) {
-      return fallback;
+    const dataFileFriend = path.join(sessDir, 'pro_data_friend.json');
+    if (fs.existsSync(dataFileFriend)) {
+        try { session.proDataFriend = { ...session.proDataFriend, ...JSON.parse(fs.readFileSync(dataFileFriend, 'utf-8')) }; } catch(e) {}
     }
-    return format(d, formatStr);
-  } catch (e) {
-    return fallback;
-  }
-}
-
-interface Chat {
-  id: string;
-  name: string;
-  lastMessage?: any;
-  unreadCount?: number;
-  timestamp?: number;
-  isGroup?: boolean;
+    session.realChats = session.proData.cachedChats || [];
+    session.realChatsFriend = session.proDataFriend.cachedChats || [];
+    sessions.set(sessionId, session);
+    console.log(`[Session] New session created: ${sessionId}`);
+    return session;
 }
 
-interface Message {
-  id: string;
-  sender: string;
-  text: string;
-  timestamp: number;
-  fromMe: boolean;
-  status: "sent" | "delivered" | "read";
-  rawMessage?: any;
-}
-
-type Tab = "CHATS" | "STATUS" | "CALLS" | "RECORDS" | "SETTINGS";
-
-export default function App() {
-  const [phoneNumber, setPhoneNumber] = useState("");
-  const [pairingCode, setPairingCode] = useState("");
-  const [qrCode, setQrCode] = useState<string | null>(null);
-  const [loginMethod, setLoginMethod] = useState<"pairing" | "qr">("pairing");
-  const [connectionState, setConnectionState] = useState<
-    "close" | "connecting" | "open"
-  >("close");
-  const [user, setUser] = useState<any>(null);
-  const [chats, setChats] = useState<Chat[]>([]);
-  const [activeChat, setActiveChat] = useState<Chat | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [newMessage, setNewMessage] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>("CHATS");
-  const [engineLogs, setEngineLogs] = useState<any[]>([]);
-  const [callRecords, setCallRecords] = useState<any[]>([]);
-
-  const fetchCallRecords = async () => {
-    try {
-      const res = await apiFetch("/api/calls/records");
-      if (res.ok) {
-        const data = await res.json();
-        setCallRecords(data);
-      }
-    } catch (e) {}
-  };
-
-  useEffect(() => {
-    if (activeTab === "RECORDS") {
-      fetchCallRecords();
-    }
-  }, [activeTab]);
-  const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
-  const [contacts, setContacts] = useState<Record<string, any>>({});
-  const [lidToPnMap, setLidToPnMap] = useState<Record<string, string>>({});
-  const [isAiLoading, setIsAiLoading] = useState(false);
-  const [selectedAccount, setSelectedAccount] = useState<"me" | "friend">("me");
-  const [phoneNumberFriend, setPhoneNumberFriend] = useState("");
-  const [pairingCodeFriend, setPairingCodeFriend] = useState("");
-  const [qrCodeFriend, setQrCodeFriend] = useState<string | null>(null);
-  const [loginMethodFriend, setLoginMethodFriend] = useState<"pairing" | "qr">("pairing");
-  const [connectionStateFriend, setConnectionStateFriend] = useState<"close" | "connecting" | "open">("close");
-  const [userFriend, setUserFriend] = useState<any>(null);
-  const [chatsFriend, setChatsFriend] = useState<Chat[]>([]);
-  const [activeChatFriend, setActiveChatFriend] = useState<Chat | null>(null);
-  const [messagesFriend, setMessagesFriend] = useState<Message[]>([]);
-  const [waLinkPhone, setWaLinkPhone] = useState("12065550100"); // FIXED
-  const [waLinkMessage, setWaLinkMessage] = useState("Hello! I need support with WhatsApp Pro."); // FIXED
-  const [waConnectMode, setWaConnectMode] = useState<"engine" | "direct">("engine"); // FIXED
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [showMsgSearch, setShowMsgSearch] = useState(false);
-  const [msgSearchQuery, setMsgSearchQuery] = useState("");
-  const [showSettings, setShowSettings] = useState(false);
-  const [callHistory, setCallHistory] = useState<any[]>([]);
-  const [proSettings, setProSettings] = useState({
-    ghostMode: false,
-    antiDelete: true,
-    antiDeleteStatus: true,
-    hideNumbers: false,
-    hideBlueTicks: false,
-    hideSecondTick: false,
-    hideTyping: false,
-    secretStatusView: true,
-    dndMode: false,
-    autoReply: false,
-    theme: "elegant-dark",
-    font: "Inter",
-    callRecordingEnabled: false,
-  });
-  const [scheduledMsgs, setScheduledMsgs] = useState<any[]>([]);
-  const [autoReplies, setAutoReplies] = useState<any[]>([]);
-  const [interceptedStatuses, setInterceptedStatuses] = useState<any[]>([]);
-  const [lockedChats, setLockedChats] = useState<string[]>([]);
-
-  // File Upload / Attachment state hooks
-  const [showAttachmentMenu, setShowAttachmentMenu] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [showUploadPreview, setShowUploadPreview] = useState(false);
-  const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(
-    null,
-  );
-  const [uploadFileType, setUploadFileType] = useState<
-    "image" | "video" | "audio" | "document"
-  >("document");
-  const [uploadCaption, setUploadCaption] = useState("");
-  const attachmentButtonRef = useRef<HTMLButtonElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
-  const emojiButtonRef = useRef<HTMLButtonElement>(null);
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setSelectedUploadFile(file);
-
-    if (file.type.startsWith("image/")) {
-      setUploadFileType("image");
-    } else if (file.type.startsWith("video/")) {
-      setUploadFileType("video");
-    } else if (file.type.startsWith("audio/")) {
-      setUploadFileType("audio");
-    } else {
-      setUploadFileType("document");
-    }
-
-    setShowUploadPreview(true);
-    setShowAttachmentMenu(false);
-  };
-
-  const triggerFileSelection = (
-    type: "image" | "video" | "audio" | "document",
-  ) => {
-    setUploadFileType(type);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ""; // Reset value to guarantee onChange fires on same file
-      if (type === "image") {
-        fileInputRef.current.accept = "image/*";
-      } else if (type === "video") {
-        fileInputRef.current.accept = "video/*";
-      } else if (type === "audio") {
-        fileInputRef.current.accept = "audio/*";
-      } else {
-        fileInputRef.current.removeAttribute("accept");
-      }
-      fileInputRef.current.click();
-    }
-  };
-
-  const handleUploadAndSend = async () => {
-    const currentActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
-    if (!selectedUploadFile || !currentActiveChat) return;
-    setIsUploading(true);
-    const formData = new FormData();
-    formData.append("file", selectedUploadFile);
-    formData.append("jid", currentActiveChat.id);
-    formData.append("caption", uploadCaption);
-    formData.append("type", uploadFileType);
-    formData.append("account", selectedAccount);
-
-    try {
-      const res = await apiFetch("/api/send-media", {
-        method: "POST",
-        body: formData,
-      });
-      if (res.ok) {
-        setSelectedUploadFile(null);
-        setUploadCaption("");
-        setShowUploadPreview(false);
-      } else {
-        const errData = await res.json();
-        setError(errData.error || "Failed to transfer core media packet");
-      }
-    } catch (err: any) {
-      setError("Connection to node lost: failed to send file");
-    } finally {
-      setIsUploading(false);
-    }
-  };
-
-  // Tactical Cloud Backup & Administration gesture state hooks
-  const [adminTapCount, setAdminTapCount] = useState(0);
-  const [showAdminConsole, setShowAdminConsole] = useState(false);
-  const [backupStatus, setBackupStatus] = useState<any>(null);
-  const [isBackupLoading, setIsBackupLoading] = useState(false);
-  const [backupError, setBackupError] = useState<string | null>(null);
-
-  const [adminAccessAlert, setAdminAccessAlert] = useState<{
-    id: string;
-    timestamp: string;
-    adminEmail: string;
-  } | null>(null);
-  const [alertDismissCountdown, setAlertDismissCountdown] = useState(0);
-
-  // Real-time Administrator Access Transparency Listener
-  useEffect(() => {
-    if (!backupStatus?.phone || !clientDb) return;
-
-    try {
-      const cleanPhone = backupStatus.phone.replace(/[^0-9]/g, "");
-      const notificationsRef = collection(
-        clientDb,
-        `users/${cleanPhone}/admin_access_notifications`,
-      );
-      const q = query(notificationsRef, orderBy("timestamp", "desc"));
-
-      const unsubscribe = onSnapshot(
-        q,
-        (snapshot) => {
-          snapshot.docChanges().forEach((change) => {
-            if (change.type === "added") {
-              const notifData = change.doc.data();
-              const timestamp = notifData.timestamp
-                ? new Date(notifData.timestamp.seconds * 1000).toLocaleString()
-                : new Date().toLocaleString();
-
-              // Engage active visual overlay with non-dismissible countdown
-              setAdminAccessAlert({
-                id: change.doc.id,
-                timestamp,
-                adminEmail: notifData.admin_email || "Authorized Administrator",
-              });
-              setAlertDismissCountdown(5);
-            }
-          });
+function createDefaultProData() {
+    return {
+        scheduledMessages: [] as any[],
+        autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
+        messageHistory: {} as Record<string, any[]>,
+        callHistory: [] as any[],
+        callRecords: [] as any[],
+        statusUpdates: [] as any[],
+        deletedStatuses: [] as any[],
+        recycleBin: { messages: [] as any[], chats: [] as any[] },
+        favorites: [] as string[],
+        lockedChats: [] as string[],
+        cachedChats: [] as any[],
+        contacts: {} as Record<string, any>,
+        lidToPnMap: {} as Record<string, string>,
+        settings: {
+            autoTranslate: false, theme: 'elegant-dark', font: 'Inter',
+            aiContext: 'Professional Assistant', ghostMode: false, antiDelete: true,
+            antiDeleteStatus: true, hideNumbers: false, hideBlueTicks: false,
+            hideSecondTick: false, hideTyping: false, secretStatusView: true,
+            dndMode: false, autoReply: false, phoneNumber: '', firebaseBackupEnabled: false
         },
-        (err) => {
-          // Silently fail or log debug if database/permission error
-          const isDbNotFound = err.message.toLowerCase().includes("database") || err.message.toLowerCase().includes("not-found") || err.message.toLowerCase().includes("permission");
-          if (!isDbNotFound) {
-            console.warn(
-              "Transparency listener suspended:",
-              err.message,
-            );
-          }
-        },
-      );
-
-      return () => unsubscribe();
-    } catch (e: any) {
-      console.warn("Failed to register tactical transparency listener:", e);
-    }
-  }, [backupStatus?.phone]);
-
-  // Countdown interval timer
-  useEffect(() => {
-    if (alertDismissCountdown <= 0) return;
-    const interval = setInterval(() => {
-      setAlertDismissCountdown((prev) => prev - 1);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [alertDismissCountdown]);
-
-  const fetchBackupStatus = async () => {
-    try {
-      const res = await apiFetch("/api/firebase-backup/status");
-      const data = await res.json();
-      if (res.ok) {
-        setBackupStatus(data);
-      }
-    } catch (e) {}
-  };
-
-  const handleAdminTap = () => {
-    setAdminTapCount((prev) => {
-      const next = prev + 1;
-      if (next >= 7) {
-        setShowAdminConsole(true);
-        return 0;
-      }
-      return next;
-    });
-  };
-  const [showLockedChats, setShowLockedChats] = useState(false);
-  const [activeCallSession, setActiveCallSession] = useState<{
-    jid: string;
-    recipientName: string;
-    status: "ringing" | "connected" | "ended";
-    duration: number;
-    isMuted: boolean;
-    isVideo: boolean;
-  } | null>(null);
-  const [showPasscodeModal, setShowPasscodeModal] = useState(false);
-  const [enteredPasscode, setEnteredPasscode] = useState("");
-  const [reactingMsgId, setReactingMsgId] = useState<string | null>(null);
-  const [selectedScheduleJid, setSelectedScheduleJid] = useState<string>("");
-  const [deleteOptionModal, setDeleteOptionModal] = useState<{
-    msgId: string;
-    visible: boolean;
-  } | null>(null);
-  const [isProfileEditorOpen, setIsProfileEditorOpen] = useState(false);
-  const [profileName, setProfileName] = useState("");
-  const [profileBio, setProfileBio] = useState("");
-  const [showRecycleBin, setShowRecycleBin] = useState(false);
-  const [recycleBinData, setRecycleBinData] = useState<{
-    messages: any[];
-    chats: any[];
-  }>({ messages: [], chats: [] });
-  const [showContactInfo, setShowContactInfo] = useState(false);
-  const [chatSubTab, setChatSubTab] = useState<
-    "ALL" | "UNREAD" | "FAVORITES" | "GROUPS" | "VERIFIED" | "NEW" | "LOCKED"
-  >("ALL");
-  const [userLockPin, setUserLockPin] = useState<string>(() => {
-    try {
-      return localStorage.getItem("userLockPin") || "1234";
-    } catch (e) {
-      return "1234";
-    }
-  });
-  const [showLockSetupModal, setShowLockSetupModal] = useState(false);
-  const [selectedContactsToLock, setSelectedContactsToLock] = useState<string[]>([]);
-  const [newLockPinInput, setNewLockPinInput] = useState("");
-  const [confirmLockPinInput, setConfirmLockPinInput] = useState("");
-  const [showUnlockPinPromptModal, setShowUnlockPinPromptModal] = useState(false);
-  const [unlockPinInput, setUnlockPinInput] = useState("");
-  const [verifiedConstantActive, setVerifiedConstantActive] = useState(false);
-  const [helpProblemText, setHelpProblemText] = useState("");
-  const [helpCategory, setHelpCategory] = useState("Bug Report / Connection Reset");
-  const [isSubmittingHelp, setIsSubmittingHelp] = useState(false);
-  const [helpTicketId, setHelpTicketId] = useState<string | null>(null);
-  const [favorites, setFavorites] = useState<string[]>([]);
-  const [rowMenuChatId, setRowMenuChatId] = useState<string | null>(null);
-  const [pendingLockedChatToLoad, setPendingLockedChatToLoad] = useState<any | null>(null);
-  const [editingContact, setEditingContact] = useState<{
-    id: string;
-    name: string;
-  } | null>(null);
-  const [showStatusModal, setShowStatusModal] = useState(false);
-  const [groupMetadata, setGroupMetadata] = useState<any>(null);
-  const [statusUpdates, setStatusUpdates] = useState<any[]>([]);
-  const [activeStatus, setActiveStatus] = useState<any>(null);
-  const [statusProgress, setStatusProgress] = useState(0);
-  const [isStatusPaused, setIsStatusPaused] = useState(false);
-  const [statusDuration, setStatusDuration] = useState(6500);
-  const elapsedRef = useRef(0);
-  const [statusText, setStatusText] = useState("");
-  const [statusImage, setStatusImage] = useState<string | null>(null);
-  const [statusReplyText, setStatusReplyText] = useState("");
-  const [profilePictures, setProfilePictures] = useState<
-    Record<string, string>
-  >({});
-  const [starredMessages, setStarredMessages] = useState<any[]>([]);
-  const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
-  const [isMainMenuOpen, setIsMainMenuOpen] = useState(false);
-  const [settingsView, setSettingsView] = useState<
-    | "main"
-    | "notifications"
-    | "chats"
-    | "guides"
-    | "lists"
-    | "privacy"
-    | "accounts"
-    | "language"
-    | "keyboard"
-    | "help"
-  >("main");
-
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [showForwardModal, setShowForwardModal] = useState(false);
-  const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
-
-  const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
-  const [showScheduleModal, setShowScheduleModal] = useState(false);
-  const [scheduleData, setScheduleData] = useState({ text: "", time: "" });
-  const [newAutoReply, setNewAutoReply] = useState({
-    keyword: "",
-    response: "",
-  });
-
-  const ws = useRef<WebSocket | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const activeChatRef = useRef<Chat | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordingTimerRef = useRef<any>(null);
-  const failedPictures = useRef<Set<string>>(new Set());
-
-  useEffect(() => {
-    activeChatRef.current = activeChat;
-  }, [activeChat]);
-
-  useEffect(() => {
-    if (activeStatus) {
-      elapsedRef.current = 0;
-      setStatusProgress(0);
-      setIsStatusPaused(false);
-      if (activeStatus.message?.videoMessage) {
-        setStatusDuration(15000); // default 15s for video, will be updated by handleMediaLoaded
-      } else if (activeStatus.message?.audioMessage) {
-        setStatusDuration(10000); // default 10s for audio
-      } else {
-        setStatusDuration(6500); // standard 6.5s image/text duration
-      }
-    } else {
-      elapsedRef.current = 0;
-      setStatusProgress(0);
-    }
-  }, [activeStatus]);
-
-  useEffect(() => {
-    if (!activeStatus) return;
-
-    const intervalTime = 50;
-    const tick = setInterval(() => {
-      if (isStatusPaused) {
-        return;
-      }
-
-      elapsedRef.current += intervalTime;
-      const pct = Math.min((elapsedRef.current / statusDuration) * 100, 100);
-      setStatusProgress(pct);
-
-      if (elapsedRef.current >= statusDuration) {
-        clearInterval(tick);
-        elapsedRef.current = 0;
-        
-        const chronological = statusUpdates
-          .filter((s) => s.participant === activeStatus.participant)
-          .slice()
-          .reverse();
-        const idx = chronological.findIndex((s) => s.id === activeStatus.id);
-        if (idx !== -1 && idx < chronological.length - 1) {
-          setActiveStatus(chronological[idx + 1]);
-        } else {
-          setActiveStatus(null);
-        }
-      }
-    }, intervalTime);
-
-    return () => clearInterval(tick);
-  }, [activeStatus, isStatusPaused, statusDuration, statusUpdates]);
-
-  useEffect(() => {
-    if (!activeCallSession) return;
-
-    let timer: NodeJS.Timeout | null = null;
-    let connectTimeout: NodeJS.Timeout | null = null;
-
-    if (activeCallSession.status === "ringing") {
-      connectTimeout = setTimeout(() => {
-        setActiveCallSession((prev) =>
-          prev ? { ...prev, status: "connected" } : null,
-        );
-      }, 1500);
-    } else if (activeCallSession.status === "connected") {
-      timer = setInterval(() => {
-        setActiveCallSession((prev) =>
-          prev ? { ...prev, duration: prev.duration + 1 } : null,
-        );
-      }, 1000);
-    }
-
-    return () => {
-      if (timer) clearInterval(timer);
-      if (connectTimeout) clearTimeout(connectTimeout);
+        logs: [] as { time: string, level: string, msg: string }[]
     };
-  }, [activeCallSession?.status]);
+}
 
-  useEffect(() => {
-    connectWebSocket();
-    // Notify backend to initialize this session's WhatsApp engine
-    apiFetch('/api/session/init', { method: 'POST' }).catch(() => {});
-    checkConnectionStatus();
-    fetchLogs();
-    fetchSettings();
-    fetchBackupStatus(); // Extract backup status metadata on initialization
-    fetchCallHistory();
-    fetchStatusUpdates();
-    fetchFavorites();
-    fetchLockedChats();
-    fetchAutoReplies();
-    fetchScheduledMsgs();
-    const logInterval = setInterval(fetchLogs, 5000);
-    const statusInterval = setInterval(checkConnectionStatus, 4000); // Polling status check fallback for external device framing
-    return () => {
-      ws.current?.close();
-      clearInterval(logInterval);
-      clearInterval(statusInterval);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (showSettings) {
-      fetchBackupStatus();
-    }
-  }, [showSettings]);
-
-  const fetchAutoReplies = async () => {
-    try {
-      const res = await apiFetch("/api/auto-replies");
-      const data = await res.json();
-      setAutoReplies(data);
-    } catch (e) {}
-  };
-
-  const fetchScheduledMsgs = async () => {
-    try {
-      const res = await apiFetch("/api/scheduled-messages");
-      const data = await res.json();
-      setScheduledMsgs(data);
-    } catch (e) {}
-  };
-
-  useEffect(() => {
-    // Apply Font
-    document.documentElement.style.setProperty(
-      "--engine-font",
-      proSettings.font || "Inter",
-    );
-
-    // Apply Theme
-    const themes: any = {
-      "elegant-dark": {
-        primary: "#00e676",
-        bg: "#000000",
-        surface: "#0d0d0d",
-        accent: "#161619",
-      },
-      "matrix-green": {
-        primary: "#22c55e",
-        bg: "#000000",
-        surface: "#050505",
-        accent: "#0c0a09",
-      },
-      "cyber-blue": {
-        primary: "#00f2ff",
-        bg: "#020617",
-        surface: "#0f172a",
-        accent: "#1e293b",
-      },
-      "royal-purple": {
-        primary: "#a855f7",
-        bg: "#0f0714",
-        surface: "#1a0b2e",
-        accent: "#2d1b4e",
-      },
-      "blood-red": {
-        primary: "#ef4444",
-        bg: "#0a0a0a",
-        surface: "#171717",
-        accent: "#262626",
-      },
-    };
-
-    const theme = themes[proSettings.theme] || themes["elegant-dark"];
-    document.documentElement.style.setProperty(
-      "--color-primary",
-      theme.primary,
-    );
-    document.documentElement.style.setProperty("--color-bg", theme.bg);
-    document.documentElement.style.setProperty(
-      "--color-surface",
-      theme.surface,
-    );
-    document.documentElement.style.setProperty("--color-accent", theme.accent);
-  }, [proSettings.theme, proSettings.font]);
-
-  const fetchStatusUpdates = async () => {
-    try {
-      const res = await apiFetch("/api/status-updates");
-      const data = await res.json();
-      setStatusUpdates(data.active || []);
-      setInterceptedStatuses(data.intercepted || []);
-    } catch (e) {}
-  };
-
-  const fetchCallHistory = async () => {
-    try {
-      const res = await apiFetch("/api/history/calls");
-      const data = await res.json();
-      setCallHistory(data);
-    } catch (e) {}
-  };
-
-  const fetchRecycleBin = async () => {
-    try {
-      const res = await apiFetch("/api/recycle-bin");
-      const data = await res.json();
-      setRecycleBinData(data);
-    } catch (e) {}
-  };
-
-  const fetchSettings = async () => {
-    try {
-      const res = await apiFetch("/api/settings");
-      const data = await res.json();
-      setProSettings(data);
-      if (data && data.phoneNumber) {
+function saveSessionProData(session: any, isFriend = false) {
+    const key = isFriend ? 'saveProDataFriendTimeout' : 'saveProDataTimeout';
+    const dataKey = isFriend ? 'proDataFriend' : 'proData';
+    const fileName = isFriend ? 'pro_data_friend.json' : 'pro_data.json';
+    if (session[key]) clearTimeout(session[key]);
+    session[key] = setTimeout(() => {
+        session[key] = null;
         try {
-          const pinRes = await apiFetch(`/api/phone-lock-pin?phone=${encodeURIComponent(data.phoneNumber)}`);
-          const pinData = await pinRes.json();
-          if (pinData.success && pinData.pin) {
-            setUserLockPin(pinData.pin);
-            try {
-              localStorage.setItem("userLockPin", pinData.pin);
-            } catch (e) {}
-          }
-        } catch (err) {}
-      }
-    } catch (e) {}
-  };
-
-  const fetchFavorites = async () => {
-    try {
-      const res = await apiFetch("/api/favorites");
-      const data = await res.json();
-      setFavorites(data);
-    } catch (e) {}
-  };
-
-  const fetchLockedChats = async () => {
-    try {
-      const res = await apiFetch("/api/locked-chats");
-      const data = await res.json();
-      setLockedChats(data);
-    } catch (e) {}
-  };
-
-  const fetchGroupMetadata = async (jid: string) => {
-    if (!jid.endsWith("@g.us")) return;
-    try {
-      const res = await apiFetch(`/api/group-metadata/${jid}`);
-      const data = await res.json();
-      setGroupMetadata(data);
-    } catch (e) {}
-  };
-
-  const toggleLockChat = async (chatId: string) => {
-    const isLocked = lockedChats.includes(chatId);
-    try {
-      const res = await apiFetch("/api/lock-chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId, lock: !isLocked }),
-      });
-      const data = await res.json();
-      setLockedChats(data.lockedChats);
-      if (!isLocked && activeChat?.id === chatId) {
-        setActiveChat(null);
-      }
-    } catch (e) {}
-  };
-
-  const updateProfile = async () => {
-    setLoading(true);
-    try {
-      await apiFetch("/api/update-profile", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: profileName, bio: profileBio }),
-      });
-      setIsProfileEditorOpen(false);
-      checkConnectionStatus();
-    } catch (e) {}
-    setLoading(false);
-  };
-  const uploadProfilePicture = async (
-    e: React.ChangeEvent<HTMLInputElement>,
-  ) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (re: any) => {
-      const base64 = re.target.result;
-      try {
-        const res = await apiFetch("/api/update-profile-picture", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ image: base64 }),
-        });
-        if (res.ok) {
-          checkConnectionStatus(); // Refresh user info
-          setError("Biometric Visual updated in Matrix.");
-        }
-      } catch (err) {
-        setError("Failed to transmit visual data.");
-      }
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const [previewPhotoUrl, setPreviewPhotoUrl] = useState<string | null>(null);
-  const [selectedPhotoFile, setSelectedPhotoFile] = useState<File | null>(null);
-  const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
-  const profilePhotoInputRef = useRef<HTMLInputElement>(null);
-
-  const handlePhotoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setSelectedPhotoFile(file);
-      const url = URL.createObjectURL(file);
-      setPreviewPhotoUrl(url);
-    }
-  };
-
-  const confirmPhotoUpload = async () => {
-    if (!selectedPhotoFile) return;
-    setIsUploadingPhoto(true);
-    const formData = new FormData();
-    formData.append("image", selectedPhotoFile);
-
-    try {
-      const res = await apiFetch("/api/profile/picture", {
-        method: "POST",
-        body: formData,
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.url) {
-          const ownJid = user?.id ? (user.id.split(":")[0] + "@s.whatsapp.net") : "me@s.whatsapp.net";
-          setProfilePictures((prev) => ({
-            ...prev,
-            [ownJid]: data.url,
-            "me@s.whatsapp.net": data.url,
-          }));
-          
-          setPreviewPhotoUrl(null);
-          setSelectedPhotoFile(null);
-          setError("Profile portrait updated successfully.");
-        }
-      } else {
-        setError("Error transmitting portrait data file.");
-      }
-    } catch (err) {
-      setError("Failed to transmit image file.");
-    } finally {
-      setIsUploadingPhoto(false);
-    }
-  };
-
-  const fetchProfilePicture = async (jid: string) => {
-    if (profilePictures[jid] || failedPictures.current.has(jid)) return;
-    try {
-      const res = await apiFetch(`/api/profile-picture?jid=${jid}`);
-      const data = await res.json();
-      if (data.url) {
-        setProfilePictures((prev) => ({ ...prev, [jid]: data.url }));
-      } else {
-        failedPictures.current.add(jid);
-      }
-    } catch (e) {
-      failedPictures.current.add(jid);
-    }
-  };
-
-  const readAll = async () => {
-    try {
-      setChats((prev) => prev.map((c) => ({ ...c, unreadCount: 0 })));
-      await apiFetch("/api/read-all", { method: "POST" });
-    } catch (e) {}
-  };
-
-  const [isCallRecording, setIsCallRecording] = useState(false);
-
-  const toggleCallRecording = async () => {
-    if (!activeCallSession) return;
-    const newRecordingState = !isCallRecording;
-    const action = newRecordingState ? "start" : "stop";
-    
-    try {
-      const res = await apiFetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action,
-          from: "me@s.whatsapp.net",
-          to: activeCallSession.jid,
-          type: activeCallSession.isVideo ? "video" : "audio",
-          duration: activeCallSession.duration,
-          contactName: activeCallSession.recipientName
-        })
-      });
-      if (res.ok) {
-        setIsCallRecording(newRecordingState);
-      }
-    } catch (err) {}
-  };
-
-  const startInAppCall = (chatId: string, isVideo: boolean = false) => {
-    const chat = chats.find((c) => c.id === chatId);
-    const recipientName = chat ? getDisplayName(chat) : chatId.split("@")[0];
-
-    setIsCallRecording(false);
-    setActiveCallSession({
-      jid: chatId,
-      recipientName,
-      status: "ringing",
-      duration: 0,
-      isMuted: false,
-      isVideo,
-    });
-  };
-
-  const endInAppCall = async () => {
-    if (!activeCallSession) return;
-    
-    if (isCallRecording) {
-      try {
-        await apiFetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "stop",
-            from: "me@s.whatsapp.net",
-            to: activeCallSession.jid,
-            type: activeCallSession.isVideo ? "video" : "audio",
-            duration: activeCallSession.duration,
-            contactName: activeCallSession.recipientName
-          })
-        });
-      } catch (err) {}
-      setIsCallRecording(false);
-    }
-
-    const finalSession = { ...activeCallSession, status: "ended" };
-    setActiveCallSession(finalSession);
-
-    try {
-      const res = await apiFetch("/api/add-call", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jid: finalSession.jid,
-          type: finalSession.isVideo ? "video" : "audio",
-          date: new Date().toISOString(),
-          duration: finalSession.duration,
-          status: "connected",
-          fromMe: true,
-        }),
-      });
-      if (res.ok) {
-        fetchCallHistory();
-      }
-    } catch (e) {}
-
-    setTimeout(() => {
-      setActiveCallSession(null);
-    }, 800);
-  };
-
-  const restoreChat = async (chatId: string) => {
-    try {
-      await apiFetch("/api/restore-chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId }),
-      });
-      fetchRecycleBin();
-      checkConnectionStatus(); // Refresh chat list
-    } catch (e) {}
-  };
-
-  const restoreMessage = async (msgId: string) => {
-    try {
-      await apiFetch("/api/restore-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ msgId }),
-      });
-      fetchRecycleBin();
-    } catch (e) {}
-  };
-
-  const toggleFavorite = async (chatId: string) => {
-    try {
-      const res = await apiFetch("/api/favorite-chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId }),
-      });
-      const data = await res.json();
-      setFavorites(data.favorites);
-    } catch (e) {}
-  };
-
-  const clearChat = async (chatId: string) => {
-    try {
-      await apiFetch("/api/clear-chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId }),
-      });
-      if (activeChat?.id === chatId) setMessages([]);
-    } catch (e) {}
-  };
-
-  const updateContact = async (id: string, name: string) => {
-    let jid = id;
-    if (!jid.includes("@")) jid = `${jid}@s.whatsapp.net`;
-    else if (jid.endsWith("@c.us")) jid = jid.replace("@c.us", "@s.whatsapp.net");
-
-    // Pre-emptively update UI state
-    setContacts((prev) => ({
-      ...prev,
-      [jid]: { ...(prev[jid] || {}), id: jid, name },
-    }));
-
-    try {
-      await apiFetch("/api/update-contact", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: jid, name }),
-      });
-      setEditingContact(null);
-    } catch (e) {}
-  };
-
-  const downloadMedia = async (
-    msgId: string,
-    chatId: string,
-    filename: string,
-  ) => {
-    try {
-      const res = await fetch(
-        `/api/media?msgId=${msgId}&chatId=${chatId}&download=true`,
-      );
-      if (!res.ok) {
-        const errorData = await res.text();
-        if (res.status === 410) {
-          throw new Error(
-            "MEDIA_EXPIRED: The requested asset is no longer available on WhatsApp servers.",
-          );
-        }
-        throw new Error(errorData || "Fetch failed");
-      }
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (e: any) {
-      if (e.message.startsWith("MEDIA_EXPIRED")) {
-        setError(`Archive Purge: ${e.message}`);
-      } else {
-        setError(
-          `Media Extraction Failed: ${e.message}. Ensure the original asset is still logged on your device.`,
-        );
-      }
-      console.error(`Download failure: ${e.message}`);
-    }
-  };
-
-  const [downloadFormatModal, setDownloadFormatModal] = useState<{
-    msgId: string;
-    chatId: string;
-    show: boolean;
-  } | null>(null);
-
-  const [pendingConsentRequest, setPendingConsentRequest] = useState<{
-    token: string;
-    adminEmail: string;
-    expiresAt: number;
-    phone: string;
-  } | null>(null);
-
-  const [showCallRecordingConfirmation, setShowCallRecordingConfirmation] = useState(false);
-
-  const downloadMediaWithFormat = async (
-    msgId: string,
-    chatId: string,
-    format: "jpg" | "png" | "mp3" | "mp4" | "original"
-  ) => {
-    try {
-      const formatParam = format === "original" ? "" : `&format=${format}`;
-      const url = `/api/media/download?msgId=${msgId}&chatId=${chatId}${formatParam}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error("Download conversion failed.");
-      }
-      const blob = await res.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      
-      let ext = "bin";
-      if (format === "jpg") ext = "jpg";
-      else if (format === "png") ext = "png";
-      else if (format === "mp3") ext = "mp3";
-      else if (format === "mp4") ext = "mp4";
-      
-      a.download = `media_${msgId}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(blobUrl);
-      document.body.removeChild(a);
-    } catch (err: any) {
-      setError(`Download failed: ${err.message}`);
-    }
-  };
-
-  // Periodically Poll for pending user consent token requests
-  useEffect(() => {
-    if (!user || !user.phone) return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await apiFetch(`/api/user-consent/pending?phone=${encodeURIComponent(user.phone)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.pending && !data.approved) {
-            setPendingConsentRequest({
-              token: data.token,
-              adminEmail: data.adminEmail,
-              expiresAt: data.expiresAt,
-              phone: user.phone
-            });
-          } else {
-            setPendingConsentRequest(null);
-          }
-        }
-      } catch (err) {
-        console.error("Polled user consent status error:", err);
-      }
-    }, 4000); // 4 seconds interval
-
-    return () => clearInterval(interval);
-  }, [user]);
-
-  const handleApproveConsent = async (approve: boolean) => {
-    if (!pendingConsentRequest) return;
-    try {
-      const res = await apiFetch("/api/approve-user-consent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          phone: pendingConsentRequest.phone,
-          token: pendingConsentRequest.token,
-          approve
-        })
-      });
-      if (res.ok) {
-        setPendingConsentRequest(null);
-      } else {
-        const err = await res.json();
-        setError(`Consent decision dispatch failure: ${err.error || "unknown"}`);
-      }
-    } catch (err: any) {
-      setError(`Failed to approve consent: ${err.message}`);
-    }
-  };
-
-  const updateProSettings = async (updates: any) => {
-    if (updates.hasOwnProperty("callRecordingEnabled") && updates.callRecordingEnabled === true && !proSettings.callRecordingEnabled) {
-      setShowCallRecordingConfirmation(true);
-      return;
-    }
-    const newSettings = { ...proSettings, ...updates };
-    setProSettings(newSettings);
-    try {
-      await apiFetch("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newSettings),
-      });
-    } catch (e) {}
-  };
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages, activeChat]);
-
-  const fetchLogs = async () => {
-    try {
-      const res = await apiFetch("/api/engine-logs");
-      const data = await res.json();
-      setEngineLogs(data);
-    } catch (e) {}
-  };
-
-  const addAutoReply = async () => {
-    if (!newAutoReply.keyword || !newAutoReply.response) return;
-    try {
-      await apiFetch("/api/auto-replies", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newAutoReply),
-      });
-      fetchAutoReplies();
-      setNewAutoReply({ keyword: "", response: "" });
-      setShowAutoReplyModal(false);
-    } catch (e) {}
-  };
-
-  const scheduleMessage = async () => {
-    const targetJid = selectedScheduleJid || activeChat?.id;
-    if (!targetJid || !scheduleData.text || !scheduleData.time) {
-      setError("RECIPIENT, MESSAGE PAYLOAD, AND TIMING SPECIFICATION REQUIRED");
-      return;
-    }
-    try {
-      await apiFetch("/api/schedule-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...scheduleData, jid: targetJid }),
-      });
-      fetchScheduledMsgs();
-      setScheduleData({ text: "", time: "" });
-      setSelectedScheduleJid("");
-      setShowScheduleModal(false);
-    } catch (e) {}
-  };
-
-  const checkConnectionStatus = async () => {
-    try {
-      const res = await apiFetch("/api/connection-status");
-      const data = await res.json();
-      
-      // Sync Primary Account State
-      setConnectionState(data.state);
-      if (data.statusUpdates) setStatusUpdates(data.statusUpdates);
-      if (data.supportPhoneNumber) {
-        setWaLinkPhone(data.supportPhoneNumber); // FIXED
-      }
-      
-      // Load chats for primary. If empty, keep existing state to ensure permanent backup display
-      if (data.chats && data.chats.length > 0) {
-        const normalizedAndFiltered = data.chats
-          .map((c: any) => {
-            let nextId = c.id;
-            if (nextId && nextId.includes(":")) {
-              const parts = nextId.split(":");
-              const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
-              nextId = `${parts[0]}@${suffix}`;
-            }
-            if (nextId && nextId.endsWith("@c.us")) {
-              nextId = nextId.replace("@c.us", "@s.whatsapp.net");
-            }
-            return { ...c, id: nextId };
-          })
-          .filter((c: any) => {
-            if (!c.id) return false;
-            if (c.id === "status@broadcast" || c.id === "0@s.whatsapp.net") return false;
-            if (c.id.endsWith("@lid")) return false; // Filter out LID numbers // FIXED
-            const idNum = c.id.split("@")[0];
-            if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
-            return true;
-          });
-        const sorted = normalizedAndFiltered.sort(
-          (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
-        );
-        setChats(sorted);
-        sorted.forEach((c: any) => fetchProfilePicture(c.id));
-      }
-      if (data.user) {
-        setUser(data.user);
-      }
-      if (data.contacts) {
-        // Clean contact list to prevent dummy or fake LID numbers // FIXED
-        const cleanedContacts: Record<string, any> = {};
-        Object.keys(data.contacts).forEach((key) => {
-          if (!key.endsWith("@lid") && key !== "0@s.whatsapp.net") {
-            cleanedContacts[key] = data.contacts[key];
-          }
-        });
-        setContacts(cleanedContacts);
-      }
-      setQrCode(data.qrCode || null);
-
-      // Sync Companion (Friend) Account State
-      if (data.friend) {
-        setConnectionStateFriend(data.friend.state);
-        setQrCodeFriend(data.friend.qrCode || null);
-        if (data.friend.user) {
-          setUserFriend(data.friend.user);
-        }
-        if (data.friend.chats && data.friend.chats.length > 0) {
-          const normalizedAndFilteredFriend = data.friend.chats
-            .map((c: any) => {
-              let nextId = c.id;
-              if (nextId && nextId.includes(":")) {
-                const parts = nextId.split(":");
-                const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
-                nextId = `${parts[0]}@${suffix}`;
-              }
-              if (nextId && nextId.endsWith("@c.us")) {
-                nextId = nextId.replace("@c.us", "@s.whatsapp.net");
-              }
-              return { ...c, id: nextId };
-            })
-            .filter((c: any) => {
-              if (!c.id) return false;
-              if (c.id === "status@broadcast" || c.id === "0@s.whatsapp.net") return false;
-              if (c.id.endsWith("@lid")) return false;
-              const idNum = c.id.split("@")[0];
-              if (idNum.length < 7 || idNum.length > 20) return false;
-              return true;
-            });
-          const sortedFriend = normalizedAndFilteredFriend.sort(
-            (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
-          );
-          setChatsFriend(sortedFriend);
-        }
-      }
-
-      setError((prev) => {
-        if (prev && (prev.includes("Neural Link") || prev.includes("Hybrid Polling"))) {
-          return null;
-        }
-        return prev;
-      });
-    } catch (e) {}
-  };
-
-  const refreshQr = async () => {
-    setIsRefreshing(true);
-    if (selectedAccount === "friend") {
-      setQrCodeFriend(null);
-    } else {
-      setQrCode(null);
-    }
-    try {
-      await apiFetch(`/api/refresh-qr?account=${selectedAccount}`);
-    } catch (e) {
-      setError("Failed to refresh engine");
-    } finally {
-      setTimeout(() => setIsRefreshing(false), 2000);
-    }
-  };
-
-  const hardLogout = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      await apiFetch("/api/logout", { 
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ account: selectedAccount })
-      });
-      if (selectedAccount === "friend") {
-        setUserFriend(null);
-        // Keep chatsFriend permanently intact to preserve retrieved history offline
-        setActiveChatFriend(null);
-        setQrCodeFriend(null);
-        setPairingCodeFriend("");
-      } else {
-        setUser(null);
-        // Keep chats permanently intact to preserve retrieved history offline
-        setActiveChat(null);
-        setQrCode(null);
-        setPairingCode("");
-      }
-    } catch (e) {
-      setError("Logout failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const connectWebSocket = () => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    // FIXED: Use VITE_BACKEND_WS_URL env var so WebSocket goes directly to backend
-    // (Vercel cannot proxy WebSocket — this was why QR never loaded on Vercel+Railway split)
-    const baseWsUrl = import.meta.env.VITE_BACKEND_WS_URL
-      ? import.meta.env.VITE_BACKEND_WS_URL
-      : `${protocol}//${window.location.host}`;
-    // Pass session ID so backend routes WebSocket to the right session
-    const socket = new WebSocket(`${baseWsUrl}?sid=${SESSION_ID}`);
-    ws.current = socket;
-
-    socket.onerror = (err) => {
-      // FIXED: Log WS errors instead of silently swallowing them
-      // Frontend will automatically fall back to HTTP polling for QR
-      console.warn("[WhatsApp Pro] WebSocket connection failed. Falling back to polling mode.", err);
-    };
-
-    socket.onclose = () => {
-      setConnectionState("close");
-      setError((prev) => {
-        if (!prev) {
-          return "Neural Link operating in Hybrid Polling mode.";
-        }
-        return prev;
-      });
-      setTimeout(connectWebSocket, 5000); // Auto-reconnect WS
-    };
-
-    socket.onmessage = (event) => {
-      const { type, data } = JSON.parse(event.data);
-      switch (type) {
-        case "ADMIN_LOGIN_ATTEMPT_ALERT": {
-          const customEvent = new CustomEvent("ADMIN_LOGIN_ATTEMPT_ALERT", { detail: data });
-          window.dispatchEvent(customEvent);
-          break;
-        }
-        case "CONNECTION_STATE":
-          setConnectionState(data);
-          if (data === "open") {
-            setPairingCode("");
-            setQrCode(null);
-            setError(null); // Clear errors upon successful link
-            setTimeout(() => {
-              chats.forEach((c) => fetchProfilePicture(c.id));
-            }, 2000);
-          }
-          break;
-        case "QR_CODE":
-          setQrCode(data);
-          setError(null); // Fresh QR means we are ready to try again
-          break;
-        case "QR_TIMEOUT":
-          setQrCode(null);
-          if (data?.message) {
-            setError(data.message);
-          }
-          break;
-        case "LOGGED_IN":
-          setUser(data);
-          setError(null);
-          break;
-        case "LOGOUT":
-          setUser(null);
-          setChats([]);
-          setActiveChat(null);
-          setQrCode(null);
-          setPairingCode("");
-          if (data?.message) {
-            setError(data.message);
-          }
-          if (data?.fatal) {
-            // Force re-fetch of status after a momentary delay
-            setTimeout(checkConnectionStatus, 3000);
-          }
-          break;
-        case "CONNECTION_STATE_FRIEND":
-          setConnectionStateFriend(data);
-          if (data === "open") {
-            setPairingCodeFriend("");
-            setQrCodeFriend(null);
-          }
-          break;
-        case "QR_CODE_FRIEND":
-          setQrCodeFriend(data);
-          setError(null);
-          break;
-        case "QR_TIMEOUT_FRIEND":
-          setQrCodeFriend(null);
-          if (data?.message) {
-            setError(data.message);
-          }
-          break;
-        case "LOGGED_IN_FRIEND":
-          setUserFriend(data);
-          break;
-        case "LOGOUT_FRIEND":
-          setUserFriend(null);
-          setQrCodeFriend(null);
-          setPairingCodeFriend("");
-          setTimeout(checkConnectionStatus, 3000);
-          break;
-        case "INITIAL_SYNC_FRIEND":
-          if (data.chats) {
-            setChatsFriend((prev) => {
-              const merged = [...prev];
-              data.chats.forEach((newChat: any) => {
-                let jid = newChat.id;
-                if (jid.includes(":")) {
-                  const parts = jid.split(":");
-                  const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
-                  jid = `${parts[0]}@${suffix}`;
-                }
-                if (jid.endsWith("@c.us"))
-                  jid = jid.replace("@c.us", "@s.whatsapp.net");
-                newChat.id = jid;
-
-                if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
-                if (jid.endsWith("@lid")) return;
-                const idNum = jid.split("@")[0];
-                if (idNum.length < 7 || idNum.length > 20) return;
-
-                const index = merged.findIndex((c) => c.id === jid);
-                if (index !== -1) {
-                  merged[index] = { ...merged[index], ...newChat };
-                } else {
-                  merged.push(newChat);
-                }
-              });
-              return Array.from(
-                new Map(merged.map((c) => [c.id, c])).values(),
-              ).sort(
-                (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
-              );
-            });
-          }
-          break;
-        case "MESSAGES_UPSERT_FRIEND": {
-          const msgData = data.messages?.[0];
-          if (!msgData) break;
-          let incomingJid = msgData.key?.remoteJid;
-          if (incomingJid.endsWith("@c.us"))
-            incomingJid = incomingJid.replace("@c.us", "@s.whatsapp.net");
-
-          let activeJid = activeChatFriend?.id || "";
-          if (activeJid.endsWith("@c.us"))
-            activeJid = activeJid.replace("@c.us", "@s.whatsapp.net");
-
-          if (incomingJid === activeJid) {
-            const newMsg: Message = {
-              id: msgData.key.id,
-              sender:
-                msgData.pushName ||
-                getDisplayName(
-                  msgData.participant || msgData.key.participant || incomingJid,
-                ),
-              text: getMsgText(msgData),
-              timestamp: msgData.messageTimestamp * 1000,
-              fromMe: msgData.key.fromMe,
-              status: "sent",
-              rawMessage: msgData.message,
-            };
-            setMessagesFriend((prev) => {
-              const exists = prev.some((m) => m.id === newMsg.id);
-              if (exists) return prev;
-              return [...prev, newMsg];
-            });
-          }
-          break;
-        }
-        case "CONTACTS_UPSERT":
-          const contactUpdates = Array.isArray(data) ? data : [data];
-          setContacts((prev) => {
-            const next = { ...prev };
-            contactUpdates.forEach((c) => {
-              let jid = c.id;
-              if (jid.endsWith("@c.us"))
-                jid = jid.replace("@c.us", "@s.whatsapp.net");
-              next[jid] = { ...(next[jid] || {}), ...c, id: jid };
-            });
-            return next;
-          });
-          break;
-        case "STATUS_UPDATE":
-          setStatusUpdates((prev) => [data, ...prev].slice(0, 50));
-          if (data.participant)
-            fetchProfilePicture(
-              data.participant.split(":")[0] + "@s.whatsapp.net",
-            );
-          break;
-        case "STATUS_DELETED_INTERCEPT":
-          setInterceptedStatuses((prev) => [data, ...prev].slice(0, 50));
-          break;
-        case "CALL_UPDATE":
-          const calls = Array.isArray(data) ? data : [data];
-          setCallHistory((prev) => [...calls, ...prev].slice(0, 50));
-          break;
-        case "MESSAGE_REVOKED_ANTIDELETE":
-          if (data.jid === activeChatRef.current?.id) {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === data.msgId ? { ...m, isRevoked: true } : m,
-              ),
-            );
-          }
-          break;
-        case "MESSAGE_DELETED":
-          if (data.chatId === activeChatRef.current?.id) {
-            setMessages((prev) => prev.filter((m) => m.id !== data.msgId));
-          }
-          break;
-        case "CHAT_DELETED":
-          setChats((prev) => prev.filter((c) => c.id !== data.chatId));
-          if (activeChatRef.current?.id === data.chatId) setActiveChat(null);
-          break;
-        case "CHATS_UPDATE":
-          setChats((prev) => {
-            const updates = Array.isArray(data) ? data : [data];
-            let newChats = [...prev];
-            updates.forEach((update) => {
-              if (!update.id) return;
-              let jid = update.id;
-              if (jid.includes(":")) {
-                const parts = jid.split(":");
-                const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
-                jid = `${parts[0]}@${suffix}`;
-              }
-              if (jid.endsWith("@c.us"))
-                jid = jid.replace("@c.us", "@s.whatsapp.net");
-              update.id = jid;
-
-              // Filter out system or duplicate LID junk contacts // FIXED
-              if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
-              if (jid.endsWith("@lid")) return;
-              const idNum = jid.split("@")[0];
-              if (idNum.length < 7 || idNum.length > 20) return;
-
-              const index = newChats.findIndex((c) => c.id === jid);
-              if (index !== -1) {
-                newChats[index] = { ...newChats[index], ...update };
-              } else {
-                newChats.push(update);
-              }
-            });
-            // Ensure distinct chats by ID
-            const uniqueChats = Array.from(
-              new Map(newChats.map((c) => [c.id, c])).values(),
-            );
-            return uniqueChats.sort(
-              (a, b) => (b.timestamp || 0) - (a.timestamp || 0),
-            );
-          });
-          break;
-        case "INITIAL_SYNC":
-          if (data.chats) {
-            setChats((prev) => {
-              const merged = [...prev];
-              data.chats.forEach((newChat: any) => {
-                let jid = newChat.id;
-                if (jid.includes(":")) {
-                  const parts = jid.split(":");
-                  const suffix = (parts[1] && parts[1].split("@")[1]) || "s.whatsapp.net";
-                  jid = `${parts[0]}@${suffix}`;
-                }
-                if (jid.endsWith("@c.us"))
-                  jid = jid.replace("@c.us", "@s.whatsapp.net");
-                newChat.id = jid;
-
-                // Filter out system or duplicate LID junk contacts // FIXED
-                if (jid === "status@broadcast" || jid === "0@s.whatsapp.net") return;
-                if (jid.endsWith("@lid")) return;
-                const idNum = jid.split("@")[0];
-                if (idNum.length < 7 || idNum.length > 20) return;
-
-                const index = merged.findIndex((c) => c.id === jid);
-                if (index !== -1) {
-                  merged[index] = { ...merged[index], ...newChat };
-                } else {
-                  merged.push(newChat);
-                }
-              });
-              return Array.from(
-                new Map(merged.map((c) => [c.id, c])).values(),
-              ).sort(
-                (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0),
-              );
-            });
-          }
-          if (data.contacts) {
-            setContacts((prev) => {
-              const next = { ...prev };
-              Object.keys(data.contacts).forEach((key) => {
-                let jid = key;
-                if (jid.endsWith("@c.us"))
-                  jid = jid.replace("@c.us", "@s.whatsapp.net");
-                next[jid] = {
-                  ...(next[jid] || {}),
-                  ...data.contacts[key],
-                  id: jid,
-                };
-              });
-              return next;
-            });
-          }
-          if (data.statusUpdates) setStatusUpdates(data.statusUpdates);
-          if (data.callHistory) setCallHistory(data.callHistory);
-          if (data.favorites) setFavorites(data.favorites);
-          if (data.lockedChats) setLockedChats(data.lockedChats);
-          if (data.settings) setProSettings(data.settings);
-          if (data.lidToPnMap) setLidToPnMap(data.lidToPnMap);
-          break;
-        case "LID_MAPPING":
-          if (data && data.lid && data.pn) {
-            setLidToPnMap((prev) => ({ ...prev, [data.lid]: data.pn }));
-          }
-          break;
-        case "MESSAGES_UPSERT":
-          const msgData = data.messages?.[0];
-          if (!msgData) break;
-
-          if (data.messages && data.messages.length > 0) {
-            setContacts((prev) => {
-              let updated = false;
-              const next = { ...prev };
-              data.messages.forEach((msg: any) => {
-                const jid = msg.key?.participant || msg.participant || msg.key?.remoteJid;
-                if (!jid) return;
-                
-                let normalized = jid;
-                if (normalized.includes(":")) {
-                  const parts = normalized.split(":");
-                  const suffix = normalized.split("@")[1];
-                  normalized = parts[0] + "@" + suffix;
-                }
-                if (normalized.endsWith("@c.us")) {
-                  normalized = normalized.replace("@c.us", "@s.whatsapp.net");
-                }
-                
-                if (normalized.endsWith("@lid") && lidToPnMap && lidToPnMap[normalized]) {
-                  normalized = lidToPnMap[normalized];
-                }
-                
-                if (msg.pushName && (!next[normalized] || next[normalized].name !== msg.pushName)) {
-                  next[normalized] = {
-                    ...(next[normalized] || {}),
-                    id: normalized,
-                    name: msg.pushName,
-                    pushName: msg.pushName,
-                  };
-                  updated = true;
-                }
-              });
-              return updated ? next : prev;
-            });
-          }
-
-          let incomingJid = msgData.key?.remoteJid;
-          if (incomingJid.endsWith("@c.us"))
-            incomingJid = incomingJid.replace("@c.us", "@s.whatsapp.net");
-
-          let activeJid = activeChatRef.current?.id || "";
-          if (activeJid.endsWith("@c.us"))
-            activeJid = activeJid.replace("@c.us", "@s.whatsapp.net");
-
-          if (incomingJid === activeJid) {
-            const newMsg: Message = {
-              id: msgData.key.id,
-              sender:
-                msgData.pushName ||
-                getDisplayName(
-                  msgData.participant || msgData.key.participant || incomingJid,
-                ),
-              text: getMsgText(msgData),
-              timestamp: msgData.messageTimestamp * 1000,
-              fromMe: msgData.key.fromMe,
-              status: "sent",
-              rawMessage: msgData.message,
-            };
-            setMessages((prev) => {
-              const exists = prev.some((m) => m.id === newMsg.id);
-              if (exists) return prev;
-              return [...prev, newMsg];
-            });
-            if (!newMsg.fromMe && newMsg.text) getAiSuggestions(newMsg.text);
-          }
-          break;
-      }
-    };
-  };
-
-  const getDisplayName = (chat: any) => {
-    if (!chat) return "Unknown";
-    let chatJid = typeof chat === "string" ? chat : chat.id;
-
-    // De-alias participants from groups (number:device@s.whatsapp.net -> number@s.whatsapp.net)
-    if (chatJid.includes(":")) {
-      const parts = chatJid.split(":");
-      const suffix = chatJid.split("@")[1];
-      chatJid = parts[0] + "@" + suffix;
-    }
-
-    if (chatJid.endsWith("@c.us"))
-      chatJid = chatJid.replace("@c.us", "@s.whatsapp.net");
-
-    // Resolve LID using synchronous mappings loaded from server
-    if (chatJid.endsWith("@lid") && lidToPnMap && lidToPnMap[chatJid]) {
-      chatJid = lidToPnMap[chatJid];
-    }
-
-    const contact = contacts[chatJid];
-    if (contact && contact.name) {
-      return contact.name;
-    }
-
-    if (chat.name) return chat.name;
-
-    const rawNumber = chatJid.split("@")[0];
-    const bypassMask = showContactInfo && activeChat && activeChat.id === chatJid;
-    if (proSettings.hideNumbers && !bypassMask) {
-      return `${rawNumber.slice(0, 4)}••••${rawNumber.slice(-2)}`;
-    }
-    return rawNumber;
-  };
-
-  const renderHighlightedText = (text: string, highlight: string) => {
-    if (!text) return "";
-    if (!highlight.trim()) return text;
-    try {
-      const parts = text.split(new RegExp(`(${highlight.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')})`, "gi"));
-      return parts.map((part, index) =>
-        part.toLowerCase() === highlight.toLowerCase() ? (
-          <mark key={index} className="bg-yellow-500/30 text-yellow-300 rounded px-0.5 border border-yellow-500/20 font-bold">
-            {part}
-          </mark>
-        ) : (
-          part
-        )
-      );
-    } catch (e) {
-      return text;
-    }
-  };
-
-  const getMsgText = (m: any) => {
-    if (!m || !m.message) return "";
-    const content = m.message;
-    const doc = content.documentMessage;
-    if (doc) return doc.fileName || "Document";
-    return (
-      content.conversation ||
-      content.extendedTextMessage?.text ||
-      content.imageMessage?.caption ||
-      content.videoMessage?.caption ||
-      (content.protocolMessage ? "System Message" : "") ||
-      (content.imageMessage ? "📷 Image" : "") ||
-      (content.videoMessage ? "🎥 Video" : "") ||
-      (content.audioMessage ? "🎵 Audio" : "") ||
-      (content.stickerMessage ? "Sticker" : "") ||
-      ""
-    );
-  };
-
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-      const chunks: Blob[] = [];
-
-      recorder.ondataavailable = (e) => chunks.push(e.data);
-      recorder.onstop = async () => {
-        const blob = new Blob(chunks, { type: "audio/mp4" });
-        const reader = new FileReader();
-        reader.onload = async () => {
-          const base64 = reader.result as string;
-          if (activeChat) {
-            await apiFetch("/api/send-audio", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                jid: activeChat.id,
-                audio: base64,
-                duration: recordingTime,
-                ptt: true,
-              }),
-            });
-          }
-        };
-        reader.readAsDataURL(blob);
-        stream.getTracks().forEach((track) => track.stop());
-      };
-
-      recorder.start();
-      setIsRecording(true);
-      setRecordingTime(0);
-      recordingTimerRef.current = setInterval(() => {
-        setRecordingTime((prev) => prev + 1);
-      }, 1000);
-    } catch (e) {
-      setError(
-        "Neural Link Blocked: Microphone access required for sonic transmission.",
-      );
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      clearInterval(recordingTimerRef.current);
-    }
-  };
-
-  const forwardMessage = async (targetJid: string) => {
-    if (!forwardMsg || !activeChat) return;
-    try {
-      await apiFetch("/api/forward-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          targetJid,
-          msgId: forwardMsg.id,
-          fromJid: activeChat.id,
-        }),
-      });
-      setShowForwardModal(false);
-      setForwardMsg(null);
-    } catch (e) {}
-  };
-
-  const reactToMessage = async (
-    msgId: string,
-    emoji: string,
-    fromMe: boolean,
-  ) => {
-    if (!activeChat) return;
-    // Optimistically update reactions state immediately
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.id === msgId || m.key?.id === msgId) {
-          return { ...m, reaction: emoji };
-        }
-        return m;
-      }),
-    );
-
-    try {
-      await apiFetch("/api/react-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jid: activeChat.id,
-          msgId,
-          emoji,
-          fromMe,
-        }),
-      });
-    } catch (e) {}
-  };
-
-  const replyToStatus = async () => {
-    if (!activeStatus || !statusReplyText.trim()) return;
-    try {
-      const targetJid = activeStatus.participant;
-      await apiFetch("/api/send-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jid: targetJid,
-          text: statusReplyText,
-          quoted: activeStatus,
-        }),
-      });
-
-      // Open the chat with the status participant
-      const existingChat = chats.find((c) => c.id === targetJid);
-      if (existingChat) {
-        loadHistory(existingChat);
-      } else {
-        const tempChat = { id: targetJid, name: getDisplayName(targetJid) };
-        setActiveChat(tempChat);
-        loadHistory(tempChat);
-      }
-
-      setActiveStatus(null);
-      setStatusReplyText("");
-      setActiveTab("CHATS");
-    } catch (e) {}
-  };
-
-  const postStatus = async (
-    type: "text" | "image" | "video",
-    content: string,
-    caption?: string,
-  ) => {
-    try {
-      await apiFetch("/api/post-status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type, content, caption }),
-      });
-      setShowStatusModal(false);
-      setStatusText("");
-      setStatusImage(null);
-    } catch (e) {
-      setError("Signal Jammed: Status upload failed.");
-    }
-  };
-
-  const markStatusSeen = async (status: any) => {
-    try {
-      await apiFetch("/api/read-status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          keys: [
-            {
-              remoteJid: "status@broadcast",
-              id: status.id,
-              participant: status.participant,
-            },
-          ],
-        }),
-      });
-    } catch (e) {}
-  };
-
-  const getAiSuggestions = async (text: string) => {
-    if (!text || text.length < 5) return;
-    setIsAiLoading(true);
-    try {
-      const res = await apiFetch("/api/ai-suggestion", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      const data = await res.json();
-      if (data.suggestions) {
-        setAiSuggestions(data.suggestions);
-      }
-    } catch (e) {
-      console.error("AI Error:", e);
-    } finally {
-      setIsAiLoading(false);
-    }
-  };
-
-  const requestPairingCode = async () => {
-    const targetPhone = selectedAccount === "friend" ? phoneNumberFriend : phoneNumber;
-    if (!targetPhone || targetPhone.length !== 10) {
-      setError("Please enter a valid 10-digit India number");
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await apiFetch("/api/request-pairing-code", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phoneNumber: targetPhone, account: selectedAccount }),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      
-      if (selectedAccount === "friend") {
-        setPairingCodeFriend(data.code);
-      } else {
-        setPairingCode(data.code);
-      }
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const sendMessage = async () => {
-    const currentActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
-    const currentNewMessage = newMessage;
-    if (!currentNewMessage.trim() || !currentActiveChat) return;
-
-    const msg: Message = {
-      id: Math.random().toString(36).substr(2, 9),
-      sender: "Me",
-      text: currentNewMessage,
-      timestamp: Date.now(),
-      fromMe: true,
-      status: "sent",
-    };
-
-    if (selectedAccount === "friend") {
-      setMessagesFriend((prev) => [...prev, msg]);
-    } else {
-      setMessages((prev) => [...prev, msg]);
-    }
-    setNewMessage("");
-    setAiSuggestions([]);
-
-    try {
-      const res = await apiFetch("/api/send-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid: currentActiveChat.id, text: currentNewMessage, account: selectedAccount }),
-      });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(
-          errData.error || `Server returned status code ${res.status}`,
-        );
-      }
-      
-      const setChatsFunc = selectedAccount === "friend" ? setChatsFriend : setChats;
-      // Update local chat timestamp/last message for immediate feedback
-      setChatsFunc((prev) => {
-        const index = prev.findIndex((c) => c.id === currentActiveChat.id);
-        if (index === -1) return prev;
-        const next = [...prev];
-        next[index] = {
-          ...next[index],
-          timestamp: Math.floor(Date.now() / 1000),
-          lastMessage: {
-            key: { id: msg.id },
-            message: { conversation: currentNewMessage },
-            messageTimestamp: Math.floor(Date.now() / 1000),
-          },
-        };
-        return next.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      });
-    } catch (e: any) {
-      setError(`Transmission Failure: ${e.message}`);
-    }
-  };
-
-  const deleteChat = async (chatId: string) => {
-    try {
-      await apiFetch("/api/delete-chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId }),
-      });
-      setChats((prev) => prev.filter((c) => c.id !== chatId));
-      if (activeChat?.id === chatId) setActiveChat(null);
-    } catch (e) {}
-  };
-
-  const blockContact = async (jid: string) => {
-    try {
-      await fetch(`${API_BASE}/api/block-contact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid, block: true }),
-      });
-      setError("Neural block active. Signal terminated.");
-    } catch (e: any) {
-      setError(`Failed to block: ${e.message}`);
-    }
-  };
-
-  const reportContact = async (jid: string) => {
-    try {
-      await fetch(`${API_BASE}/api/report-contact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid }),
-      });
-      setError("Neural reporting engaged. Admin notified.");
-    } catch (e: any) {
-      setError(`Failed to report: ${e.message}`);
-    }
-  };
-
-  const deleteMessage = async (msgId: string, revoke: boolean = false) => {
-    if (!activeChat) return;
-    try {
-      await apiFetch("/api/delete-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: activeChat.id, msgId, revoke }),
-      });
-      setMessages((prev) => prev.filter((m) => m.id !== msgId));
-      setDeleteOptionModal(null);
-    } catch (e) {}
-  };
-
-  const loadHistory = async (chat: Chat) => {
-    if (lockedChats.includes(chat.id) && !showLockedChats) {
-      setEnteredPasscode("");
-      setPendingLockedChatToLoad(chat);
-      setShowPasscodeModal(true);
-      return;
-    }
-    
-    if (selectedAccount === "friend") {
-      setActiveChatFriend(chat);
-      setMessagesFriend([]);
-    } else {
-      setActiveChat(chat);
-      setMessages([]);
-    }
-    setAiSuggestions([]);
-    setGroupMetadata(null);
-    setShowMsgSearch(false);
-    setMsgSearchQuery("");
-    if (chat.id.endsWith("@g.us")) {
-      fetchGroupMetadata(chat.id);
-    }
-    try {
-      const res = await apiFetch(`/api/history/${chat.id}?account=${selectedAccount}`);
-      const data = await res.json();
-      const formatted = data.map((m: any) => {
-        // Resolve sender name for group chats
-        let senderName = "Me";
-        if (!m.key.fromMe) {
-          senderName = getDisplayName(
-            m.participant || m.key.participant || m.key.remoteJid,
-          );
-        }
-
-        return {
-          id: m.key.id,
-          sender: senderName,
-          text: getMsgText(m),
-          timestamp: m.messageTimestamp * 1000 || Date.now(),
-          fromMe: !!m.key.fromMe,
-          status: "read",
-          rawMessage: m.message,
-          isRevoked: !!m.isRevoked,
-        };
-      });
-
-      // Deduplicate formatted messages by ID to prevent duplicate React keys errors
-      const uniqueFormatted: any[] = [];
-      const seenIds = new Set();
-      formatted.forEach((msg: any) => {
-        if (!seenIds.has(msg.id)) {
-          seenIds.add(msg.id);
-          uniqueFormatted.push(msg);
-        }
-      });
-
-      if (selectedAccount === "friend") {
-        setMessagesFriend(uniqueFormatted);
-      } else {
-        setMessages(uniqueFormatted);
-      }
-      
-      if (uniqueFormatted.length > 0) {
-        const last = uniqueFormatted[uniqueFormatted.length - 1];
-        if (!last.fromMe && last.text) getAiSuggestions(last.text);
-
-        // Mark as read if not in ghost mode
-        if (!proSettings.ghostMode) {
-          apiFetch("/api/read-chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              jid: chat.id,
-              account: selectedAccount,
-              keys: data
-                .filter((m: any) => !m.key.fromMe)
-                .map((m: any) => m.key),
-            }),
-          }).catch(() => {});
-        }
-      }
-    } catch (e) {}
-  };
-
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-black flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-[#0a0a0c] rounded-2xl border border-white/5 shadow-2xl overflow-hidden">
-          <div className="h-1 bg-primary w-full shadow-[0_0_15px_var(--color-primary)]" />
-          <div className="p-8">
-            <div className="flex items-center justify-center mb-10 mt-4">
-              <div className="p-4 bg-primary rounded-2xl shadow-xl shadow-primary/20 rotate-3 transition-transform hover:rotate-0">
-                <Shield className="w-8 h-8 text-white" />
-              </div>
-            </div>
-
-            <div className="flex items-center justify-center gap-2 mb-2">
-              <h1 className="text-3xl font-black text-white tracking-tight italic">
-                WHATSAPP PRO
-              </h1>
-              <span className="text-primary text-xl">🛡️</span>
-            </div>
-            <p className="text-primary/60 text-center mb-8 text-[10px] font-black uppercase tracking-[0.3em]">
-              Encrypted Command Engine
-            </p>
-
-            <div className="flex gap-1 mb-8 bg-zinc-900 p-1 rounded-xl">
-              <button
-                onClick={() => setLoginMethod("pairing")}
-                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === "pairing" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
-              >
-                OTP Secure
-              </button>
-              <button
-                onClick={() => setLoginMethod("qr")}
-                className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${loginMethod === "qr" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
-              >
-                Optic Sync
-              </button>
-            </div>
-
-            <div className="space-y-6">
-              {loginMethod === "pairing" ? (
-                <>
-                  <div>
-                    <label className="block text-[10px] font-bold text-primary/50 uppercase tracking-widest mb-2 ml-1">
-                      Terminal Link identifier
-                    </label>
-                    <div className="relative group">
-                      <div className="absolute left-4 top-1/2 -translate-y-1/2 text-primary font-mono font-bold text-sm">
-                        +91
-                      </div>
-                      <input
-                        type="text"
-                        placeholder="Master Phone"
-                        className="w-full pl-14 pr-4 py-4 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-primary transition-all font-mono"
-                        value={phoneNumber}
-                        onChange={(e) =>
-                          setPhoneNumber(
-                            e.target.value.replace(/\D/g, "").slice(0, 10),
-                          )
-                        }
-                        disabled={!!pairingCode || loading}
-                      />
-                    </div>
-                  </div>
-
-                  <AnimatePresence>
-                    {pairingCode && (
-                      <motion.div
-                        initial={{ scale: 0.9, opacity: 0 }}
-                        animate={{ scale: 1, opacity: 1 }}
-                        className="p-6 bg-[#121214] rounded-xl border border-primary/20 flex flex-col items-center"
-                      >
-                        <span className="text-[10px] text-primary font-black mb-4 uppercase tracking-[0.3em]">
-                          Access Code
-                        </span>
-                        <div className="flex gap-1">
-                          {pairingCode.split("").map((char, i) => (
-                            <span
-                              key={i}
-                              className="text-3xl font-mono font-black text-white bg-black/40 w-8 h-12 flex items-center justify-center rounded-lg border border-white/5 shadow-inner"
-                            >
-                              {char}
-                            </span>
-                          ))}
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </>
-              ) : (
-                <div className="flex flex-col items-center w-full">
-                  {/* Mode switcher for Optic Sync // FIXED */}
-                  <div className="flex gap-1 bg-black/40 p-1 rounded-xl border border-white/5 mb-6 w-full">
-                    <button
-                      type="button"
-                      onClick={() => setWaConnectMode("engine")}
-                      className={`flex-1 py-2 rounded-lg text-[8.5px] font-black uppercase tracking-widest transition-all ${waConnectMode === "engine" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
-                    >
-                      Engine Sync
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setWaConnectMode("direct")}
-                      className={`flex-1 py-2 rounded-lg text-[8.5px] font-black uppercase tracking-widest transition-all ${waConnectMode === "direct" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
-                    >
-                      Chat QR Link
-                    </button>
-                  </div>
-
-                  {waConnectMode === "direct" ? (
-                    /* Direct WA.me Link Generator QR // FIXED */
-                    <div className="w-full flex flex-col items-center space-y-4">
-                      <div className="p-4 bg-white rounded-2xl shadow-2xl relative group">
-                        <div className="relative bg-white p-1 rounded-lg">
-                          <QRCode 
-                            id="direct-wa-qr"
-                            value={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`} 
-                            size={180} 
-                          />
-                          <div className="absolute inset-0 border-4 border-[#00a884]/20 rounded-lg pointer-events-none animate-pulse" />
-                        </div>
-                        <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
-                      </div>
-
-                      <div className="text-center">
-                        <p className="text-[10px] text-primary font-black uppercase tracking-widest mb-1">
-                          Scan to Chat Now
-                        </p>
-                        <p className="text-[8px] text-slate-400 font-medium">
-                          Opens real WhatsApp instantly
-                        </p>
-                      </div>
-
-                      {/* Inputs to customize target link */}
-                      <div className="w-full space-y-3 pt-2">
-                        <div className="space-y-1">
-                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
-                            Target Phone Number
-                          </label>
-                          <input
-                            type="text"
-                            placeholder="e.g. 12065550100"
-                            className="w-full px-3 py-2.5 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all font-mono"
-                            value={waLinkPhone}
-                            onChange={(e) => setWaLinkPhone(e.target.value.replace(/[^\d+]/g, ""))}
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
-                            Preset Message content
-                          </label>
-                          <textarea
-                            rows={2}
-                            placeholder="Type greeting message..."
-                            className="w-full px-3 py-2 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all"
-                            value={waLinkMessage}
-                            onChange={(e) => setWaLinkMessage(e.target.value)}
-                          />
-                        </div>
-
-                        <a
-                          href={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="w-full bg-[#00a884] text-white font-black py-3 rounded-xl hover:opacity-90 transition-all text-[9px] uppercase tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-[#00a884]/15"
-                        >
-                          Send Message / Open Link 🚀
-                        </a>
-                      </div>
-                    </div>
-                  ) : (
-                    /* Default Baileys Authenticator Token QR */
-                    <div className="flex flex-col items-center w-full">
-                      <div className="p-4 bg-white rounded-2xl mb-6 shadow-2xl relative group">
-                        {qrCode ? (
-                          <div className="relative bg-white p-1 rounded-lg">
-                            <QRCode value={qrCode} size={180} />
-                            <div className="absolute inset-0 border-4 border-primary/20 rounded-lg pointer-events-none animate-pulse" />
-                          </div>
-                        ) : (
-                          <div className="w-[180px] h-[180px] flex flex-col items-center justify-center bg-[#1c1c1f] rounded-xl gap-4">
-                            <RefreshCw className="w-8 h-8 text-slate-500 animate-spin" />
-                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest text-center px-4">
-                              Calibrating Neural Link...
-                            </span>
-                          </div>
-                        )}
-                        <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
-                      </div>
-                      {!qrCode && !isRefreshing && (
-                        <p className="text-[9px] text-primary font-black uppercase tracking-[0.2em] mb-4 animate-pulse">
-                          Awaiting Authentication Stream...
-                        </p>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {error && (
-                <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3">
-                  <X className="w-4 h-4 text-red-500 shrink-0" />
-                  <p className="text-red-500 text-[10px] font-bold leading-tight">
-                    {error}
-                  </p>
-                </div>
-              )}
-
-              {!pairingCode && loginMethod === "pairing" && (
-                <button
-                  onClick={requestPairingCode}
-                  disabled={loading || phoneNumber.length !== 10}
-                  className="w-full bg-primary text-black font-black py-4 rounded-xl hover:opacity-90 disabled:opacity-20 transition-all shadow-xl shadow-primary/10 text-xs uppercase tracking-widest flex items-center justify-center gap-3"
-                >
-                  {loading && (
-                    <RefreshCw className="w-4 h-4 animate-spin text-black" />
-                  )}
-                  {loading ? "Initializing Stack..." : "Link System 💎"}
-                </button>
-              )}
-
-              {(pairingCode || loginMethod === "qr") && (
-                <div className="flex flex-col gap-2 w-full">
-                  {loginMethod === "qr" && (
-                    <button
-                      onClick={refreshQr}
-                      disabled={isRefreshing}
-                      className="w-full bg-white/5 text-primary font-black py-4 rounded-xl hover:bg-white/10 disabled:opacity-50 transition-all text-[10px] uppercase tracking-[0.2em] flex items-center justify-center gap-3 border border-primary/10"
-                    >
-                      <RefreshCw
-                        className={`w-4 h-4 ${isRefreshing ? "animate-spin" : ""}`}
-                      />
-                      {isRefreshing ? "Resetting Engine..." : "Fast Refresh QR"}
-                    </button>
-                  )}
-                  <button
-                    onClick={hardLogout}
-                    disabled={loading}
-                    className="w-full bg-red-500/10 text-red-500 font-black py-3 rounded-xl hover:bg-red-500/20 transition-all text-[10px] uppercase tracking-[0.2em] flex items-center justify-center gap-3 border border-red-500/10"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    Clean Auth Reset
-                  </button>
-                  <button
-                    onClick={() => {
-                      setPairingCode("");
-                      setQrCode(null);
-                      setError(null);
-                      checkConnectionStatus();
-                    }}
-                    className="w-full text-white/20 text-[10px] font-black uppercase tracking-[0.4em] hover:text-[#00a884] transition-colors py-2 border border-white/5 rounded-xl mt-2"
-                  >
-                    Reinitialize System
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const displayedActiveChat = selectedAccount === "friend" ? activeChatFriend : activeChat;
-  const displayedMessages = selectedAccount === "friend" ? messagesFriend : messages;
-
-  return (
-    <div className="max-w-[1440px] mx-auto h-screen flex bg-bg overflow-hidden text-[#e9edef] font-sans selection:bg-primary/30">
-      {/* Sidebar - Chat List / Logs */}
-      <div className="w-[420px] flex flex-col border-r border-white/5 bg-surface">
-        {/* DND Indicator */}
-        {proSettings.dndMode && (
-          <div className="bg-red-500 py-1 px-4 flex items-center justify-center gap-2 animate-pulse overflow-hidden whitespace-nowrap">
-            <Zap className="w-3 h-3 text-white fill-white" />
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-white">
-              Neural Airplane Mode Active - Matrix Disconnected
-            </span>
-            <Zap className="w-3 h-3 text-white fill-white" />
-          </div>
-        )}
-
-        {/* Pro Header */}
-        <div className="bg-accent p-4 flex items-center justify-between">
-          <div
-            className="flex items-center gap-3 group cursor-pointer"
-            onClick={() => {
-              if (selectedAccount === "me") {
-                setProfileName(user?.name || "");
-                setProfileBio(user?.status || "");
-                setIsProfileEditorOpen(true);
-              }
-            }}
-          >
-            <div className="relative">
-              <div className="w-10 h-10 rounded-xl bg-primary flex items-center justify-center shadow-lg transition-transform hover:scale-105 overflow-hidden border border-white/10">
-                {selectedAccount === "friend" ? (
-                  userFriend?.id &&
-                  profilePictures[userFriend.id.split(":")[0] + "@s.whatsapp.net"] ? (
-                    <img
-                      src={
-                        profilePictures[userFriend.id.split(":")[0] + "@s.whatsapp.net"]
-                      }
-                      alt=""
-                      className="w-full h-full object-cover"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                    />
-                  ) : (
-                    <User className="w-5 h-5 text-white" />
-                  )
-                ) : (
-                  user?.id &&
-                  profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"] ? (
-                    <img
-                      src={
-                        profilePictures[user.id.split(":")[0] + "@s.whatsapp.net"]
-                      }
-                      alt=""
-                      className="w-full h-full object-cover"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                    />
-                  ) : (
-                    <Zap className="w-5 h-5 text-white" />
-                  )
-                )}
-              </div>
-              {selectedAccount === "me" && (
-                <label className="absolute -bottom-1 -right-1 bg-[#233138] p-1 rounded-lg border border-white/10 cursor-pointer hover:bg-[#00a884] transition-colors group/edit">
-                  <Camera className="w-3 h-3 text-[#00a884] group-hover/edit:text-white" />
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={uploadProfilePicture}
-                    className="hidden"
-                  />
-                </label>
-              )}
-            </div>
-            <div>
-              <div className="flex items-center gap-1.5 leading-none">
-                <span className="font-black text-xs tracking-tighter uppercase italic text-[#e9edef]">
-                  {selectedAccount === "friend" ? (userFriend?.name || "FRIEND SESSION") : (user?.name || "OWNER SESSION")}
-                </span>
-                {(selectedAccount === "friend" ? connectionStateFriend : connectionState) === "open" && (
-                  <div className="w-2 h-2 rounded-full bg-primary shadow-[0_0_10px_var(--color-primary)]" />
-                )}
-              </div>
-              <div className="flex items-center gap-2 mt-1">
-                <p className="text-[9px] font-black text-[#8696af] tracking-widest uppercase opacity-60">
-                  {selectedAccount === "friend" ? (
-                    userFriend?.id ? userFriend.id.split(":")[0] : "Friend Scanner Ready"
-                  ) : (
-                    user?.id ? user.id.split(":")[0] : "Calibrating Neural Link..."
-                  )}
-                </p>
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-4 text-[#aebac1]">
-            <Activity className="w-4 h-4 text-[#00a884] opacity-50" />
-            <div className="relative">
-              <button
-                onClick={() => setIsMainMenuOpen(!isMainMenuOpen)}
-                className="hover:text-white transition-colors p-1"
-              >
-                <MoreVertical className="w-5 h-5" />
-              </button>
-              {isMainMenuOpen && (
-                <>
-                  <div
-                    className="fixed inset-0 z-40"
-                    onClick={() => setIsMainMenuOpen(false)}
-                  />
-                  <div className="absolute top-full right-0 mt-2 w-56 bg-[#233138] rounded-xl shadow-2xl py-2 z-50 border border-white/5 backdrop-blur-xl animate-in fade-in zoom-in duration-200">
-                    <div className="px-4 py-2 border-b border-white/5 mb-1">
-                      <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest">
-                        Master Protocol
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => {
-                        updateProSettings({
-                          hideNumbers: !proSettings.hideNumbers,
-                        });
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center justify-between text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors"
-                    >
-                      <div className="flex items-center gap-2 italic">
-                        <MessageCircle className="w-4 h-4" />
-                        Hide Numbers
-                      </div>
-                      <div
-                        className={`w-8 h-4 rounded-full relative transition-colors ${proSettings.hideNumbers ? "bg-[#00a884]" : "bg-white/10"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${proSettings.hideNumbers ? "left-4.5" : "left-0.5"}`}
-                        />
-                      </div>
-                    </button>
-                    <button
-                      onClick={() => {
-                        if (!showLockedChats) {
-                          setEnteredPasscode("");
-                          setShowPasscodeModal(true);
-                        } else {
-                          setShowLockedChats(false);
-                        }
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center justify-between text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors"
-                    >
-                      <div className="flex-col">
-                        <div className="flex items-center gap-2 italic">
-                          <Lock className="w-4 h-4" />
-                          Locked Archive
-                        </div>
-                        <p className="text-[8px] text-[#8696af] uppercase font-black text-left pl-6 tracking-widest mt-0.5 mt-1">
-                          Secured by cryptographic pin
-                        </p>
-                      </div>
-                      <div
-                        className={`w-8 h-4 rounded-full relative transition-colors ${showLockedChats ? "bg-[#00a884]" : "bg-white/10"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${showLockedChats ? "left-4.5" : "left-0.5"}`}
-                        />
-                      </div>
-                    </button>
-                    <button
-                      onClick={() => {
-                        updateProSettings({
-                          ghostMode: !proSettings.ghostMode,
-                        });
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center justify-between text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors"
-                    >
-                      <div className="flex items-center gap-2 italic">
-                        <Monitor className="w-4 h-4" />
-                        Ghost Mode
-                      </div>
-                      <div
-                        className={`w-8 h-4 rounded-full relative transition-colors ${proSettings.ghostMode ? "bg-[#00a884]" : "bg-white/10"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${proSettings.ghostMode ? "left-4.5" : "left-0.5"}`}
-                        />
-                      </div>
-                    </button>
-                    <button
-                      onClick={() => {
-                        updateProSettings({
-                          antiDelete: !proSettings.antiDelete,
-                        });
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center justify-between text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors"
-                    >
-                      <div className="flex items-center gap-2 italic">
-                        <ShieldCheck className="w-4 h-4" />
-                        Anti-Delete
-                      </div>
-                      <div
-                        className={`w-8 h-4 rounded-full relative transition-colors ${proSettings.antiDelete ? "bg-[#00a884]" : "bg-white/10"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${proSettings.antiDelete ? "left-4.5" : "left-0.5"}`}
-                        />
-                      </div>
-                    </button>
-                    <button
-                      onClick={() => {
-                        fetchRecycleBin();
-                        setShowRecycleBin(true);
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors italic"
-                    >
-                      <History className="w-4 h-4 text-[#00a884]" />
-                      Recycle Bin
-                    </button>
-                    <button
-                      onClick={() => {
-                        readAll();
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors italic"
-                    >
-                      <Check className="w-4 h-4 text-[#00a884]" />
-                      Read All Messages
-                    </button>
-                    <button
-                      onClick={() => {
-                        setSettingsView("starred");
-                        setShowSettings(true);
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors italic"
-                    >
-                      <Star className="w-4 h-4 text-[#00a884]" />
-                      Starred Messages
-                    </button>
-                    <button
-                      onClick={() => {
-                        setShowSettings(true);
-                        setSettingsView("main");
-                        setIsMainMenuOpen(false);
-                      }}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-[11px] font-bold transition-colors italic"
-                    >
-                      <Settings className="w-4 h-4 text-[#00a884]" />
-                      Global Settings
-                    </button>
-                    <div className="h-px bg-white/5 my-1" />
-                    <button
-                      onClick={hardLogout}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-red-500 hover:bg-white/5 text-[11px] font-bold italic transition-colors"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                      Deactivate System
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Dual Session Account Selector */}
-        <div className="flex border-b border-white/5 bg-[#111b21] p-1.5 gap-1.5 backdrop-blur-md">
-          <button
-            onClick={() => {
-              setSelectedAccount("me");
-              setActiveChat(null);
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
-              selectedAccount === "me"
-                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)]"
-                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
-            }`}
-          >
-            <User className="w-3.5 h-3.5" />
-            My Session {connectionState === "open" ? "●" : "○"}
-          </button>
-          <button
-            onClick={() => {
-              setSelectedAccount("friend");
-              setActiveChatFriend(null);
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
-              selectedAccount === "friend"
-                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)] font-bold"
-                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
-            }`}
-          >
-            <Plus className="w-3.5 h-3.5" />
-            Login Friend {connectionStateFriend === "open" ? "●" : "○"}
-          </button>
-        </div>
-
-        {/* Tab Navigation */}
-        <div className="flex border-b border-white/5 bg-[#111b21] h-12">
-          {(["CHATS", "STATUS", "CALLS", "RECORDS"] as Tab[]).map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`flex-1 text-[11px] font-black tracking-widest transition-all relative ${activeTab === tab ? "text-[#00a884]" : "text-[#aebac1]"}`}
-            >
-              {tab}
-              {activeTab === tab && (
-                <motion.div
-                  layoutId="tab-underline"
-                  className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#00a884]"
-                />
-              )}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex-1 overflow-y-auto custom-scrollbar">
-          {activeTab === "CHATS" && (
-            <>
-              <div className="p-3 bg-[#111b21] sticky top-0 z-10 border-b border-white/5">
-                <div className="bg-[#202c33] flex items-center px-4 py-2 rounded-xl border border-white/5 focus-within:border-[#00a884]/30 transition-all mb-3">
-                  <Search className="w-4 h-4 text-[#aebac1]" />
-                  <input
-                    type="text"
-                    placeholder="Search Master Index (Name or ID)..."
-                    className="bg-transparent border-none outline-none text-xs text-white px-3 w-full placeholder:text-[#aebac1]/50"
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                  />
-                  {searchTerm && (
-                    <button onClick={() => setSearchTerm("")}>
-                      <X className="w-3 h-3 text-[#aebac1]" />
-                    </button>
-                  )}
-                </div>
-
-                <div className="flex overflow-x-auto whitespace-nowrap scrollbar-none gap-2 pb-2 max-w-full touch-pan-x select-none">
-                  {(["ALL", "UNREAD", "FAVORITES", "GROUPS", "VERIFIED", "NEW"] as const).map(
-                    (tab) => {
-                      const isActive = chatSubTab === tab || (tab === "VERIFIED" && verifiedConstantActive);
-                      return (
-                        <button
-                          key={tab}
-                          onClick={() => {
-                            if (tab === "VERIFIED") {
-                              setVerifiedConstantActive(!verifiedConstantActive);
-                            } else {
-                              setChatSubTab(tab);
-                            }
-                            setShowLockedChats(false);
-                          }}
-                          className={`px-4 py-2 min-w-[95px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1 ${isActive ? "bg-[#00a884] text-white border-[#00a884] shadow-lg shadow-[#00a884]/20" : "bg-white/5 text-[#aebac1] border-white/5 hover:bg-white/10"}`}
-                        >
-                          {tab === "VERIFIED" && verifiedConstantActive ? "🛡️ VERIFIED ✓" : tab}
-                        </button>
-                      );
-                    },
-                  )}
-                  <button
-                    onClick={() => {
-                      setUnlockPinInput("");
-                      setShowUnlockPinPromptModal(true);
-                    }}
-                    className={`px-4 py-2 min-w-[120px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border flex items-center justify-center gap-1.5 ${chatSubTab === "LOCKED" ? "bg-amber-500 text-black border-amber-500 shadow-lg shadow-amber-500/20" : "bg-yellow-500/10 text-yellow-500 border-yellow-500/20 hover:bg-yellow-500/20"}`}
-                  >
-                    🔐 UNLOCK CHATS
-                  </button>
-                  <button
-                    onClick={() => {
-                      setSelectedContactsToLock([]);
-                      setNewLockPinInput("");
-                      setConfirmLockPinInput("");
-                      setShowLockSetupModal(true);
-                    }}
-                    className="px-4 py-2 min-w-[125px] rounded-full text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border border-white/5 bg-white/5 text-[#00a884] hover:bg-white/10 flex items-center justify-center gap-1"
-                  >
-                    ➕ LOCK CHATS
-                  </button>
-                </div>
-              </div>
-
-              {(() => {
-                if (selectedAccount === "friend") {
-                  return [...chatsFriend];
-                }
-                const combinedList = [...chats];
-                Object.keys(contacts).forEach((jid) => {
-                  if (!combinedList.some((c) => c.id === jid)) {
-                    combinedList.push({
-                      id: jid,
-                      name: contacts[jid].name || jid.split("@")[0],
-                      timestamp: Date.now(),
-                      lastMessage: null,
-                      unreadCount: 0
-                    });
-                  }
-                });
-                return combinedList;
-              })()
-                .filter((c) => {
-                  const search = searchTerm.toLowerCase();
-                  const displayName = getDisplayName(c).toLowerCase();
-                  const id = c.id.toLowerCase();
-                  const matchesSearch =
-                    displayName.includes(search) || id.includes(search);
-
-                  if (!matchesSearch) return false;
-
-                  // Constantly filter to verified fits if active
-                  if (verifiedConstantActive) {
-                    const isVerified = contacts[c.id]?.name && contacts[c.id].name !== c.id.split('@')[0];
-                    if (!isVerified) return false;
-                  }
-
-                  if (chatSubTab === "UNREAD") return (c.unreadCount || 0) > 0;
-                  if (chatSubTab === "FAVORITES")
-                    return favorites.includes(c.id);
-                  if (chatSubTab === "GROUPS") return c.id.endsWith("@g.us");
-                  if (chatSubTab === "VERIFIED") {
-                    return contacts[c.id]?.name && contacts[c.id].name !== c.id.split('@')[0];
-                  }
-                  if (chatSubTab === "NEW") {
-                    return !c.id.endsWith("@g.us") && c.id !== "status@broadcast";
-                  }
-
-                  return true;
-                })
-                .filter((c) => {
-                  if (chatSubTab === "LOCKED") return lockedChats.includes(c.id);
-                  return !lockedChats.includes(c.id);
-                })
-                .map((chat) => (
-                  <div
-                    key={chat.id}
-                    onClick={() => loadHistory(chat)}
-                    className={`w-full flex items-center gap-4 p-4 hover:bg-[#202c33] cursor-pointer transition-colors border-b border-white/[0.03] group ${(selectedAccount === "friend" ? activeChatFriend?.id : activeChat?.id) === chat.id ? "bg-[#2a3942]" : ""}`}
-                  >
-                    <div className="w-12 h-12 rounded-xl bg-[#374248] flex items-center justify-center shrink-0 border border-white/5 overflow-hidden font-black text-[#00a884] text-xl">
-                      {profilePictures[chat.id] ? (
-                        <img
-                          src={profilePictures[chat.id]}
-                          alt=""
-                          className="w-full h-full object-cover"
-                          referrerPolicy="no-referrer"
-                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                        />
-                      ) : (
-                        getDisplayName(chat)[0]
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0 text-left w-full">
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="font-bold text-sm truncate text-[#e9edef] uppercase tracking-tight">
-                          {getDisplayName(chat)}
-                        </span>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          {favorites.includes(chat.id) && (
-                            <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
-                          )}
-                          {lockedChats.includes(chat.id) && (
-                            <Lock className="w-3 h-3 text-yellow-500" />
-                          )}
-                          {chatSubTab === "LOCKED" && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleLockChat(chat.id);
-                              }}
-                              className="px-2 py-1 hover:bg-[#202c33] rounded text-amber-500 hover:text-amber-400 transition-colors shrink-0 flex items-center gap-1 border border-amber-500/20 bg-amber-500/10 mr-1"
-                              title="Unlock this mobile number"
-                            >
-                              <Unlock className="w-3 h-3 text-amber-500" />
-                              <span className="text-[8px] font-black uppercase tracking-tight">UNLOCK</span>
-                            </button>
-                          )}
-                          <span className="text-[9px] text-[#8696a0] font-black mr-1">
-                            {safeFormat(chat.timestamp, "HH:mm")}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <p className="text-xs text-[#8696a0] truncate opacity-60 font-medium flex-1 mr-2">
-                          {getMsgText(chat.lastMessage) || "SYNCHRONIZING..."}
-                        </p>
-                        <div className="flex items-center gap-1.5 shrink-0 relative">
-                          {(chat.unreadCount || 0) > 0 && (
-                            <div className="bg-[#00a884] text-[#111b21] text-[9px] font-black rounded-lg min-w-[20px] h-5 flex items-center justify-center px-1.5 shadow-lg">
-                              {chat.unreadCount}
-                            </div>
-                          )}
-                          <div className="relative">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setRowMenuChatId(rowMenuChatId === chat.id ? null : chat.id);
-                              }}
-                              className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-white/5 rounded-lg transition-all text-[#aebac1] hover:text-[#00a884]"
-                              title="Chat Actions"
-                            >
-                              <MoreVertical className="w-3.5 h-3.5" />
-                            </button>
-                            {rowMenuChatId === chat.id && (
-                              <>
-                                <div
-                                  className="fixed inset-0 z-40"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setRowMenuChatId(null);
-                                  }}
-                                />
-                                <div className="absolute right-0 bottom-full mb-1 z-50 bg-[#233138] border border-white/10 rounded-xl shadow-2xl py-1 w-44 font-sans text-xs">
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      toggleFavorite(chat.id);
-                                      setRowMenuChatId(null);
-                                    }}
-                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
-                                  >
-                                    <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" />
-                                    {favorites.includes(chat.id) ? "Remove Favorite" : "Add to Favourites"}
-                                  </button>
-                                  
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      toggleLockChat(chat.id);
-                                      setRowMenuChatId(null);
-                                    }}
-                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
-                                  >
-                                    <Lock className="w-3.5 h-3.5 text-yellow-500" />
-                                    {lockedChats.includes(chat.id) ? "Unlock Chat" : "Lock Chat"}
-                                  </button>
-                                  
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setEditingContact({
-                                        id: chat.id,
-                                        name: getDisplayName(chat)
-                                      });
-                                      setRowMenuChatId(null);
-                                    }}
-                                    className="w-full text-left px-4 py-2 text-[#e9edef] hover:bg-white/5 transition-colors flex items-center gap-2"
-                                  >
-                                    <Edit className="w-3.5 h-3.5 text-emerald-500" />
-                                    Edit Name
-                                  </button>
-                                  
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      deleteChat(chat.id);
-                                      setRowMenuChatId(null);
-                                    }}
-                                    className="w-full text-left px-4 py-2 text-red-400 hover:bg-white/5 transition-colors flex items-center gap-2 border-t border-white/5"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                    Delete Chat
-                                  </button>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              {chats.length === 0 && Object.keys(contacts).length === 0 && (
-                <div className="flex flex-col items-center justify-center py-20 px-10 text-center">
-                  <div className="relative mb-6">
-                    <Monitor className="w-12 h-12 opacity-20" />
-                    {connectionState === "open" && (
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <RefreshCw className="w-6 h-6 text-[#00a884] animate-spin" />
-                      </div>
-                    )}
-                  </div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.3em] opacity-40">
-                    {connectionState === "open"
-                      ? "Synchronizing Master Index..."
-                      : "Awaiting Engine Link"}
-                  </p>
-                  {connectionState === "open" && (
-                    <p className="text-[9px] text-[#00a884] font-bold mt-2 uppercase tracking-widest animate-pulse">
-                      Initial Sync in Progress
-                    </p>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-
-          {activeTab === "STATUS" && (
-            <div className="flex flex-col h-full relative">
-              <div className="p-4 border-b border-white/5 flex items-center justify-between">
-                <h3 className="text-[10px] font-black uppercase tracking-widest text-[#00a884]">
-                  Status Pulse
-                </h3>
-                <button
-                  onClick={() => setShowStatusModal(true)}
-                  className="p-2 bg-[#00a884] text-white rounded-xl shadow-lg shadow-[#00a884]/20 hover:scale-110 transition-transform"
-                >
-                  <Plus className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-2">
-                {statusUpdates.map((status, i) => (
-                  <div
-                    key={`${status.id}-${status.timestamp}-${i}`}
-                    onClick={() => {
-                      setActiveStatus(status);
-                      markStatusSeen(status);
-                    }}
-                    className="flex items-center gap-4 p-3 hover:bg-white/5 rounded-xl border border-white/[0.02] cursor-pointer group"
-                  >
-                    <div
-                      className={`w-12 h-12 rounded-full border-2 p-0.5 ${interceptedStatuses.some((s) => s.id === status.id) ? "border-red-500/50" : "border-[#00a884]"}`}
-                    >
-                      <div className="w-full h-full rounded-full bg-[#374248] flex items-center justify-center font-black text-[#00a884] overflow-hidden">
-                        {profilePictures[status.participant] ? (
-                          <img
-                            src={profilePictures[status.participant]}
-                            alt=""
-                            className="w-full h-full object-cover"
-                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                          />
-                        ) : (
-                          getDisplayName(status.participant)[0]
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <p className="text-xs font-bold truncate uppercase">
-                          {getDisplayName(status.participant) ||
-                            status.pushName}
-                        </p>
-                        {interceptedStatuses.some(
-                          (s) => s.id === status.id,
-                        ) && (
-                          <span className="text-[7px] bg-red-500/20 text-red-500 px-1.5 py-0.5 rounded font-black uppercase tracking-tighter">
-                            Intercepted
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-[9px] opacity-40 uppercase font-black">
-                        {safeFormat(status.timestamp, "MMM dd, HH:mm")}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-                {statusUpdates.length === 0 && (
-                  <div className="flex flex-col items-center justify-center py-20 px-10 text-center">
-                    <Camera className="w-12 h-12 opacity-10 mb-4" />
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] opacity-30">
-                      Status stream is encrypted
-                    </p>
-                    <p className="text-[8px] opacity-20 mt-2 font-bold">
-                      PRO Logic: Status updates are mirrored from your mobile
-                      device
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              <AnimatePresence>
-                {activeStatus && (
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="fixed inset-0 z-[110] bg-black flex flex-col items-center justify-center select-none"
-                    onClick={() => setActiveStatus(null)}
-                  >
-                    {/* Segmented Top Progress Bars */}
-                    {(() => {
-                      const chronological = statusUpdates
-                        .filter((s) => s.participant === activeStatus.participant)
-                        .slice()
-                        .reverse();
-                      const idx = chronological.findIndex((s) => s.id === activeStatus.id);
-                      if (chronological.length > 1) {
-                        return (
-                          <div
-                            className="absolute top-3 left-0 right-0 px-3 flex gap-1 z-[120]"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {chronological.map((s, index) => {
-                              let progressValue = 0;
-                              if (index < idx) progressValue = 100;
-                              else if (index === idx) progressValue = statusProgress;
-                              return (
-                                <div
-                                  key={s.id}
-                                  className="h-[3px] flex-1 bg-white/20 rounded-full overflow-hidden"
-                                >
-                                  <div
-                                    className="h-full bg-white transition-all duration-75"
-                                    style={{ width: `${progressValue}%` }}
-                                  />
-                                </div>
-                              );
-                            })}
-                          </div>
-                        );
-                      }
-                      return null;
-                    })()}
-
-                    {/* Profile Info Header */}
-                    <div
-                      className="absolute top-6 left-4 flex items-center gap-4 text-white z-[120]"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="w-10 h-10 rounded-full overflow-hidden bg-white/10 flex-shrink-0">
-                        {profilePictures[activeStatus.participant] ? (
-                          <img
-                            src={profilePictures[activeStatus.participant]}
-                            alt=""
-                            className="w-full h-full object-cover"
-                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                          />
-                        ) : (
-                          <div className="w-full h-full bg-[#00a884] flex items-center justify-center font-black uppercase text-sm">
-                            {getDisplayName(activeStatus.participant)[0]}
-                          </div>
-                        )}
-                      </div>
-                      <div>
-                        <p className="text-sm font-bold shadow-sm">
-                          {getDisplayName(activeStatus.participant) ||
-                            activeStatus.pushName}
-                        </p>
-                        <p className="text-[10px] opacity-60 shadow-sm">
-                          {safeFormat(activeStatus.timestamp, "HH:mm")}
-                        </p>
-                      </div>
-                    </div>
-
-                    <button
-                      className="absolute top-6 right-4 text-white z-[120] hover:scale-110 active:scale-90 transition-transform"
-                      onClick={() => setActiveStatus(null)}
-                    >
-                      <X className="w-8 h-8 drop-shadow-md" />
-                    </button>
-
-                    {/* Tap-to-Navigate Zones */}
-                    <div
-                      className="absolute inset-y-0 left-0 w-[20%] z-40 cursor-w-resize"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const chronological = statusUpdates
-                          .filter((s) => s.participant === activeStatus.participant)
-                          .slice()
-                          .reverse();
-                        const idx = chronological.findIndex((s) => s.id === activeStatus.id);
-                        if (idx > 0) {
-                          setActiveStatus(chronological[idx - 1]);
-                        } else {
-                          setActiveStatus(null);
-                        }
-                      }}
-                    />
-                    <div
-                      className="absolute inset-y-0 right-0 w-[20%] z-40 cursor-e-resize"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const chronological = statusUpdates
-                          .filter((s) => s.participant === activeStatus.participant)
-                          .slice()
-                          .reverse();
-                        const idx = chronological.findIndex((s) => s.id === activeStatus.id);
-                        if (idx < chronological.length - 1) {
-                          setActiveStatus(chronological[idx + 1]);
-                        } else {
-                          setActiveStatus(null);
-                        }
-                      }}
-                    />
-
-                    {/* Main Content Display Panel */}
-                    <div
-                      className="max-w-full max-h-screen p-4 flex flex-col items-center justify-center gap-6 z-30 select-text"
-                      onClick={(e) => e.stopPropagation()}
-                      onMouseDown={() => setIsStatusPaused(true)}
-                      onMouseUp={() => setIsStatusPaused(false)}
-                      onTouchStart={() => setIsStatusPaused(true)}
-                      onTouchEnd={() => setIsStatusPaused(false)}
-                    >
-                      {activeStatus.message?.videoMessage && (
-                        <div className="flex flex-col items-center gap-4">
-                          <video
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
-                            onError={(e) => { e.currentTarget.style.display='none'; }}
-                            controls
-                            autoPlay
-                            playsInline
-                            onPlay={() => setIsStatusPaused(false)}
-                            onPause={() => setIsStatusPaused(true)}
-                            onLoadedMetadata={(e: any) => {
-                              const d = e.target.duration;
-                              if (d && !isNaN(d)) setStatusDuration(d * 1000);
-                            }}
-                            onWaiting={() => setIsStatusPaused(true)}
-                            onCanPlay={() => setIsStatusPaused(false)}
-                            onPlaying={() => setIsStatusPaused(false)}
-                            className="max-w-full max-h-[60vh] rounded-xl shadow-2xl border border-white/5"
-                          />
-                          <div className="flex gap-3 justify-center">
-                            <button
-                              onClick={() =>
-                                downloadMedia(
-                                  activeStatus.id,
-                                  "status@broadcast",
-                                  `status_video_${activeStatus.id}.mp4`,
-                                )
-                              }
-                              className="px-4 py-2.5 bg-zinc-950/80 hover:bg-zinc-900 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center gap-2 border border-white/10 shadow-lg hover:border-[#00a884] active:scale-95"
-                            >
-                              <Download className="w-4 h-4 text-[#00a884] animate-bounce" />
-                              Download MP4
-                            </button>
-                            <button
-                              onClick={() =>
-                                downloadMedia(
-                                  activeStatus.id,
-                                  "status@broadcast",
-                                  `status_audio_${activeStatus.id}.mp3`,
-                                )
-                              }
-                              className="px-4 py-2.5 bg-zinc-950/80 hover:bg-zinc-900 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center gap-2 border border-white/10 shadow-lg hover:border-[#00a884] active:scale-95"
-                            >
-                              <Music className="w-4 h-4 text-[#00a884] animate-pulse" />
-                              Download MP3
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {activeStatus.message?.audioMessage && (
-                        <div className="bg-white/10 p-8 rounded-3xl backdrop-blur-xl flex flex-col items-center gap-4">
-                          <Mic className="w-12 h-12 text-[#00a884] animate-pulse" />
-                          <audio
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
-                            controls
-                            autoPlay
-                            onPlay={() => setIsStatusPaused(false)}
-                            onPause={() => setIsStatusPaused(true)}
-                            onLoadedMetadata={(e: any) => {
-                              const d = e.target.duration;
-                              if (d && !isNaN(d)) setStatusDuration(d * 1000);
-                            }}
-                            onWaiting={() => setIsStatusPaused(true)}
-                            onCanPlay={() => setIsStatusPaused(false)}
-                            onPlaying={() => setIsStatusPaused(false)}
-                          />
-                          <p className="text-[10px] font-black uppercase tracking-widest opacity-40">
-                            Sonic Broadcast Active
-                          </p>
-                        </div>
-                      )}
-                      {activeStatus.message?.imageMessage && (
-                        <div className="flex flex-col items-center gap-4">
-                          <img
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
-                            alt="Status"
-                            onError={(e) => {
-                              e.currentTarget.style.display = 'none';
-                            }}
-                            className="max-w-full max-h-[70vh] rounded-xl shadow-2xl"
-                          />
-                          <button
-                            onClick={() =>
-                              downloadMedia(
-                                activeStatus.id,
-                                "status@broadcast",
-                                `status_image_${activeStatus.id}.jpg`,
-                              )
-                            }
-                            className="px-4 py-2 text-white bg-zinc-950/80 border border-white/10 rounded-xl hover:border-[#00a884] transition-all flex items-center gap-2 text-xs uppercase font-black"
-                          >
-                            <Download className="w-3.5 h-3.5 text-[#00a884]" /> Download Image
-                          </button>
-                        </div>
-                      )}
-
-                      {/* Text Captions / Pure Text status display */}
-                      {activeStatus.message?.conversation ||
-                      activeStatus.message?.extendedTextMessage?.text ||
-                      activeStatus.message?.imageMessage?.caption ||
-                      activeStatus.message?.videoMessage?.caption ? (
-                        <div className="text-white text-lg font-medium text-center bg-black/60 p-5 rounded-2xl backdrop-blur-sm max-w-lg border border-white/10">
-                          {activeStatus.message?.conversation ||
-                            activeStatus.message?.extendedTextMessage?.text ||
-                            activeStatus.message?.imageMessage?.caption ||
-                            activeStatus.message?.videoMessage?.caption}
-                        </div>
-                      ) : (
-                        !activeStatus.message?.imageMessage &&
-                        !activeStatus.message?.videoMessage &&
-                        !activeStatus.message?.audioMessage && (
-                          <div
-                            className="text-white text-3xl font-black text-center p-12 rounded-3xl max-w-2xl leading-tight select-text shadow-2xl backdrop-blur-sm border border-white/10 bg-gradient-to-br from-[#00a884] to-[#128c7e]"
-                            style={{
-                              backgroundColor:
-                                activeStatus.backgroundColor || "#00a884",
-                            }}
-                          >
-                            {activeStatus.text ||
-                              activeStatus.message?.extendedTextMessage?.text ||
-                              "Broadcast Package"}
-                          </div>
-                        )
-                      )}
-                    </div>
-
-                    {/* Reply Bar Overlay */}
-                    <div
-                      className="absolute bottom-10 left-1/2 -translate-x-1/2 w-full max-w-md px-6 z-50"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="bg-white/10 backdrop-blur-xl p-2 rounded-2xl border border-white/20 flex items-center gap-3 shadow-2xl">
-                        <input
-                          type="text"
-                          placeholder="Reply to status..."
-                          className="flex-1 bg-transparent border-none outline-none text-white px-4 py-2 text-sm placeholder:text-white/40"
-                          value={statusReplyText}
-                          onChange={(e) => setStatusReplyText(e.target.value)}
-                          onKeyPress={(e) =>
-                            e.key === "Enter" && replyToStatus()
-                          }
-                          onFocus={() => setIsStatusPaused(true)}
-                          onBlur={() => setIsStatusPaused(false)}
-                        />
-                        <button
-                          onClick={replyToStatus}
-                          disabled={!statusReplyText.trim()}
-                          className="p-3 bg-[#00a884] text-white rounded-xl disabled:opacity-50 transition-all hover:scale-105"
-                        >
-                          <Send className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          )}
-
-          {activeTab === "CALLS" && (
-            <div className="space-y-1 p-2">
-              {callHistory.map((call, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-4 p-3 hover:bg-white/5 rounded-xl border border-white/[0.02]"
-                >
-                  <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center">
-                    <Phone
-                      className={`w-4 h-4 ${call.status === "missed" ? "text-red-500" : "text-[#00a884]"}`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold truncate uppercase">
-                      {getDisplayName(call.from || "")}
-                    </p>
-                    <p className="text-[9px] opacity-40 uppercase font-black">
-                      {call.status} •{" "}
-                      {safeFormat(
-                        call.timestamp,
-                        "MMM dd, HH:mm",
-                        safeFormat(new Date(), "MMM dd, HH:mm"),
-                      )}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => {
-                      if (call.from) {
-                        const num = call.from.split("@")[0];
-                        startInAppCall(call.from);
-                      }
-                    }}
-                    className="p-2 hover:bg-white/5 rounded-full text-[#00a884]"
-                  >
-                    <Phone className="w-4 h-4" />
-                  </button>
-                </div>
-              ))}
-              {callHistory.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-20 px-10 text-center">
-                  <Phone className="w-12 h-12 opacity-10 mb-4" />
-                  <p className="text-[10px] font-black uppercase tracking-[0.3em] opacity-30">
-                    Call log empty
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-          {activeTab === "RECORDS" && (
-            <div className="p-4 space-y-4 h-full flex flex-col overflow-hidden bg-[#111b21]">
-              <div className="p-3 bg-[#202c33] rounded-xl border border-white/5 space-y-1">
-                <div className="flex items-center gap-2">
-                  <Mic className="w-4 h-4 text-[#00a884]" />
-                  <span className="text-[#00a884] font-black uppercase tracking-wider text-[11px]">
-                    Vault Call Recordings
-                  </span>
-                </div>
-                <p className="text-[9px] text-white/50">
-                  Secure backup and active call log auditing files. Always offline persistent.
-                </p>
-              </div>
-
-              <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
-                {callRecords.length === 0 ? (
-                  <div className="h-44 flex flex-col items-center justify-center space-y-2 opacity-30 text-center">
-                    <Mic className="w-8 h-8 text-white" />
-                    <p className="text-[10px] font-black uppercase tracking-wider">No recordings offline</p>
-                  </div>
-                ) : (
-                  callRecords.map((record: any) => (
-                    <div
-                      key={record.id}
-                      className="p-3 bg-[#202c33]/50 border border-white/5 rounded-xl flex flex-col space-y-3 transition-hover hover:bg-[#202c33]"
-                    >
-                      <div className="flex justify-between items-start">
-                        <div className="space-y-0.5">
-                          <p className="text-[11px] font-black text-white truncate max-w-[180px]">
-                            {record.contactName || record.to || "Unknown Call"}
-                          </p>
-                          <p className="text-[9px] font-mono text-white/40">
-                            {record.to}
-                          </p>
-                        </div>
-                        <span className="p-1 px-2 rounded-md bg-white/5 text-white/60 text-[8px] font-bold font-mono">
-                          {record.type === "video" ? "VIDEO" : "AUDIO"}
-                        </span>
-                      </div>
-
-                      <div className="flex items-center justify-between text-[9px] text-[#aebac1]">
-                        <span className="flex items-center gap-1">
-                          <Clock className="w-3 h-3 text-[#00a884]" />
-                          {record.duration}s
-                        </span>
-                        <span className="text-white/30 text-[8px]">
-                          {new Date(record.timestamp * 1000).toLocaleString()}
-                        </span>
-                      </div>
-
-                      <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                        <audio
-                          src={record.recording_url}
-                          controls
-                          className="flex-1 h-7 rounded-lg bg-black/40 text-white [&::-webkit-media-controls-panel]:bg-[#202c33]"
-                        />
-                        <a
-                          href={record.recording_url}
-                          download={`call_${record.id}.mp3`}
-                          className="px-3 py-1.5 h-7 bg-[#00a884] text-white hover:bg-[#00a884]/80 rounded-lg text-[9px] font-black uppercase tracking-wider flex items-center justify-center gap-1 transition-all"
-                        >
-                          <Download className="w-3 h-3" />
-                          Save
-                        </a>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Main View - Chat Content */}
-      <div className="flex-1 flex flex-col bg-[#0b141a] relative">
-        <div
-          className="absolute inset-0 opacity-[0.03] pointer-events-none"
-          style={{
-            backgroundImage:
-              'url("https://user-images.githubusercontent.com/15075759/28719144-86dc0f70-73b1-11e7-911d-60d70fcded21.png")',
-          }}
-        />
-
-        {activeCallSession && (
-          <div className="absolute inset-0 z-50 bg-[#070c10] flex flex-col items-center justify-between p-12 text-white overflow-hidden animate-in fade-in duration-300">
-            {/* Ambient background glow */}
-            <div
-              className={`absolute top-1/4 w-80 h-80 rounded-full bg-[#00a884]/10 blur-[100px] transition-all duration-1000 ${activeCallSession.status === "ringing" ? "scale-110 opacity-70" : "scale-125 opacity-40"}`}
-            />
-
-            {/* Header / Info */}
-            <div className="text-center space-y-4 z-10 mt-8">
-              <div className="inline-flex items-center gap-2 px-3 py-1 bg-[#00a884]/15 border border-[#00a884]/30 rounded-full text-xs font-black tracking-widest text-[#00a884] uppercase animate-pulse">
-                {activeCallSession.isVideo
-                  ? "Secure Video Link"
-                  : "Secure voice interface"}
-              </div>
-              <h2 className="text-3xl font-black uppercase tracking-tight italic">
-                {activeCallSession.recipientName}
-              </h2>
-              <p className="text-[#8696af] font-mono text-xs uppercase tracking-widest font-bold">
-                {activeCallSession.status === "ringing"
-                  ? "INITIALIZING TRANSPONDERS (RINGING)..."
-                  : "SECURE COMMUNICATIONS CHANNEL ACTIVATED"}
-              </p>
-            </div>
-
-            {/* Avatar / Camera Preview View */}
-            <div className="relative z-10 my-6 flex items-center justify-center">
-              {activeCallSession.isVideo &&
-              activeCallSession.status === "connected" ? (
-                <div className="w-64 h-64 md:w-80 md:h-80 rounded-[3rem] bg-accent border-2 border-[#00a884]/40 overflow-hidden shadow-2xl relative flex items-center justify-center">
-                  <div className="absolute inset-0 bg-[#070d12] flex items-center justify-center">
-                    <div className="w-full h-full bg-[#0b141a] flex flex-col items-center justify-center gap-4 text-center p-6">
-                      <User className="w-20 h-20 text-[#00a884] opacity-20 animate-pulse" />
-                      <p className="text-[10px] font-black tracking-widest text-[#8696af] uppercase">
-                        Incoming cryptographic feed syncing...
-                      </p>
-                    </div>
-                  </div>
-                  {/* Local feed insert */}
-                  <div className="absolute bottom-4 right-4 w-20 h-28 bg-[#111b21] rounded-xl border border-white/10 shadow-xl overflow-hidden flex items-center justify-center">
-                    <User className="w-8 h-8 text-white opacity-40" />
-                  </div>
-                </div>
-              ) : (
-                <div className="relative group">
-                  {/* Pulsing visual halo rings */}
-                  <div className="absolute inset-0 rounded-[2.5rem] bg-[#00a884]/10 scale-110 animate-ping opacity-60" />
-                  <div className="absolute inset-0 rounded-[2.5rem] bg-[#00a884]/5 scale-125 animate-pulse opacity-40" />
-
-                  <div className="w-40 h-40 rounded-[2.5rem] bg-[#00a884]/10 border-2 border-dashed border-[#00a884]/30 flex items-center justify-center overflow-hidden shadow-2xl relative">
-                    {profilePictures[activeCallSession.jid] ? (
-                      <img
-                        src={profilePictures[activeCallSession.jid]}
-                        className="w-full h-full object-cover"
-                        referrerPolicy="no-referrer"
-                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                      />
-                    ) : (
-                      <User className="w-20 h-20 text-[#00a884]" />
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Timer Output */}
-            <div className="text-center z-10 space-y-2">
-              {activeCallSession.status === "connected" && (
-                <div className="space-y-2">
-                  <div className="font-mono text-2xl font-black text-[#00a884] tracking-widest bg-white/5 border border-white/5 px-6 py-2 rounded-xl inline-block shadow-inner">
-                    {Math.floor(activeCallSession.duration / 60)
-                      .toString()
-                      .padStart(2, "0")}
-                    :
-                    {(activeCallSession.duration % 60)
-                      .toString()
-                      .padStart(2, "0")}
-                  </div>
-                  {isCallRecording && (
-                    <div className="flex items-center justify-center gap-1.5 text-red-500 font-bold uppercase tracking-widest text-[9px] animate-pulse">
-                      <span className="w-2 h-2 rounded-full bg-red-500" />
-                      <span>Recording...</span>
-                    </div>
-                  )}
-                </div>
-              )}
-              <p className="text-[9px] text-[#8696af] uppercase tracking-[0.2em] font-black opacity-60">
-                END TO END ENCRYPTED • ZERO LEAK GATEWAY
-              </p>
-            </div>
-
-            {/* Dashboard Call Actions */}
-            <div className="flex items-center gap-4 z-10 mb-8">
-              <button
-                onClick={() =>
-                  setActiveCallSession((prev) =>
-                    prev ? { ...prev, isMuted: !prev.isMuted } : null,
-                  )
-                }
-                className={`w-14 h-14 rounded-2xl flex items-center justify-center border transition-all ${activeCallSession.isMuted ? "bg-red-500/20 text-red-500 border-red-500/40" : "bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15"}`}
-              >
-                {activeCallSession.isMuted ? (
-                  <MicOff className="w-5 h-5" />
-                ) : (
-                  <Mic className="w-5 h-5" />
-                )}
-              </button>
-
-              <button
-                onClick={toggleCallRecording}
-                className={`w-14 h-14 rounded-2xl flex flex-col items-center justify-center border transition-all ${isCallRecording ? "bg-red-500/20 text-red-500 border-red-500/40 animate-pulse" : "bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15"}`}
-                title="Toggle Call Recording"
-              >
-                <Mic className="w-5 h-5 mb-0.5" />
-                <span className="text-[8px] font-black uppercase text-center block leading-none">
-                  {isCallRecording ? "REC ON" : "RECORD"}
-                </span>
-              </button>
-
-              <button
-                onClick={endInAppCall}
-                className="w-20 h-14 rounded-2xl bg-red-600 hover:bg-red-700 text-white flex items-center justify-center transition-all shadow-lg shadow-red-600/30 font-black hover:scale-105 active:scale-95 animate-pulse"
-              >
-                <PhoneOff className="w-6 h-6" />
-              </button>
-
-              <button
-                onClick={() =>
-                  setActiveCallSession((prev) =>
-                    prev ? { ...prev, isVideo: !prev.isVideo } : null,
-                  )
-                }
-                className={`w-14 h-14 rounded-2xl flex items-center justify-center border transition-all ${activeCallSession.isVideo ? "bg-[#00a884]/20 text-[#00a884] border-[#00a884]/40" : "bg-white/5 text-[#aebac1] border-white/10 hover:bg-white/15"}`}
-              >
-                <Video className="w-5 h-5" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {displayedActiveChat ? (() => {
-          const activeChat = displayedActiveChat;
-          const messages = displayedMessages;
-          const currentSetActiveChat = selectedAccount === "friend" ? setActiveChatFriend : setActiveChat;
-          return (
-            <>
-              <AnimatePresence>
-              {showUploadPreview && selectedUploadFile && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  className="absolute inset-0 bg-[#0c1317]/98 backdrop-blur-md z-30 flex flex-col justify-between p-6 md:p-12"
-                >
-                  {/* Header */}
-                  <div className="flex items-center justify-between pb-6 border-b border-white/5">
-                    <div>
-                      <h3 className="text-lg font-black uppercase tracking-widest italic text-white flex items-center gap-2">
-                        <span>PREPARE SONIC PAYLOAD</span>
-                        <span className="px-2 py-0.5 bg-[#00a884]/20 border border-[#00a884]/30 rounded text-[9px] font-mono text-[#00a884] non-italic">
-                          READY
-                        </span>
-                      </h3>
-                      <p className="text-[10px] text-white/40 uppercase tracking-wider font-bold mt-1">
-                        Verify file integrity and optional caption header
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => {
-                        setSelectedUploadFile(null);
-                        setShowUploadPreview(false);
-                        setUploadCaption("");
-                      }}
-                      className="p-2.5 hover:bg-white/5 rounded-full text-white/60 hover:text-white transition-all border border-white/5 hover:border-white/10"
-                    >
-                      <X className="w-5 h-5" />
-                    </button>
-                  </div>
-
-                  {/* File Visual Representation */}
-                  <div className="flex-1 flex flex-col items-center justify-center p-8">
-                    <div className="max-w-md w-full bg-white/[0.02] border border-white/5 rounded-3xl p-6 flex flex-col items-center text-center shadow-2xl relative overflow-hidden">
-                      <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#00a884]/45 to-transparent animate-pulse" />
-
-                      {uploadFileType === "image" ? (
-                        <div className="w-full max-h-[250px] mb-4 overflow-hidden rounded-xl border border-white/5 bg-black/20 flex items-center justify-center">
-                          <img
-                            src={URL.createObjectURL(selectedUploadFile)}
-                            alt="Upload preview"
-                            className="max-w-full max-h-[250px] object-contain rounded-xl"
-                          />
-                        </div>
-                      ) : uploadFileType === "video" ? (
-                        <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
-                          <Video className="w-8 h-8 text-[#00a884]" />
-                        </div>
-                      ) : uploadFileType === "audio" ? (
-                        <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
-                          <Music className="w-8 h-8 text-[#00a884]" />
-                        </div>
-                      ) : (
-                        <div className="w-16 h-16 bg-[#00a884]/15 rounded-2xl flex items-center justify-center mb-4 border border-[#00a884]/20">
-                          <FileText className="w-8 h-8 text-[#00a884]" />
-                        </div>
-                      )}
-
-                      <p className="text-sm font-black text-white truncate max-w-full italic px-2">
-                        {selectedUploadFile.name}
-                      </p>
-                      <p className="text-[10px] uppercase font-mono text-[#00a884] font-black tracking-widest mt-1">
-                        {uploadFileType} •{" "}
-                        {(selectedUploadFile.size / 1024 / 1024).toFixed(2)} MB
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Caption & Send Actions footer */}
-                  <div className="space-y-4 pt-6 border-t border-white/5">
-                    <div className="bg-[#2a3942] rounded-2xl flex items-center px-5 py-2 border border-white/10 max-w-3xl mx-auto w-full">
-                      <input
-                        type="text"
-                        placeholder="ADD A CAPTION FOR THIS PAYLOAD..."
-                        value={uploadCaption}
-                        onChange={(e) => setUploadCaption(e.target.value)}
-                        onKeyPress={(e) =>
-                          e.key === "Enter" &&
-                          !isUploading &&
-                          handleUploadAndSend()
-                        }
-                        className="bg-transparent border-none outline-none text-sm text-white px-2 py-3.5 w-full placeholder:text-white/20 font-bold tracking-tight"
-                        disabled={isUploading}
-                      />
-                    </div>
-
-                    <div className="flex justify-end gap-3 max-w-3xl mx-auto w-full">
-                      <button
-                        onClick={() => {
-                          setSelectedUploadFile(null);
-                          setUploadCaption("");
-                          setShowUploadPreview(false);
-                        }}
-                        disabled={isUploading}
-                        className="px-6 py-3.5 bg-white/5 hover:bg-white/10 rounded-2xl text-[10px] font-black uppercase tracking-widest text-[#aebac1] hover:text-white transition-all disabled:opacity-50"
-                      >
-                        Discard
-                      </button>
-                      <button
-                        onClick={handleUploadAndSend}
-                        disabled={isUploading}
-                        className="px-8 py-3.5 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 shadow-xl shadow-[#00a884]/20 disabled:scale-95 disabled:opacity-50"
-                      >
-                        {isUploading ? (
-                          <>
-                            <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                            <span>Sending...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Send className="w-3.5 h-3.5 text-white" />
-                            <span>Transmit File</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* Chat header */}
-            <div className="bg-accent p-3 flex items-center justify-between z-10 shadow-lg">
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => currentSetActiveChat(null)}
-                  className="md:hidden text-[#aebac1]"
-                >
-                  <ChevronLeft />
-                </button>
-                <div className="w-10 h-10 rounded-xl bg-surface flex items-center justify-center border border-white/5 font-black text-primary overflow-hidden">
-                  {profilePictures[activeChat.id] ? (
-                    <img
-                      src={profilePictures[activeChat.id]}
-                      alt=""
-                      className="w-full h-full object-cover"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                    />
-                  ) : (
-                    getDisplayName(activeChat)[0]
-                  )}
-                </div>
-                <div
-                  className="cursor-pointer hover:bg-white/5 px-2 py-1 rounded-lg transition-colors flex items-center gap-1.5"
-                  onClick={() => setShowContactInfo(!showContactInfo)}
-                >
-                  <h2 className="font-black text-sm uppercase tracking-tight italic">
-                    {getDisplayName(activeChat)}
-                  </h2>
-                  {favorites.includes(activeChat.id) && (
-                    <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400 shrink-0" />
-                  )}
-                  {lockedChats.includes(activeChat.id) && (
-                    <Lock className="w-3.5 h-3.5 text-yellow-500 shrink-0 animate-pulse" />
-                  )}
-                  <p className="text-[9px] text-primary font-black uppercase tracking-widest mt-0.5">
-                    {showContactInfo
-                      ? activeChat.id.split("@")[0]
-                      : "Encrypted Pulse Active"}
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-5 text-[#aebac1]">
-                <button
-                  onClick={() => setShowScheduleModal(true)}
-                  className="hover:text-primary transition-colors p-1"
-                  title="Schedule Protocol"
-                >
-                  <Clock className="w-5 h-5" />
-                </button>
-                <button
-                  onClick={() => setShowAutoReplyModal(true)}
-                  className="hover:text-primary transition-colors p-1"
-                  title="Auto Reply Interface"
-                >
-                  <Zap className="w-5 h-5" />
-                </button>
-                <button
-                  className="hover:text-white transition-colors"
-                  onClick={() => startInAppCall(activeChat.id, false)}
-                  title="Voice Call"
-                >
-                  <Phone className="w-5 h-5" />
-                </button>
-                <button
-                  className="hover:text-white transition-colors"
-                  onClick={() => startInAppCall(activeChat.id, true)}
-                  title="Video Call"
-                >
-                  <Video className="w-5 h-5" />
-                </button>
-                <button
-                  className={`hover:text-white transition-colors ${showMsgSearch ? "text-[#00a884]" : ""}`}
-                  onClick={() => {
-                    setShowMsgSearch(!showMsgSearch);
-                    if (showMsgSearch) setMsgSearchQuery("");
-                  }}
-                  title="Search Messages"
-                >
-                  <Search className="w-5 h-5" />
-                </button>
-                <div className="relative">
-                  <button
-                    onClick={() => setIsChatMenuOpen(!isChatMenuOpen)}
-                    className="hover:text-white transition-colors p-1"
-                  >
-                    <MoreVertical className="w-5 h-5" />
-                  </button>
-                  {isChatMenuOpen && (
-                    <>
-                      <div
-                        className="fixed inset-0 z-40"
-                        onClick={() => setIsChatMenuOpen(false)}
-                      />
-                      <div className="absolute top-full right-0 mt-2 w-48 bg-[#233138] rounded-xl shadow-2xl py-2 z-50 border border-white/5 backdrop-blur-xl">
-                        <button
-                          onClick={() => {
-                            toggleLockChat(activeChat.id);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <Lock
-                            className={`w-4 h-4 ${lockedChats.includes(activeChat.id) ? "text-yellow-500" : "text-[#00a884]"}`}
-                          />
-                          {lockedChats.includes(activeChat.id)
-                            ? "Unlock Matrix"
-                            : "Chat Lock"}
-                        </button>
-                        <button
-                          onClick={() => {
-                            setShowContactInfo(!showContactInfo);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <User className="w-4 h-4 text-[#00a884]" />
-                          {showContactInfo
-                            ? "Hide Identity"
-                            : "Reveal Identity"}
-                        </button>
-                        <button
-                          onClick={() => {
-                            setSettingsView("starred");
-                            setShowSettings(true);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <Star className="w-4 h-4 text-[#00a884]" />
-                          Starred Signals
-                        </button>
-                        <button
-                          onClick={() => {
-                            setEditingContact({
-                              id: activeChat.id,
-                              name: getDisplayName(activeChat),
-                            });
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <Settings className="w-4 h-4 text-[#00a884]" />
-                          Rename Matrix
-                        </button>
-                        <button
-                          onClick={() => {
-                            toggleFavorite(activeChat.id);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <Star
-                            className={`w-4 h-4 ${favorites.includes(activeChat.id) ? "text-yellow-400 fill-yellow-400" : "text-[#00a884]"}`}
-                          />
-                          {favorites.includes(activeChat.id)
-                            ? "Remove Favorite"
-                            : "Add to Favorite"}
-                        </button>
-                        <button
-                          onClick={() => {
-                            const content = messages
-                              .map(
-                                (m) =>
-                                  `[${safeFormat(m.timestamp, "yyyy-MM-dd HH:mm:ss")}] ${m.sender}: ${m.text}`,
-                              )
-                              .join("\n");
-                            const blob = new Blob([content], {
-                              type: "text/plain",
-                            });
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement("a");
-                            a.href = url;
-                            a.download = `chat_export_${activeChat.id.split("@")[0]}.txt`;
-                            a.click();
-                            URL.revokeObjectURL(url);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <FileText className="w-4 h-4 text-[#00a884]" />
-                          Export Data
-                        </button>
-                        <button
-                          onClick={() => {
-                            clearChat(activeChat.id);
-                            setIsChatMenuOpen(false);
-                          }}
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-[#aebac1] hover:bg-white/5 text-xs font-bold transition-colors italic"
-                        >
-                          <ShieldCheck className="w-4 h-4 text-[#00a884]" />
-                          Purge History
-                        </button>
-                        <div className="h-px bg-white/5 my-1" />
-                        <button
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-red-500 hover:bg-white/5 text-xs font-bold transition-colors italic"
-                          onClick={() => {
-                            blockContact(activeChat.id);
-                            setIsChatMenuOpen(false);
-                          }}
-                        >
-                          <Lock className="w-4 h-4" />
-                          Terminate Signal (Block)
-                        </button>
-                        <button
-                          className="w-full px-4 py-2.5 flex items-center gap-3 text-red-400 hover:bg-white/5 text-xs font-bold transition-colors italic"
-                          onClick={() => {
-                            reportContact(activeChat.id);
-                            setIsChatMenuOpen(false);
-                          }}
-                        >
-                          <Zap className="w-4 h-4" />
-                          Report Signal
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {showMsgSearch && (
-              <div className="bg-[#111b21] px-6 py-3 border-b border-white/5 flex items-center gap-3 animate-slideDown shrink-0">
-                <Search className="w-4 h-4 text-[#00a884]" />
-                <input
-                  type="text"
-                  placeholder="Filter messages in this active terminal..."
-                  className="bg-transparent border-none outline-none text-xs text-white px-2 w-full placeholder:text-[#aebac1]/30 italic"
-                  value={msgSearchQuery}
-                  onChange={(e) => setMsgSearchQuery(e.target.value)}
-                  autoFocus
-                />
-                {msgSearchQuery.trim() && (
-                  <span className="text-[9px] bg-[#00a884]/12 text-[#00a884] px-2 py-1 rounded border border-[#00a884]/20 font-mono font-black uppercase shrink-0">
-                    {messages.filter(msg => {
-                      const query = msgSearchQuery.toLowerCase();
-                      return (msg.text || "").toLowerCase().includes(query) || (msg.sender || "").toLowerCase().includes(query);
-                    }).length} matches
-                  </span>
-                )}
-                <button
-                  onClick={() => {
-                    setMsgSearchQuery("");
-                    setShowMsgSearch(false);
-                  }}
-                  className="text-[9px] font-black uppercase tracking-widest text-[#aebac1]/50 hover:text-white transition-colors"
-                >
-                  Close
-                </button>
-              </div>
-            )}
-
-            {/* Messages Area */}
-            <div
-              ref={scrollRef}
-              className="flex-1 overflow-y-auto p-6 md:p-10 space-y-6 z-10 scroll-smooth custom-scrollbar"
-            >
-              <div className="flex justify-center mb-10">
-                <div className="bg-[#1b2831] px-4 py-2 rounded-lg border border-white/5 flex items-center gap-3 shadow-xl">
-                  <ShieldCheck className="w-4 h-4 text-[#00a884]" />
-                  <span className="text-[10px] text-[#8696af] font-black uppercase tracking-widest">
-                    Secure Terminal Logic Verified
-                  </span>
-                </div>
-              </div>
-
-              {messages
-                .filter((msg) => {
-                  if (!msgSearchQuery.trim()) return true;
-                  const query = msgSearchQuery.toLowerCase();
-                  return (
-                    (msg.text || "").toLowerCase().includes(query) ||
-                    (msg.sender || "").toLowerCase().includes(query)
-                  );
-                })
-                .map((msg, i) => (
-                <motion.div
-                  key={`${msg.id}-${i}`}
-                  initial={{ opacity: 0, y: 12, scale: 0.97 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  transition={{ type: "spring", stiffness: 350, damping: 25 }}
-                  className={`flex ${msg.fromMe ? "justify-end" : "justify-start"}`}
-                >
-                  <div
-                    className={`max-w-[70%] px-5 py-3 rounded-2xl shadow-2xl relative group ${msg.fromMe ? "bg-[#005c4b] text-[#e9edef]" : "bg-accent text-[#e9edef]"}`}
-                  >
-                    {!msg.fromMe && activeChat?.id?.endsWith("@g.us") && (
-                      <p className="text-[10px] font-black uppercase text-primary tracking-[1.5px] mb-1 italic truncate max-w-full">
-                        {msg.sender}
-                      </p>
-                    )}
-                    {msg.isRevoked && (
-                      <div className="flex items-center gap-1.5 mb-1.5 opacity-50 italic">
-                        <Trash2 className="w-3 h-3" />
-                        <span className="text-[9px] font-bold uppercase tracking-wider">
-                          Intercepted Deletion
-                        </span>
-                      </div>
-                    )}
-                    {msg.rawMessage?.imageMessage && (
-                      <div className="mb-2 rounded-lg overflow-hidden border border-white/5 relative group/img">
-                        <img
-                          src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
-                          alt="Media"
-                          onError={(e) => {
-                            e.currentTarget.style.display = 'none';
-                          }}
-                          className="max-w-full h-auto object-cover min-h-[100px] bg-white/5"
-                          referrerPolicy="no-referrer"
-                        />
-                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 transition-opacity flex items-center justify-center">
-                          <button
-                            onClick={() =>
-                              setDownloadFormatModal({
-                                msgId: msg.id,
-                                chatId: activeChat.id,
-                                show: true
-                              })
-                            }
-                            className="p-3 bg-[#00a884] rounded-full shadow-2xl scale-75 group-hover/img:scale-100 transition-transform"
-                            title="Download options"
-                          >
-                            <Download className="w-5 h-5 text-white" />
-                          </button>
-                        </div>
-
-                        {downloadFormatModal?.msgId === msg.id && (
-                          <div id={`image-download-menu-${msg.id}`} className="absolute inset-0 bg-black/95 flex flex-col items-center justify-center p-3 z-10 transition-all">
-                            <p className="text-[10px] font-black uppercase text-[#00a884] tracking-widest mb-3">Download Format Channel</p>
-                            <div className="flex gap-2 w-full">
-                              <button
-                                onClick={() => {
-                                  downloadMediaWithFormat(msg.id, activeChat.id, 'jpg');
-                                  setDownloadFormatModal(null);
-                                }}
-                                className="flex-1 py-1.5 bg-[#00a884] hover:bg-[#00bc95] text-white text-[10px] font-black rounded-lg transition-colors uppercase tracking-widest cursor-pointer"
-                              >
-                                JPG Format
-                              </button>
-                              <button
-                                onClick={() => {
-                                  downloadMediaWithFormat(msg.id, activeChat.id, 'png');
-                                  setDownloadFormatModal(null);
-                                }}
-                                className="flex-1 py-1.5 bg-[#00a884] hover:bg-[#00bc95] text-white text-[10px] font-black rounded-lg transition-colors uppercase tracking-widest cursor-pointer"
-                              >
-                                PNG Format
-                              </button>
-                            </div>
-                            <button
-                              onClick={() => setDownloadFormatModal(null)}
-                              className="mt-3 text-[9px] font-bold text-white/50 hover:text-white transition-colors uppercase tracking-wider cursor-pointer"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {msg.rawMessage?.videoMessage && (
-                      <div className="mb-2 rounded-lg p-4 bg-white/5 border border-white/5 flex items-center gap-4">
-                        <PlayCircle className="w-10 h-10 text-[#00a884]" />
-                        <div className="flex-1">
-                          <p className="text-xs font-black uppercase tracking-widest text-[#00a884]">
-                            Video File
-                          </p>
-                          <p className="text-[10px] opacity-40">
-                            Click to fetch and play
-                          </p>
-                        </div>
-                        <button
-                          onClick={() =>
-                            downloadMediaWithFormat(
-                              msg.id,
-                              activeChat.id,
-                              "mp4"
-                            )
-                          }
-                          className="p-2 hover:bg-white/10 rounded-full cursor-pointer"
-                        >
-                          <Download className="w-5 h-5" />
-                        </button>
-                      </div>
-                    )}
-
-                    {msg.rawMessage?.documentMessage && (
-                      <div className="mb-2 rounded-xl p-4 bg-white/5 border border-white/5 flex items-center gap-4 group/doc">
-                        <div className="w-12 h-12 bg-[#00a884]/10 rounded-xl flex items-center justify-center group-hover/doc:bg-[#00a884]/20 transition-colors">
-                          <FileText className="w-6 h-6 text-[#00a884]" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-bold truncate text-[#e9edef]">
-                            {msg.text}
-                          </p>
-                          <p className="text-[10px] uppercase font-black tracking-widest opacity-40 mt-0.5">
-                            Document •{" "}
-                            {(
-                              msg.rawMessage.documentMessage.fileLength /
-                              1024 /
-                              1024
-                            ).toFixed(1)}{" "}
-                            MB
-                          </p>
-                        </div>
-                        <button
-                          onClick={() =>
-                            downloadMedia(msg.id, activeChat.id, msg.text)
-                          }
-                          className="p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-all"
-                        >
-                          <Download className="w-4 h-4 text-[#00a884]" />
-                        </button>
-                      </div>
-                    )}
-
-                    {msg.rawMessage?.audioMessage && (
-                      <div className="mb-2 rounded-xl p-3 bg-white/5 border border-white/5 flex flex-col gap-2 min-w-[200px]">
-                        <div className="flex items-center gap-4">
-                          <button
-                            onClick={async () => {
-                              const res = await fetch(
-                                `/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
-                              );
-                              const blob = await res.blob();
-                              const url = URL.createObjectURL(blob);
-                              new Audio(url).play().catch(() => {});
-                            }}
-                            className="w-10 h-10 bg-[#00a884] rounded-full flex items-center justify-center hover:bg-[#00bc95] transition-colors shadow-lg"
-                          >
-                            <Play className="w-5 h-5 text-white" />
-                          </button>
-                          <div className="flex-1 h-1.5 bg-white/10 rounded-full relative overflow-hidden">
-                            <div className="absolute inset-0 bg-[#00a884] w-[40%] animate-pulse" />
-                          </div>
-                          <span className="text-[10px] font-bold opacity-40 font-mono">
-                            {msg.rawMessage.audioMessage.seconds
-                              ? `${Math.floor(msg.rawMessage.audioMessage.seconds / 60)}:${(msg.rawMessage.audioMessage.seconds % 60).toString().padStart(2, "0")}`
-                              : "0:00"}
-                          </span>
-                        </div>
-                        <div className="flex justify-between items-center px-1">
-                          <p className="text-[9px] font-black uppercase text-[#00a884] tracking-widest">
-                            Sonic Signal
-                          </p>
-                          <button
-                            onClick={() =>
-                              downloadMediaWithFormat(
-                                msg.id,
-                                activeChat.id,
-                                "mp3"
-                              )
-                            }
-                            className="p-1 hover:bg-white/10 rounded-full cursor-pointer"
-                          >
-                            <Download className="w-3 h-3" />
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    <p
-                      className={`text-sm leading-relaxed font-medium ${msg.rawMessage?.documentMessage ? "mt-2" : ""}`}
-                    >
-                      {renderHighlightedText(msg.text, msgSearchQuery)}
-                    </p>
-                    <div className="flex items-center justify-between gap-2 mt-2 pt-1 border-t border-white/5">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[8px] opacity-40 font-black">
-                          {safeFormat(msg.timestamp, "HH:mm")}
-                        </span>
-                        {msg.fromMe && (
-                          <Check
-                            className={`w-3 h-3 ${msg.status === "read" ? "text-sky-400" : "opacity-30"}`}
-                          />
-                        )}
-                        <button
-                          onClick={() =>
-                            setStarredMessages((prev) =>
-                              prev.some((s) => s.id === msg.id)
-                                ? prev.filter((s) => s.id !== msg.id)
-                                : [...prev, msg],
-                            )
-                          }
-                          className={`ml-2 transition-colors ${starredMessages.some((s) => s.id === msg.id) ? "text-yellow-400" : "text-white/10 hover:text-yellow-400"}`}
-                        >
-                          <Star
-                            className={`w-3 h-3 ${starredMessages.some((s) => s.id === msg.id) ? "fill-yellow-400" : ""}`}
-                          />
-                        </button>
-                        <button
-                          onClick={() => {
-                            setForwardMsg(msg);
-                            setShowForwardModal(true);
-                          }}
-                          className="ml-2 text-white/10 hover:text-[#00a884] transition-colors"
-                          title="Forward Message"
-                        >
-                          <Forward className="w-3 h-3" />
-                        </button>
-                        <div className="ml-2 relative flex items-center gap-1">
-                          <button
-                            onClick={() =>
-                              setReactingMsgId(
-                                reactingMsgId === msg.id ? null : msg.id,
-                              )
-                            }
-                            className="text-white/20 hover:text-[#00a884] transition-colors p-0.5"
-                            title="React to Message"
-                          >
-                            <Smile className="w-3.5 h-3.5" />
-                          </button>
-                          {reactingMsgId === msg.id && (
-                            <>
-                              <div
-                                className="fixed inset-0 z-40"
-                                onClick={() => setReactingMsgId(null)}
-                              />
-                              <div className="absolute bottom-full mb-1.5 left-0 bg-[#233138] border border-white/10 shadow-2xl rounded-full px-3 py-1.5 flex gap-2 z-50 animate-in fade-in zoom-in-75 duration-100">
-                                {["👍", "❤️", "😂", "😮", "😢", "🙏"].map(
-                                  (emoji) => (
-                                    <button
-                                      key={emoji}
-                                      onClick={() => {
-                                        reactToMessage(
-                                          msg.id,
-                                          emoji,
-                                          msg.fromMe,
-                                        );
-                                        setReactingMsgId(null);
-                                      }}
-                                      className="hover:scale-125 transition-all text-base active:scale-95"
-                                    >
-                                      {emoji}
-                                    </button>
-                                  ),
-                                )}
-                              </div>
-                            </>
-                          )}
-                          {["👍", "❤️", "😂", "😮", "😢", "🙏"].map((emoji) => (
-                            <button
-                              key={emoji}
-                              onClick={() =>
-                                reactToMessage(msg.id, emoji, msg.fromMe)
-                              }
-                              className="opacity-0 group-hover:opacity-100 hover:scale-120 transition-all text-sm"
-                            >
-                              {emoji}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                      <button
-                        onClick={() =>
-                          setDeleteOptionModal({ msgId: msg.id, visible: true })
-                        }
-                        className="opacity-0 group-hover:opacity-40 hover:opacity-100 transition-opacity p-1 text-red-400"
-                        title="Delete Message"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
-                    {/* Visual Chat bubble tail */}
-                    <div
-                      className={`absolute top-0 w-3 h-4 ${msg.fromMe ? "-right-2" : "-left-2"}`}
-                    >
-                      <svg
-                        viewBox="0 0 10 16"
-                        className={`w-full h-full ${msg.fromMe ? "fill-[#005c4b]" : "fill-[#202c33]"}`}
-                      >
-                        <path
-                          d={
-                            msg.fromMe
-                              ? "M0 0h10v16c-4-4-10-4-10-4V0z"
-                              : "M10 0H0v16c4-4 10-4 10-4V0z"
-                          }
-                        />
-                      </svg>
-                    </div>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
-
-            {/* AI Integration Bar */}
-            <AnimatePresence>
-              {(aiSuggestions.length > 0 || isAiLoading) && (
-                <motion.div
-                  initial={{ y: 20, opacity: 0 }}
-                  animate={{ y: 0, opacity: 1 }}
-                  className="p-3 bg-[#111b21] border-t border-white/5 z-20 flex gap-2 overflow-x-auto no-scrollbar"
-                >
-                  <div className="flex items-center gap-2 px-3 py-2 bg-[#00a884]/10 rounded-full shrink-0 border border-[#00a884]/20">
-                    <Sparkles className="w-3 h-3 text-[#00a884]" />
-                    <span className="text-[9px] font-black uppercase text-[#00a884] tracking-widest">
-                      AI LINK
-                    </span>
-                  </div>
-                  {isAiLoading ? (
-                    <div className="flex gap-2">
-                      <div className="h-8 w-24 bg-white/5 animate-pulse rounded-full" />
-                      <div className="h-8 w-32 bg-white/5 animate-pulse rounded-full" />
-                    </div>
-                  ) : (
-                    aiSuggestions.map((suggestion, i) => (
-                      <button
-                        key={i}
-                        onClick={() => setNewMessage(suggestion)}
-                        className="px-5 py-2 bg-[#202c33] hover:bg-[#2a3942] rounded-full text-[11px] text-[#00a884] font-black whitespace-nowrap border border-white/5 transition-all uppercase tracking-tight"
-                      >
-                        {suggestion}
-                      </button>
-                    ))
-                  )}
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* Input area */}
-            <div className="bg-[#202c33] p-4 flex items-center gap-4 z-10 shadow-[0_-10px_20px_rgba(0,0,0,0.2)]">
-              {/* Hidden File Input */}
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={handleFileChange}
-                className="hidden"
-              />
-
-              {/* Attachment Button & Menu */}
-              <div className="relative">
-                <button
-                  ref={attachmentButtonRef}
-                  onClick={() => setShowAttachmentMenu(!showAttachmentMenu)}
-                  className={`p-2 rounded-full transition-all flex items-center justify-center ${showAttachmentMenu ? "bg-[#00a884] text-white rotate-45" : "text-[#aebac1] hover:text-[#00a884]"}`}
-                  title="Attach Payload"
-                >
-                  <Plus className="w-6 h-6 transition-transform duration-200" />
-                </button>
-                <AnimatePresence>
-                  {showAttachmentMenu && (
-                    <>
-                      {/* Click-out overlay */}
-                      <div
-                        className="fixed inset-0 z-30"
-                        onClick={() => setShowAttachmentMenu(false)}
-                      />
-                      <motion.div
-                        initial={{ opacity: 0, y: 15, scale: 0.9 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: 15, scale: 0.9 }}
-                        className="absolute bottom-full left-0 mb-4 bg-[#233138] border border-white/10 rounded-2xl shadow-2xl p-2 flex flex-col gap-1.5 z-40 min-w-[150px]"
-                      >
-                        <button
-                          onClick={() => triggerFileSelection("image")}
-                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
-                        >
-                          <ImageIcon className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">
-                            Image
-                          </span>
-                        </button>
-                        <button
-                          onClick={() => triggerFileSelection("video")}
-                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
-                        >
-                          <Video className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">
-                            Video
-                          </span>
-                        </button>
-                        <button
-                          onClick={() => triggerFileSelection("audio")}
-                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
-                        >
-                          <Music className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">
-                            Audio
-                          </span>
-                        </button>
-                        <button
-                          onClick={() => triggerFileSelection("document")}
-                          className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
-                        >
-                          <FileText className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">
-                            Document
-                          </span>
-                        </button>
-                      </motion.div>
-                    </>
-                  )}
-                </AnimatePresence>
-              </div>
-
-              {/* Emoji Picker Button & Menu */}
-              <div className="relative flex items-center">
-                <button
-                  ref={emojiButtonRef}
-                  onClick={() => setShowEmojiPicker(!showEmojiPicker)}
-                  className={`p-2 rounded-full transition-colors flex items-center justify-center ${showEmojiPicker ? "text-[#00a884] bg-white/5" : "text-[#aebac1] hover:text-[#00a884]"}`}
-                  title="Emoji Menu"
-                >
-                  <Smile className="w-6 h-6" />
-                </button>
-                <AnimatePresence>
-                  {showEmojiPicker && (
-                    <>
-                      {/* Click-out overlay */}
-                      <div
-                        className="fixed inset-0 z-30"
-                        onClick={() => setShowEmojiPicker(false)}
-                      />
-                      <motion.div
-                        initial={{ opacity: 0, y: 15, scale: 0.9 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: 15, scale: 0.9 }}
-                        className="absolute bottom-full left-0 mb-4 bg-[#233138] border border-white/10 rounded-2xl shadow-2xl p-4 z-40 w-[280px] sm:w-[320px] max-h-[250px] overflow-y-auto custom-scrollbar"
-                      >
-                        <div className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-3 flex items-center justify-between pb-2 border-b border-white/5">
-                          <span>SYSTEM MATRIX EMOJIS</span>
-                          <span className="text-[#00a884]">SELECT</span>
-                        </div>
-                        <div className="grid grid-cols-7 gap-2.5">
-                          {[
-                            "😀",
-                            "😃",
-                            "😄",
-                            "😁",
-                            "😆",
-                            "😅",
-                            "😂",
-                            "🤣",
-                            "😊",
-                            "😇",
-                            "🙂",
-                            "🙃",
-                            "😉",
-                            "😌",
-                            "😍",
-                            "🥰",
-                            "😘",
-                            "😗",
-                            "😙",
-                            "😚",
-                            "😋",
-                            "😛",
-                            "😝",
-                            "😜",
-                            "🤪",
-                            "🤨",
-                            "🧐",
-                            "🤓",
-                            "😎",
-                            "🥸",
-                            "🤩",
-                            "🥳",
-                            "😏",
-                            "😒",
-                            "😞",
-                            "😔",
-                            "😟",
-                            "😕",
-                            "🙁",
-                            "☹️",
-                            "😣",
-                            "😖",
-                            "😫",
-                            "😩",
-                            "🥺",
-                            "😢",
-                            "😭",
-                            "😤",
-                            "😠",
-                            "😡",
-                            "🤬",
-                            "🤯",
-                            "😳",
-                            "🥵",
-                            "🥶",
-                            "😱",
-                            "😨",
-                            "😰",
-                            "😥",
-                            "😓",
-                            "🤗",
-                            "🤔",
-                            "🫣",
-                            "🤭",
-                            "🫢",
-                            "🤫",
-                            "🫠",
-                            "✍️",
-                            "👍",
-                            "👎",
-                            "👊",
-                            "✊",
-                            "🤛",
-                            "🤜",
-                            "🤞",
-                            "✌️",
-                            "🤟",
-                            "🤘",
-                            "👌",
-                            "🤌",
-                            "🤏",
-                            "👈",
-                            "👉",
-                            "👆",
-                            "👇",
-                            "☝️",
-                            "✋",
-                            "🤚",
-                            "🖐",
-                            "🖖",
-                            "👋",
-                            "🤙",
-                            "💪",
-                            "🦾",
-                            "🖕",
-                            "🙏",
-                            "🤝",
-                            "💅",
-                            "🤳",
-                            "👏",
-                            "🙌",
-                            "👐",
-                            "🫱",
-                            "🫲",
-                            "🫳",
-                            "🫴",
-                            "🫵",
-                            "🫶",
-                          ].map((emoji) => (
-                            <button
-                              key={emoji}
-                              onClick={() => {
-                                setNewMessage((prev) => prev + emoji);
-                              }}
-                              className="text-lg hover:bg-white/10 p-1.5 rounded-lg transition-colors flex items-center justify-center scale-95 hover:scale-110 active:scale-90"
-                            >
-                              {emoji}
-                            </button>
-                          ))}
-                        </div>
-                      </motion.div>
-                    </>
-                  )}
-                </AnimatePresence>
-              </div>
-
-              <div className="flex-1 bg-[#2a3942] rounded-xl flex items-center px-4 py-1.5 border border-white/[0.02]">
-                <input
-                  type="text"
-                  value={newMessage}
-                  onChange={(e) => setNewMessage(e.target.value)}
-                  onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-                  placeholder={
-                    isRecording
-                      ? "RECORDING SONIC SIGNAL..."
-                      : "EXECUTE MESSAGE..."
-                  }
-                  className="bg-transparent border-none outline-none text-sm text-white px-3 py-3 w-full placeholder:text-[#8696a0]/40 font-bold tracking-tight"
-                  disabled={isRecording}
-                />
-                <div className="flex items-center gap-2">
-                  {isRecording && (
-                    <div className="flex items-center gap-2 px-3 py-1 bg-red-500/10 rounded-lg animate-pulse">
-                      <div className="w-2 h-2 rounded-full bg-red-500" />
-                      <span className="text-[10px] font-mono font-black text-red-500">
-                        {Math.floor(recordingTime / 60)}:
-                        {(recordingTime % 60).toString().padStart(2, "0")}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {newMessage.trim() ? (
-                <button
-                  onClick={sendMessage}
-                  className="p-4 rounded-xl bg-[#00a884] text-white shadow-2xl shadow-[#00a884]/30 scale-105 transition-all"
-                >
-                  <Send className="w-5 h-5 rotate-[-10deg]" />
-                </button>
-              ) : (
-                <button
-                  onClick={isRecording ? stopRecording : startRecording}
-                  className={`p-4 rounded-xl transition-all ${isRecording ? "bg-red-500 text-white animate-pulse" : "bg-white/5 text-[#aebac1] hover:text-[#00a884]"}`}
-                >
-                  {isRecording ? (
-                    <Square className="w-5 h-5" />
-                  ) : (
-                    <Mic className="w-5 h-5" />
-                  )}
-                </button>
-              )}
-            </div>
-          </>
-          );
-        })() : (
-          selectedAccount === "friend" && connectionStateFriend !== "open" ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-8 text-center bg-[#0c1317]">
-              <div className="max-w-md w-full bg-[#111b21] rounded-3xl border border-white/5 shadow-2xl p-8 relative overflow-hidden animate-in fade-in zoom-in duration-300">
-                <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#00a884]/40 to-transparent" />
-                
-                <div className="flex items-center justify-center mb-6">
-                  <div className="p-4 bg-[#00a884]/10 rounded-2xl border border-[#00a884]/20 animate-pulse">
-                    <User className="w-8 h-8 text-[#00a884]" />
-                  </div>
-                </div>
-
-                <h2 className="text-2xl font-black text-white italic tracking-tight mb-2">
-                  LOGIN YOUR FRIEND
-                </h2>
-                <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
-                  Setup Companion WhatsApp Node
-                </p>
-
-                <div className="flex gap-1 mb-6 bg-[#202c33]/50 p-1 rounded-xl border border-white/5">
-                  <button
-                    onClick={() => setLoginMethodFriend("pairing")}
-                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "pairing" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
-                  >
-                    OTP Pairing
-                  </button>
-                  <button
-                    onClick={() => setLoginMethodFriend("qr")}
-                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "qr" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
-                  >
-                    Scan QR
-                  </button>
-                </div>
-
-                {loginMethodFriend === "pairing" ? (
-                  <div className="space-y-4">
-                    <p className="text-xs text-white/60 leading-relaxed text-left">
-                      Enter your friend's 10-digit WhatsApp number (including country code) to generate a secure pairing code:
-                    </p>
-                    <div className="flex gap-2">
-                      <div className="bg-[#202c33] px-3 py-3 rounded-xl border border-white/10 text-xs font-mono text-white/70 select-none">
-                        +91
-                      </div>
-                      <input
-                        type="text"
-                        placeholder="Friend's WhatsApp Number (e.g. 9876543210)"
-                        value={phoneNumberFriend}
-                        onChange={(e) => setPhoneNumberFriend(e.target.value.replace(/\D/g, "").slice(0, 10))}
-                        className="flex-1 bg-[#202c33] px-4 py-3 rounded-xl border border-white/5 outline-none text-xs text-white focus:border-[#00a884]/30 placeholder:text-white/20"
-                      />
-                    </div>
-
-                    <button
-                      onClick={() => requestPairingCode()}
-                      className="w-full bg-[#00a884] text-white font-black text-xs uppercase tracking-widest py-3.5 rounded-xl hover:bg-[#00a884]/90 transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-[#00a884]/15 flex items-center justify-center gap-2"
-                    >
-                      <span>Generate Companion Code</span>
-                    </button>
-
-                    {pairingCodeFriend && (
-                      <div className="mt-6 p-6 bg-[#202c33] rounded-2xl border border-[#00a884]/20 animate-in fade-in zoom-in duration-200">
-                        <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest mb-3">
-                          Enter this on your friend's phone:
-                        </p>
-                        <div className="font-mono text-3xl font-black tracking-[0.2em] text-white select-all text-center uppercase py-2 bg-black/20 rounded-lg">
-                          {pairingCodeFriend}
-                        </div>
-                        <p className="text-[9px] text-white/40 uppercase font-bold mt-3 leading-relaxed">
-                          Menu &gt; Linked Devices &gt; Link with Phone Number
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center py-4 space-y-4">
-                    <p className="text-xs text-white/60 leading-relaxed">
-                      Scan this QR code using WhatsApp on your friend's logged-in device:
-                    </p>
-                    {qrCodeFriend ? (
-                      <div className="p-4 bg-white rounded-2xl select-none animate-in fade-in duration-300">
-                        <QRCode value={qrCodeFriend} size={180} />
-                      </div>
-                    ) : (
-                      <div className="w-[180px] h-[180px] bg-[#202c33] rounded-2xl border border-white/5 flex flex-col items-center justify-center text-center opacity-60 animate-pulse">
-                        <RefreshCw className="w-8 h-8 text-[#00a884] animate-spin mb-2" />
-                        <span className="text-[9px] font-black uppercase tracking-widest">Generating QR...</span>
-                      </div>
-                    )}
-                    <button
-                      onClick={() => refreshQr()}
-                      className="text-[10px] font-black uppercase tracking-widest text-[#00a884] hover:underline flex items-center gap-1 mt-2 font-black"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin-slow" /> Refresh QR
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : selectedAccount === "friend" && connectionStateFriend === "open" && !activeChatFriend ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center bg-[#0c1317]">
-              <div className="relative mb-8">
-                <div className="absolute inset-0 bg-[#00a884]/15 blur-[60px]" />
-                <div className="p-8 rounded-full bg-white/[0.02] border border-white/5 relative">
-                  <ShieldCheck className="w-16 h-16 text-[#00a884]/30" />
-                </div>
-              </div>
-              <h2 className="text-2xl font-black text-white mb-2 tracking-tight italic">
-                FRIEND SESSION SECURED
-              </h2>
-              <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
-                Connected to WhatsApp companion node
-              </p>
-              <p className="text-xs max-w-xs leading-relaxed opacity-50 font-medium pb-2">
-                Select a conversation from your friend's chat index on the left sidebar to inspect messages.
-              </p>
-            </div>
-          ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center">
-              <div className="relative mb-12">
-                <div className="absolute inset-0 bg-[#00a884]/20 blur-[60px] animate-pulse" />
-                <div className="p-12 rounded-full bg-white/[0.02] border border-white/5 relative">
-                  <ShieldCheck className="w-24 h-24 text-[#00a884]/20" />
-                </div>
-              </div>
-              <h2 className="text-4xl font-black text-white mb-4 tracking-tighter italic flex items-center gap-3">
-                WHATSAPP PRO{" "}
-                <span className="text-[#00a884] non-italic animate-bounce">
-                  💎
-                </span>
-              </h2>
-              <p className="text-sm max-w-sm leading-relaxed mb-8 opacity-40 font-medium uppercase tracking-[0.2em]">
-                System Initialized. Awaiting Master Link for message flow.
-                End-to-end security active.
-              </p>
-              <div className="flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.4em] bg-[#00a884]/5 px-6 py-3 rounded-xl border border-[#00a884]/10 text-[#00a884]">
-                <Lock className="w-3 h-3" />
-                <span>Terminal Secure link active</span>
-              </div>
-            </div>
-          )
-        )}
-      </div>
-
-      {/* Contact/Group Info Side Panel */}
-      <AnimatePresence>
-        {showContactInfo && activeChat && (
-          <motion.div
-            initial={{ x: 400 }}
-            animate={{ x: 0 }}
-            exit={{ x: 400 }}
-            transition={{ type: "spring", damping: 25, stiffness: 200 }}
-            className="w-[380px] bg-[#111b21] border-l border-white/5 flex flex-col z-20 shadow-2xl relative"
-          >
-            <div className="p-5 bg-[#202c33] flex items-center gap-4 border-b border-white/5">
-              <button
-                onClick={() => setShowContactInfo(false)}
-                className="p-2 hover:bg-white/5 rounded-full transition-colors text-[#aebac1]"
-              >
-                <X className="w-5 h-5" />
-              </button>
-              <div>
-                <h3 className="text-sm font-black uppercase tracking-widest italic">
-                  {activeChat.id.endsWith("@g.us")
-                    ? "Network Node Info"
-                    : "Entity Profile"}
-                </h3>
-                <p className="text-[9px] font-black text-[#00a884] uppercase tracking-[0.3em]">
-                  Neural Identification
-                </p>
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-8 custom-scrollbar space-y-10">
-              <div className="flex flex-col items-center gap-6">
-                <div className="relative group">
-                  <div className="w-32 h-32 rounded-[2rem] bg-[#00a884]/10 flex items-center justify-center border-2 border-dashed border-[#00a884]/20 overflow-hidden shadow-2xl transition-transform group-hover:scale-105">
-                    {profilePictures[activeChat.id] ? (
-                      <img
-                        src={profilePictures[activeChat.id]}
-                        className="w-full h-full object-cover"
-                        referrerPolicy="no-referrer"
-                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                      />
-                    ) : (
-                      <User className="w-16 h-16 text-[#00a884] opacity-20" />
-                    )}
-                  </div>
-                  <div className="absolute -bottom-2 -right-2 p-2 bg-[#00a884] rounded-xl shadow-xl shadow-[#00a884]/20 border border-white/20">
-                    <ShieldCheck className="w-4 h-4 text-white" />
-                  </div>
-                </div>
-                <div className="text-center">
-                  <div className="flex items-center justify-center gap-2 mb-1">
-                    <h2 className="text-2xl font-black uppercase tracking-tight italic">
-                      {getDisplayName(activeChat)}
-                    </h2>
-                    <button
-                      onClick={() => {
-                        setEditingContact({
-                          id: activeChat.id,
-                          name: getDisplayName(activeChat),
-                        });
-                      }}
-                      className="p-1 text-[#8696af] hover:text-[#00a884] transition-colors"
-                      title="Edit Contact Name"
-                    >
-                      <Edit className="w-4 h-4" />
-                    </button>
-                  </div>
-                  <p className="text-[#00a884] text-[10px] font-black uppercase tracking-[0.4em] mb-4">
-                    {activeChat.id.endsWith("@g.us")
-                      ? "Collective Matrix"
-                      : "Signal Origin"}
-                  </p>
-                  <p className="text-xs text-[#8696af] font-bold font-mono px-4 py-2 bg-white/5 rounded-lg border border-white/5 shrink-0 inline-block uppercase tracking-widest">
-                    {activeChat.id.split("@")[0]}
-                  </p>
-                </div>
-              </div>
-
-              {activeChat.id.endsWith("@g.us") && (
-                <div className="space-y-6">
-                  <div className="flex items-center justify-between border-b border-white/5 pb-4">
-                    <h4 className="text-[10px] font-black text-[#00a884] uppercase tracking-[0.2em]">
-                      Matrix Participants
-                    </h4>
-                    <span className="text-[10px] bg-[#00a884]/10 text-[#00a884] px-2 py-0.5 rounded-full font-black border border-[#00a884]/20">
-                      {groupMetadata?.participants?.length || 0} Entities
-                    </span>
-                  </div>
-
-                  <div className="space-y-3">
-                    {groupMetadata?.participants?.map((p: any) => (
-                      <div
-                        key={p.id}
-                        className="flex items-center gap-4 p-3 rounded-2xl bg-accent/50 border border-white/[0.02] hover:bg-accent transition-colors group/part"
-                      >
-                        <div className="w-10 h-10 rounded-xl bg-surface flex items-center justify-center font-black text-primary overflow-hidden border border-white/5">
-                          {profilePictures[
-                            p.id.split(":")[0] + "@s.whatsapp.net"
-                          ] ? (
-                            <img
-                              src={
-                                profilePictures[
-                                  p.id.split(":")[0] + "@s.whatsapp.net"
-                                ]
-                              }
-                              className="w-full h-full object-cover"
-                              referrerPolicy="no-referrer"
-                              onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                            />
-                          ) : (
-                            getDisplayName(p.id)[0]
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-black uppercase tracking-tight truncate group-hover/part:text-[#00a884] transition-colors">
-                            {getDisplayName(p.id)}
-                          </p>
-                          <div className="flex items-center gap-2 mt-0.5">
-                            <p className="text-[9px] text-[#8696af] font-bold font-mono truncate">
-                              {p.id.split("@")[0]}
-                            </p>
-                            {p.admin && (
-                              <span className="text-[7px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded border border-yellow-500/20 text-yellow-500 bg-yellow-500/10">
-                                Admin
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                        <div className="opacity-0 group-hover/part:opacity-100 transition-opacity">
-                          <button className="p-2 hover:bg-white/5 rounded-lg text-[#00a884]">
-                            <MessageSquare className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                    {!groupMetadata && (
-                      <div className="py-10 flex flex-col items-center justify-center gap-4 text-[#8696af]/40">
-                        <RefreshCw className="w-8 h-8 animate-spin" />
-                        <span className="text-[9px] font-black uppercase tracking-widest">
-                          Synchronizing Collective...
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              <div className="space-y-4 pt-10 border-t border-white/5">
-                {[
-                  {
-                    label: "Encryption Key",
-                    val: "RSA-4096-AES-GCM",
-                    icon: Lock,
-                  },
-                  {
-                    label: "Neural Link Status",
-                    val: "Verified & Secure",
-                    icon: ShieldCheck,
-                  },
-                  {
-                    label: "Signal Strength",
-                    val: "-44dBm (Optimal)",
-                    icon: Activity,
-                  },
-                ].map((item, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center gap-4 bg-[#202c33]/30 p-4 rounded-2xl border border-white/[0.02]"
-                  >
-                    <div className="p-2 bg-[#00a884]/10 rounded-xl">
-                      <item.icon className="w-4 h-4 text-[#00a884]" />
-                    </div>
-                    <div>
-                      <p className="text-[9px] font-black uppercase text-[#8696af] tracking-widest mb-0.5">
-                        {item.label}
-                      </p>
-                      <p className="text-[11px] font-black text-white italic">
-                        {item.val}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Passcode Verification Modal */}
-      <AnimatePresence>
-        {showPasscodeModal && (
-          <div className="fixed inset-0 z-[110] bg-black/95 backdrop-blur-2xl flex items-center justify-center p-4">
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="w-full max-w-sm bg-accent p-6 rounded-3xl border border-[#00a884]/30 shadow-2xl space-y-6"
-            >
-              <div className="text-center space-y-2">
-                <div className="w-12 h-12 bg-[#00a884]/12 rounded-full flex items-center justify-center mx-auto border border-[#00a884]/30">
-                  <Lock className="w-5 h-5 text-[#00a884]" />
-                </div>
-                <h3 className="text-lg font-black uppercase tracking-tight italic text-white">
-                  Cryptographic Access
-                </h3>
-                <p className="text-[9px] text-[#8696af] uppercase tracking-widest font-bold">
-                  ENTER PIN TO OPEN: {pendingLockedChatToLoad ? getDisplayName(pendingLockedChatToLoad) : 'LOCKED CHAT'} • DEFAULT: 1234
-                </p>
-              </div>
-
-              <div className="space-y-4">
-                <input
-                  type="password"
-                  placeholder="••••"
-                  value={enteredPasscode}
-                  onChange={(e) => setEnteredPasscode(e.target.value)}
-                  onKeyPress={(e) => {
-                    if (e.key === "Enter") {
-                      if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
-                        setShowLockedChats(true);
-                        setChatSubTab("LOCKED");
-                        setShowPasscodeModal(false);
-                        if (pendingLockedChatToLoad) {
-                          loadHistory(pendingLockedChatToLoad);
-                          setPendingLockedChatToLoad(null);
-                        }
-                      } else {
-                        setError("INVALID SECURITY PASSPHRASE PIN");
-                        setEnteredPasscode("");
-                      }
-                    }
-                  }}
-                  className="w-full text-center bg-black/40 border border-white/10 rounded-2xl py-4 font-mono text-xl tracking-[0.5em] focus:border-[#00a884] focus:ring-1 focus:ring-[#00a884] outline-none text-white font-bold placeholder:text-white/10"
-                  autoFocus
-                />
-
-                <div className="flex gap-3">
-                  <button
-                    onClick={() => {
-                      setShowPasscodeModal(false);
-                      setPendingLockedChatToLoad(null);
-                    }}
-                    className="flex-1 py-3 bg-white/5 rounded-xl text-xs font-bold uppercase transition-colors hover:bg-white/10 text-white"
-                  >
-                    Abort
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
-                        setShowLockedChats(true);
-                        setChatSubTab("LOCKED");
-                        setShowPasscodeModal(false);
-                        if (pendingLockedChatToLoad) {
-                          loadHistory(pendingLockedChatToLoad);
-                          setPendingLockedChatToLoad(null);
-                        }
-                      } else {
-                        setError("INVALID SECURITY PASSPHRASE PIN");
-                        setEnteredPasscode("");
-                      }
-                    }}
-                    className="flex-1 py-3 bg-[#00a884] rounded-xl text-xs font-black uppercase tracking-widest transition-colors hover:bg-[#00bc95] text-white"
-                  >
-                    Verify PIN
-                  </button>
-                </div>
-
-                <button
-                  onClick={() => {
-                    if (enteredPasscode === "1234" || enteredPasscode === userLockPin) {
-                      toggleLockChat(pendingLockedChatToLoad?.id || "");
-                      setShowPasscodeModal(false);
-                      setPendingLockedChatToLoad(null);
-                      setEnteredPasscode("");
-                    } else {
-                      setError("INVALID SECURITY PASSPHRASE PIN");
-                      setEnteredPasscode("");
-                    }
-                  }}
-                  className="w-full py-3 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-xs font-black uppercase tracking-widest transition-colors hover:bg-yellow-500/20 text-yellow-400"
-                >
-                  🔓 Unlock This Chat Permanently
-                </button>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Recycle Bin Modal */}
-      <AnimatePresence>
-        {showRecycleBin && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-xl flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.9, y: 20 }}
-              className="w-full max-w-2xl bg-surface rounded-3xl border border-white/5 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
-            >
-              <div className="p-6 bg-accent flex items-center justify-between border-b border-white/5">
-                <div className="flex items-center gap-3">
-                  <div className="p-3 bg-primary/10 rounded-xl">
-                    <Trash2 className="w-6 h-6 text-primary" />
-                  </div>
-                  <div>
-                    <h2 className="text-xl font-black uppercase italic tracking-tight">
-                      Recycle Bin
-                    </h2>
-                    <p className="text-[9px] font-black text-primary uppercase tracking-widest">
-                      Engine Recovery Vault
-                    </p>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setShowRecycleBin(false)}
-                  className="p-2 hover:bg-white/5 rounded-full transition-colors text-[#aebac1]"
-                >
-                  <X />
-                </button>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
-                {/* Deleted Messages */}
-                <div>
-                  <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-[#8696af] mb-4 flex items-center gap-2">
-                    <MessageSquare className="w-3 h-3 text-primary" />
-                    Deleted Messages ({recycleBinData.messages.length})
-                  </h3>
-                  <div className="space-y-2">
-                    {recycleBinData.messages.map((m: any, i: number) => (
-                      <div
-                        key={i}
-                        className="p-4 bg-accent rounded-2xl border border-white/5 flex items-center justify-between gap-4"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 mb-1">
-                            <span className="text-[9px] font-black uppercase text-primary">
-                              {getDisplayName(m.originalChat)}
-                            </span>
-                            <span className="text-[8px] opacity-30 font-bold">
-                              {safeFormat(m.deletedAt, "MMM dd, HH:mm")}
-                            </span>
-                          </div>
-                          <p className="text-sm opacity-80 truncate italic">
-                            "{getMsgText(m)}"
-                          </p>
-                        </div>
-                        <button
-                          onClick={() => restoreMessage(m.key.id)}
-                          className="p-2 hover:bg-primary/20 rounded-lg text-primary transition-colors"
-                          title="Restore Message"
-                        >
-                          <RefreshCw className="w-4 h-4" />
-                        </button>
-                      </div>
-                    ))}
-                    {recycleBinData.messages.length === 0 && (
-                      <p className="text-[10px] opacity-30 italic text-center py-4">
-                        No salvaged signals found
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Deleted Chats */}
-                <div>
-                  <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-[#8696af] mb-4 flex items-center gap-2">
-                    <Zap className="w-3 h-3 text-primary" />
-                    Nuked Chats ({recycleBinData.chats.length})
-                  </h3>
-                  <div className="space-y-2">
-                    {recycleBinData.chats.map((c: any, i: number) => (
-                      <div
-                        key={i}
-                        className="p-4 bg-accent rounded-2xl border border-white/5 flex items-center justify-between"
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-xl bg-surface flex items-center justify-center font-black text-primary border border-white/5 shadow-inner">
-                            {getDisplayName(c)[0]}
-                          </div>
-                          <div>
-                            <p className="text-sm font-bold uppercase">
-                              {getDisplayName(c)}
-                            </p>
-                            <p className="text-[9px] opacity-40 uppercase font-black">
-                              Nuked at {safeFormat(c.deletedAt, "HH:mm")}
-                            </p>
-                          </div>
-                        </div>
-                        <button
-                          onClick={() => restoreChat(c.id)}
-                          className="p-2 hover:bg-primary/20 rounded-lg text-primary transition-colors"
-                          title="Restore Chat"
-                        >
-                          <RefreshCw className="w-4 h-4" />
-                        </button>
-                      </div>
-                    ))}
-                    {recycleBinData.chats.length === 0 && (
-                      <p className="text-[10px] opacity-30 italic text-center py-4">
-                        No annihilated indices captured
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Intercepted Statuses */}
-                <div>
-                  <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-[#8696af] mb-4 flex items-center gap-2">
-                    <ShieldCheck className="w-3 h-3 text-primary" />
-                    Intercepted Statuses ({interceptedStatuses.length})
-                  </h3>
-                  <div className="grid grid-cols-2 gap-3">
-                    {interceptedStatuses.map((s, i) => (
-                      <div
-                        key={i}
-                        className="p-3 bg-accent rounded-2xl border border-white/5 flex flex-col gap-2"
-                      >
-                        <div className="flex items-center gap-2">
-                          <div className="w-6 h-6 rounded-full bg-primary/20 flex items-center justify-center text-[10px] font-black text-primary">
-                            {s.pushName?.[0] || "?"}
-                          </div>
-                          <div className="min-w-0">
-                            <p className="text-[9px] font-black uppercase truncate italic">
-                              {s.pushName || "Unknown Entity"}
-                            </p>
-                            <p className="text-[7px] opacity-30 font-mono">
-                              INTERCEPTED: {safeFormat(s.timestamp, "HH:mm")}
-                            </p>
-                          </div>
-                        </div>
-                        <div
-                          className="h-24 bg-black/20 rounded-xl flex items-center justify-center cursor-pointer overflow-hidden border border-white/[0.02] relative group"
-                          onClick={() => {
-                            setActiveStatus(s);
-                            setShowRecycleBin(false);
-                          }}
-                        >
-                          {s.message?.imageMessage ? (
-                            <img
-                              src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
-                              onError={(e) => {
-                                e.currentTarget.style.display = 'none';
-                              }}
-                              className="w-full h-full object-cover blur-[1px] group-hover:blur-0 transition-all"
-                            />
-                          ) : (
-                            <p className="text-[8px] text-center px-4 font-bold opacity-60">
-                              "
-                              {s.message?.conversation?.substring(0, 50) ||
-                                "Signal Encrypted"}
-                              "
-                            </p>
-                          )}
-                          <div className="absolute inset-0 bg-primary/5 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                            <PlayCircle className="w-8 h-8 text-white" />
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                    {interceptedStatuses.length === 0 && (
-                      <p className="col-span-2 text-[10px] opacity-30 italic text-center py-4">
-                        No revoked broadcast packets recovered
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div className="p-6 bg-accent text-center border-t border-white/5">
-                <p className="text-[10px] font-black text-primary uppercase tracking-widest opacity-50 italic">
-                  Data persists until engine reinitialization
-                </p>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showStatusModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-lg rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 border-b border-white/5 flex justify-between items-center bg-[#202c33]">
-                <h2 className="text-sm font-black uppercase tracking-widest text-[#00a884] italic">
-                  Broadcast Status 📡
-                </h2>
-                <button onClick={() => setShowStatusModal(false)}>
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="p-8 space-y-6">
-                <div className="flex flex-col items-center gap-4">
-                  <div
-                    className="w-20 h-20 rounded-full bg-[#00a884]/10 flex items-center justify-center border-2 border-dashed border-[#00a884]/30 cursor-pointer hover:bg-[#00a884]/20 transition-all overflow-hidden"
-                    onClick={() => {
-                      const input = document.createElement("input");
-                      input.type = "file";
-                      input.accept = "image/*";
-                      input.onchange = (e: any) => {
-                        const file = e.target.files[0];
-                        const reader = new FileReader();
-                        reader.onload = (re: any) =>
-                          setStatusImage(re.target.result as string);
-                        reader.readAsDataURL(file);
-                      };
-                      input.click();
-                    }}
-                  >
-                    {statusImage ? (
-                      <img
-                        src={statusImage}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <Camera className="w-8 h-8 text-[#00a884]" />
-                    )}
-                  </div>
-                  <span className="text-[10px] font-black text-[#8696af] uppercase tracking-widest">
-                    Capture Visual or Upload
-                  </span>
-                </div>
-                <textarea
-                  placeholder="Enter status signal..."
-                  className="w-full h-32 bg-[#202c33] border border-white/5 rounded-2xl p-4 text-sm text-white placeholder:text-white/20 outline-none focus:border-[#00a884] transition-all resize-none"
-                  value={statusText}
-                  onChange={(e) => setStatusText(e.target.value)}
-                />
-                <button
-                  onClick={postStatus}
-                  disabled={(!statusText && !statusImage) || loading}
-                  className="w-full bg-[#00a884] text-white font-black py-4 rounded-2xl hover:bg-[#00bc95] transition-all shadow-xl shadow-[#00a884]/20 text-xs uppercase tracking-widest disabled:opacity-30 flex items-center justify-center gap-3"
-                >
-                  {loading && <RefreshCw className="w-4 h-4 animate-spin" />}
-                  Post to Global Broadcast
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showStatusModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/90 backdrop-blur-md flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-surface w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 bg-accent border-b border-white/5 flex justify-between items-center text-primary">
-                <h2 className="text-sm font-black uppercase tracking-widest italic flex items-center gap-2">
-                  <Camera className="w-4 h-4" /> Deploy Status Update
-                </h2>
-                <button
-                  onClick={() => setShowStatusModal(false)}
-                  className="text-white/40"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="p-8 space-y-6">
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setStatusImage(null)}
-                    className={`flex-1 py-3 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all ${!statusImage ? "bg-primary text-white border-primary" : "bg-transparent border-white/10 text-white/40"}`}
-                  >
-                    Text Signal
-                  </button>
-                  <label
-                    className={`flex-1 py-3 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all text-center cursor-pointer ${statusImage ? "bg-primary text-white border-primary" : "bg-transparent border-white/10 text-white/40"}`}
-                  >
-                    Media Payload
-                    <input
-                      type="file"
-                      accept="image/*,video/*"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) {
-                          const reader = new FileReader();
-                          reader.onloadend = () =>
-                            setStatusImage(reader.result as string);
-                          reader.readAsDataURL(file);
-                        }
-                      }}
-                    />
-                  </label>
-                </div>
-
-                {statusImage ? (
-                  <div className="relative aspect-video bg-black/20 rounded-2xl overflow-hidden border border-white/5">
-                    {statusImage.startsWith("data:video") ? (
-                      <video
-                        src={statusImage}
-                        className="w-full h-full object-contain"
-                        controls
-                      />
-                    ) : (
-                      <img
-                        src={statusImage}
-                        className="w-full h-full object-contain"
-                      />
-                    )}
-                    <input
-                      placeholder="Add encrypted caption..."
-                      className="absolute bottom-0 left-0 right-0 p-4 bg-black/60 backdrop-blur-md text-xs text-white border-none outline-none"
-                      value={statusText}
-                      onChange={(e) => setStatusText(e.target.value)}
-                    />
-                  </div>
-                ) : (
-                  <textarea
-                    className="w-full h-40 bg-accent border border-white/5 rounded-2xl p-6 text-xl font-bold outline-none focus:border-primary transition-all resize-none text-center flex items-center justify-center placeholder:text-white/10"
-                    placeholder="What's on the neural network?"
-                    value={statusText}
-                    onChange={(e) => setStatusText(e.target.value)}
-                    style={{ backgroundColor: "#111b21" }}
-                  />
-                )}
-
-                <button
-                  onClick={() => {
-                    if (statusImage) {
-                      postStatus(
-                        statusImage.startsWith("data:video")
-                          ? "video"
-                          : "image",
-                        statusImage,
-                        statusText,
-                      );
-                    } else {
-                      postStatus("text", statusText);
-                    }
-                  }}
-                  className="w-full bg-primary text-white font-black py-4 rounded-xl hover:opacity-90 transition-all text-xs uppercase tracking-[0.3em] shadow-lg shadow-primary/20"
-                >
-                  Broadcast Update
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showForwardModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden flex flex-col max-h-[70vh]"
-            >
-              <div className="p-6 bg-[#202c33] flex items-center justify-between border-b border-white/5">
-                <div className="flex items-center gap-3">
-                  <Forward className="w-5 h-5 text-[#00a884]" />
-                  <h2 className="text-sm font-black uppercase italic tracking-widest text-[#00a884]">
-                    Forward Signal
-                  </h2>
-                </div>
-                <button
-                  onClick={() => {
-                    setShowForwardModal(false);
-                    setForwardMsg(null);
-                  }}
-                  className="text-[#aebac1]"
-                >
-                  <X />
-                </button>
-              </div>
-              <div className="p-4 bg-[#0b141a] border-b border-white/5">
-                <p className="text-[10px] font-black uppercase text-[#8696af] mb-2 tracking-widest">
-                  Selected Payload
-                </p>
-                <p className="text-xs italic opacity-60 truncate">
-                  "{forwardMsg?.text || "Media Payload"}"
-                </p>
-              </div>
-              <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
-                <p className="text-[10px] font-black uppercase text-[#8696af] mb-3 tracking-widest">
-                  Select Target Node
-                </p>
-                {chats.map((chat) => (
-                  <button
-                    key={chat.id}
-                    onClick={() => forwardMessage(chat.id)}
-                    className="w-full flex items-center gap-4 p-3 rounded-2xl bg-[#202c33] hover:bg-[#2a3942] border border-white/5 transition-all text-left group"
-                  >
-                    <div className="w-10 h-10 rounded-xl bg-[#374248] flex items-center justify-center font-black text-[#00a884] overflow-hidden border border-white/5">
-                      {profilePictures[chat.id] ? (
-                        <img
-                          src={profilePictures[chat.id]}
-                          alt=""
-                          className="w-full h-full object-cover"
-                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                        />
-                      ) : (
-                        getDisplayName(chat)[0]
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-black uppercase tracking-tight truncate group-hover:text-[#00a884] transition-colors">
-                        {getDisplayName(chat)}
-                      </p>
-                      <p className="text-[9px] opacity-40 font-mono">
-                        {chat.id.split("@")[0]}
-                      </p>
-                    </div>
-                    <Send className="w-4 h-4 text-[#00a884] opacity-0 group-hover:opacity-100 transition-opacity" />
-                  </button>
-                ))}
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {editingContact && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-sm rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 border-b border-white/5 flex justify-between items-center bg-[#202c33]">
-                <h2 className="text-xs font-black uppercase tracking-widest text-[#00a884]">
-                  Rename Entity
-                </h2>
-                <button onClick={() => setEditingContact(null)}>
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="p-8 space-y-6">
-                <div>
-                  <label className="block text-[10px] font-bold text-[#8696af] uppercase tracking-widest mb-2">
-                    New Alias
-                  </label>
-                  <input
-                    type="text"
-                    className="w-full bg-[#202c33] border border-white/5 rounded-xl p-4 text-sm text-white outline-none focus:border-[#00a884] transition-all"
-                    value={editingContact.name}
-                    onChange={(e) =>
-                      setEditingContact({
-                        ...editingContact,
-                        name: e.target.value,
-                      })
-                    }
-                    autoFocus
-                  />
-                </div>
-                <button
-                  onClick={() =>
-                    updateContact(editingContact.id, editingContact.name)
-                  }
-                  className="w-full bg-[#00a884] text-white font-black py-4 rounded-xl hover:bg-[#00bc95] transition-all text-xs uppercase tracking-widest"
-                >
-                  Commit Change
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showSettings && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[110] bg-[#0b141a] flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ x: 300, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 300, opacity: 0 }}
-              className="w-full max-w-lg h-[80vh] bg-[#111b21] rounded-3xl border border-white/5 shadow-2xl flex flex-col overflow-hidden"
-            >
-              <div className="p-6 bg-[#202c33] flex items-center gap-4 border-b border-white/5">
-                <button
-                  onClick={() =>
-                    settingsView === "main"
-                      ? setShowSettings(false)
-                      : setSettingsView("main")
-                  }
-                  className="p-2 hover:bg-white/5 rounded-full"
-                >
-                  <ChevronLeft className="w-6 h-6" />
-                </button>
-                <div
-                  onClick={handleAdminTap}
-                  className="cursor-pointer select-none"
-                >
-                  <h2 className="text-xl font-black uppercase italic">
-                    {settingsView === "main"
-                      ? "Signal Settings"
-                      : settingsView.toUpperCase()}
-                  </h2>
-                  <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest">
-                    {settingsView === "main"
-                      ? "System Configuration"
-                      : "Advanced Tuning"}
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
-                {settingsView === "main" ? (
-                  <div className="space-y-2">
-                    {[
-                      {
-                        id: "notifications",
-                        icon: Zap,
-                        label: "Notifications",
-                        desc: "Secure neural pulse alerts",
-                      },
-                      {
-                        id: "chats",
-                        icon: MessageSquare,
-                        label: "Matrix Chats",
-                        desc: "Communication logs & archive",
-                      },
-                      {
-                        id: "starred",
-                        icon: Star,
-                        label: "Starred Signals",
-                        desc: "Flagged core data",
-                      },
-                      {
-                        id: "guides",
-                        icon: FileText,
-                        label: "Board Guides",
-                        desc: "Protocol instructions",
-                      },
-                      {
-                        id: "lists",
-                        icon: Activity,
-                        label: "Custom Lists",
-                        desc: "Broadcast segments",
-                      },
-                      {
-                        id: "privacy",
-                        icon: ShieldCheck,
-                        label: "Privacy Isolation",
-                        desc: "Encrypted stealth settings",
-                      },
-                      {
-                        id: "accounts",
-                        icon: User,
-                        label: "Accounts",
-                        desc: "Entity permissions",
-                      },
-                      {
-                        id: "language",
-                        icon: Monitor,
-                        label: "Interface",
-                        desc: "Syntactic skin selection",
-                      },
-                      {
-                        id: "keyboard",
-                        icon: Sparkles,
-                        label: "Input Methods",
-                        desc: "Keyboard & shortcut pulse",
-                      },
-                      {
-                        id: "help",
-                        icon: History,
-                        label: "Support Center",
-                        desc: "Admin bypass & help",
-                      },
-                    ].map((item: any) => (
-                      <button
-                        key={item.id}
-                        onClick={() => setSettingsView(item.id)}
-                        className="w-full p-4 bg-[#202c33] hover:bg-[#2a3942] rounded-2xl border border-white/5 flex items-center gap-4 transition-all group"
-                      >
-                        <div className="p-3 bg-[#00a884]/10 rounded-xl group-hover:scale-110 transition-transform">
-                          <item.icon className="w-5 h-5 text-[#00a884]" />
-                        </div>
-                        <div className="text-left flex-1 min-w-0">
-                          <p className="text-sm font-bold uppercase tracking-tight">
-                            {item.label}
-                          </p>
-                          <p className="text-[10px] opacity-40 font-medium truncate">
-                            {item.desc}
-                          </p>
-                        </div>
-                        <ChevronRight className="w-4 h-4 opacity-20" />
-                      </button>
-                    ))}
-
-                    {/* Admin Login Button */}
-                    <button
-                      id="admin-login-settings-btn"
-                      onClick={() => {
-                        setShowAdminConsole(true);
-                        setShowSettings(false);
-                      }}
-                      className="w-full mt-4 p-4 bg-[#111b21] hover:bg-red-500/10 rounded-2xl border border-red-500/10 flex items-center gap-4 transition-all group cursor-pointer"
-                    >
-                      <div className="p-3 bg-red-500/15 text-red-500 rounded-xl group-hover:scale-110 transition-transform">
-                        <ShieldAlert className="w-5 h-5" />
-                      </div>
-                      <div className="text-left flex-1 min-w-0">
-                        <p className="text-sm font-black uppercase tracking-tight text-red-500 italic">
-                          Admin Login Portal
-                        </p>
-                        <p className="text-[10px] opacity-60 font-medium truncate uppercase tracking-widest text-[#8696af]">
-                          Authorized Personnel Only
-                        </p>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-red-500/30" />
-                    </button>
-                  </div>
-                ) : settingsView === "starred" ? (
-                  <div className="space-y-4">
-                    {starredMessages.map((m, i) => (
-                      <div
-                        key={i}
-                        className="p-4 bg-[#202c33] rounded-2xl border border-white/5 flex flex-col gap-2"
-                      >
-                        <div className="flex justify-between items-center bg-[#202c33] p-1.5 rounded-lg mb-2">
-                          <span className="text-[10px] font-black text-[#00a884] uppercase tracking-widest px-2">
-                            {m.sender}
-                          </span>
-                          <span className="text-[8px] opacity-30 font-bold px-2">
-                            {safeFormat(m.timestamp, "MMM dd, HH:mm")}
-                          </span>
-                        </div>
-                        <div className="px-1 py-1">
-                          <p className="text-sm italic opacity-80 leading-relaxed">
-                            "
-                            {m.message?.conversation ||
-                              m.text ||
-                              "Encrypted Payload"}
-                            "
-                          </p>
-                        </div>
-                        <div className="flex justify-between items-center mt-3 pt-2 border-t border-white/5">
-                          <span className="text-[8px] opacity-20 font-black uppercase tracking-widest">
-                            {m.id.substring(0, 8)}
-                          </span>
-                          <button
-                            onClick={() =>
-                              setStarredMessages((prev) =>
-                                prev.filter((s) => s.id !== m.id),
-                              )
-                            }
-                            className="text-[9px] font-black uppercase text-red-400 hover:text-red-300 transition-colors tracking-tighter"
-                          >
-                            Discard Signal
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                    {starredMessages.length === 0 && (
-                      <div className="py-24 text-center opacity-10">
-                        <Star className="w-16 h-16 mx-auto mb-6" />
-                        <p className="text-[10px] font-black uppercase tracking-[0.3em]">
-                          No signals flagged for biometric retention
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="space-y-6 animate-in slide-in-from-right-10 duration-300">
-                    <div className="bg-[#202c33] p-6 rounded-3xl border border-white/5 shadow-inner">
-                      <h3 className="text-sm font-black uppercase text-[#00a884] mb-6 tracking-widest italic flex items-center gap-3">
-                        <ShieldCheck className="w-4 h-4" />
-                        {settingsView} Protocol
-                      </h3>
-                      <div className="space-y-6">
-                        <div className="flex items-center justify-between group/toggle">
-                          <div className="flex-1">
-                            <p className="text-xs font-bold uppercase tracking-tight">
-                              System {settingsView} Shield
-                            </p>
-                            <p className="text-[10px] opacity-40 font-medium">
-                              Auto-calibrate neural pulse filtering
-                            </p>
-                          </div>
-                          <button className="w-10 h-5 bg-[#00a884] rounded-full relative transition-all shadow-[0_0_10px_rgba(0,168,132,0.3)]">
-                            <div className="absolute right-1 top-1 w-3 h-3 bg-white rounded-full shadow-md" />
-                          </button>
-                        </div>
-
-                        {settingsView === "privacy" && (
-                          <>
-                            {[
-                              {
-                                key: "ghostMode",
-                                label: "Ghost Mode Protocol",
-                                desc: "Invisible presence on the signal",
-                              },
-                              {
-                                key: "antiDelete",
-                                label: "Anti-Delete Messages",
-                                desc: "Prevent recipients from revoking sent message footprints",
-                              },
-                              {
-                                key: "hideNumbers",
-                                label: "Mask Contact Numbers",
-                                desc: "Hide JID phone numbers to secure conversations on-screen",
-                              },
-                              {
-                                key: "autoReply",
-                                label: "Auto Reply Engine",
-                                desc: "Toggle automatic scripted reply module triggers",
-                              },
-                              {
-                                key: "hideBlueTicks",
-                                label: "Hide Blue Ticks",
-                                desc: "Suppress read receipt transmission",
-                              },
-                              {
-                                key: "hideSecondTick",
-                                label: "Hide Second Tick",
-                                desc: "Divert delivery confirmation",
-                              },
-                              {
-                                key: "hideTyping",
-                                label: "Hide Typing Indicator",
-                                desc: "Conceal interactive status",
-                              },
-                              {
-                                key: "secretStatusView",
-                                label: "Secret Status View",
-                                desc: "Engage status silently",
-                              },
-                              {
-                                key: "dndMode",
-                                label: "DND Airplane Mode",
-                                desc: "Disconnect from Matrix stream",
-                              },
-                              {
-                                key: "antiDeleteStatus",
-                                label: "Anti-Delete Status",
-                                desc: "Retain deleted status logs",
-                              },
-                              {
-                                key: "callRecordingEnabled",
-                                label: "Silent Call Recording",
-                                desc: "Auto-record active voice/video calls under legal compliance limits",
-                              },
-                            ].map((item) => (
-                              <div
-                                key={item.key}
-                                className="flex items-center justify-between group/toggle"
-                              >
-                                <div className="flex-1">
-                                  <p className="text-xs font-bold uppercase tracking-tight">
-                                    {item.label}
-                                  </p>
-                                  <p className="text-[10px] opacity-40 font-medium">
-                                    {item.desc}
-                                  </p>
-                                </div>
-                                <button
-                                  onClick={() =>
-                                    updateProSettings({
-                                      [item.key]:
-                                        !proSettings[
-                                          item.key as keyof typeof proSettings
-                                        ],
-                                    })
-                                  }
-                                  className={`w-10 h-5 rounded-full relative transition-all ${proSettings[item.key as keyof typeof proSettings] ? "bg-primary shadow-[0_0_10px_var(--color-primary)]" : "bg-white/10"}`}
-                                >
-                                  <div
-                                    className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${proSettings[item.key as keyof typeof proSettings] ? "right-1" : "left-1"}`}
-                                  />
-                                </button>
-                              </div>
-                            ))}
-                          </>
-                        )}
-
-                        {settingsView === "language" && (
-                          <div className="space-y-8">
-                            <div className="space-y-4">
-                              <h4 className="text-[10px] font-black uppercase text-primary tracking-widest">
-                                Interface Skin (Theme)
-                              </h4>
-                              <div className="grid grid-cols-2 gap-3">
-                                {[
-                                  "elegant-dark",
-                                  "matrix-green",
-                                  "cyber-blue",
-                                  "royal-purple",
-                                  "blood-red",
-                                ].map((t) => (
-                                  <button
-                                    key={t}
-                                    onClick={() =>
-                                      updateProSettings({ theme: t })
-                                    }
-                                    className={`p-3 rounded-xl border text-[10px] font-black uppercase tracking-tighter transition-all ${proSettings.theme === t ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" : "bg-surface border-white/5 text-white/40 hover:border-white/20"}`}
-                                  >
-                                    {t.replace("-", " ")}
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                            <div className="space-y-4">
-                              <h4 className="text-[10px] font-black uppercase text-primary tracking-widest">
-                                Typography Pulse (Font)
-                              </h4>
-                              <div className="grid grid-cols-2 gap-3">
-                                {[
-                                  "Inter",
-                                  "Space Grotesk",
-                                  "JetBrains Mono",
-                                  "Outfit",
-                                  "Fira Code",
-                                ].map((f) => (
-                                  <button
-                                    key={f}
-                                    onClick={() =>
-                                      updateProSettings({ font: f })
-                                    }
-                                    className={`p-3 rounded-xl border text-[10px] font-black uppercase tracking-tighter transition-all ${proSettings.font === f ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" : "bg-surface border-white/5 text-white/40 hover:border-white/20"}`}
-                                    style={{ fontFamily: f }}
-                                  >
-                                    {f}
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                          </div>
-                        )}
-
-                        {settingsView === "chats" && (
-                          <>
-                            <div className="flex items-center justify-between group/toggle">
-                              <div className="flex-1">
-                                <p className="text-xs font-bold uppercase tracking-tight">
-                                  Anti-Delete Protocol
-                                </p>
-                                <p className="text-[10px] opacity-40 font-medium">
-                                  Retain revoked signal packets
-                                </p>
-                              </div>
-                              <button
-                                onClick={() =>
-                                  updateProSettings({
-                                    antiDelete: !proSettings.antiDelete,
-                                  })
-                                }
-                                className={`w-10 h-5 rounded-full relative transition-all ${proSettings.antiDelete ? "bg-[#00a884] shadow-[0_0_10px_rgba(0,168,132,0.3)]" : "bg-white/10"}`}
-                              >
-                                <div
-                                  className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${proSettings.antiDelete ? "right-1" : "left-1"}`}
-                                />
-                              </button>
-                            </div>
-                          </>
-                        )}
-
-                        {settingsView === "accounts" && (
-                          <div
-                            id="settings-accounts-view"
-                            className="space-y-6"
-                          >
-                            <div className="flex items-center justify-between group/toggle pb-4 border-b border-white/5">
-                              <div className="flex-1">
-                                <p className="text-xs font-bold uppercase tracking-tight text-white">
-                                  Enable Firebase Auto Backup
-                                </p>
-                                <p className="text-[10px] opacity-40 font-medium">
-                                  Coordinate automatic live cloud updates
-                                </p>
-                              </div>
-                              <button
-                                id="toggle-firebase-backup"
-                                onClick={() => {
-                                  const nextVal = !(proSettings as any)
-                                    .firebaseBackupEnabled;
-                                  updateProSettings({
-                                    firebaseBackupEnabled: nextVal,
-                                  });
-                                  if (backupStatus) {
-                                    setBackupStatus({
-                                      ...backupStatus,
-                                      firebaseBackupEnabled: nextVal,
-                                    });
-                                  }
-                                }}
-                                className={`w-10 h-5 rounded-full relative transition-all ${(proSettings as any).firebaseBackupEnabled ? "bg-[#00a884] shadow-[0_0_10px_rgba(0,168,132,0.3)]" : "bg-white/10"}`}
-                              >
-                                <div
-                                  className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${(proSettings as any).firebaseBackupEnabled ? "right-1" : "left-1"}`}
-                                />
-                              </button>
-                            </div>
-
-                            {/* Status Indicator & Controls */}
-                            {backupStatus ? (
-                              <div
-                                id="backup-controls-container"
-                                className="space-y-4"
-                              >
-                                <div className="p-4 bg-white/5 rounded-2xl border border-white/5 space-y-3 font-mono text-[10px]">
-                                  <div className="flex justify-between">
-                                    <span className="text-white/40 uppercase text-[8px] tracking-wider">
-                                      Cloud Engine Configuration
-                                    </span>
-                                    <span
-                                      className={
-                                        backupStatus.firebase_cloud_system_enabled
-                                          ? "text-[#00a884] font-bold"
-                                          : "text-yellow-500 font-bold"
-                                      }
-                                    >
-                                      {backupStatus.firebase_cloud_system_enabled
-                                        ? "ACTIVE"
-                                        : "OFFLINE (FLAG)"}
-                                    </span>
-                                  </div>
-                                  <div className="flex justify-between">
-                                    <span className="text-white/40 uppercase text-[8px] tracking-wider">
-                                      Identified Number
-                                    </span>
-                                    <span className="text-white">
-                                      {backupStatus.phone
-                                        ? `+${backupStatus.phone}`
-                                        : "No active session"}
-                                    </span>
-                                  </div>
-                                  <div className="flex justify-between">
-                                    <span className="text-white/40 uppercase text-[8px] tracking-wider">
-                                      Last Sync Backup
-                                    </span>
-                                    <span className="text-white">
-                                      {backupStatus.metadata?.last_backup
-                                        ? new Date(
-                                            backupStatus.metadata.last_backup,
-                                          ).toLocaleString()
-                                        : "Never backed up"}
-                                    </span>
-                                  </div>
-                                  <div className="flex justify-between">
-                                    <span className="text-white/40 uppercase text-[8px] tracking-wider">
-                                      Packets Stored
-                                    </span>
-                                    <span className="text-white">
-                                      {backupStatus.metadata?.backup_size || 0}{" "}
-                                      items
-                                    </span>
-                                  </div>
-                                </div>
-
-                                {backupStatus.firebase_cloud_system_enabled &&
-                                backupStatus.phone ? (
-                                  <div className="grid grid-cols-2 gap-3 pt-2">
-                                    <button
-                                      id="trigger-backup-button"
-                                      disabled={isBackupLoading}
-                                      onClick={async () => {
-                                        setIsBackupLoading(true);
-                                        setBackupError(null);
-                                        try {
-                                          const res = await fetch(
-                                            "/api/firebase-backup/backup",
-                                            { method: "POST" },
-                                          );
-                                          if (!res.ok)
-                                            throw new Error("Sync failed");
-                                          await fetchBackupStatus();
-                                        } catch (e: any) {
-                                          setBackupError(
-                                            "Backup failed. Verify Firestore connection Rules.",
-                                          );
-                                        } finally {
-                                          setIsBackupLoading(false);
-                                        }
-                                      }}
-                                      className="py-3.5 bg-[#00a884]/10 hover:bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/20 rounded-xl font-black text-[9px] uppercase tracking-widest transition-all"
-                                    >
-                                      {isBackupLoading
-                                        ? "Syncing..."
-                                        : "Backup to Cloud"}
-                                    </button>
-                                    <button
-                                      id="trigger-restore-button"
-                                      disabled={isBackupLoading}
-                                      onClick={async () => {
-                                        setIsBackupLoading(true);
-                                        setBackupError(null);
-                                        try {
-                                          const res = await fetch(
-                                            "/api/firebase-backup/restore",
-                                            { method: "POST" },
-                                          );
-                                          if (!res.ok)
-                                            throw new Error("Restore failed");
-                                          await fetchBackupStatus();
-                                          await fetchSettings(); // reload settings
-                                           await fetchBackupStatus();
-                                           await fetchFavorites();
-                                           await fetchLockedChats();
-                                           await checkConnectionStatus();
-                                           setError("Cloud Restore Complete! Decrypted and synced database successfully with active cloud backup.");
-                                        } catch (e: any) {
-                                          setBackupError(
-                                            "Restore failed. No active backup available.",
-                                          );
-                                        } finally {
-                                          setIsBackupLoading(false);
-                                        }
-                                      }}
-                                      className="py-3.5 bg-primary hover:opacity-90 text-white rounded-xl font-black text-[9px] uppercase tracking-widest transition-all shadow-lg shadow-primary/20"
-                                    >
-                                      {isBackupLoading
-                                        ? "Restoring..."
-                                        : "Restore from Cloud"}
-                                    </button>
-                                  </div>
-                                ) : (
-                                  <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 rounded-xl text-[10px] space-y-1 leading-relaxed italic">
-                                    <p className="font-bold">SYSTEM NOTICE:</p>
-                                    <p>
-                                      Backup controls are inactive because the
-                                      global developer flag{" "}
-                                      <code>firebase_cloud_system_enabled</code>{" "}
-                                      is set to <code>false</code> in server
-                                      memory.
-                                    </p>
-                                  </div>
-                                )}
-
-                                {backupError && (
-                                  <p
-                                    id="backup-error-message"
-                                    className="text-red-500 text-[10px] font-bold italic text-center mt-2"
-                                  >
-                                    {backupError}
-                                  </p>
-                                )}
-                              </div>
-                            ) : (
-                              <div className="flex justify-center py-4">
-                                <div className="w-5 h-5 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-2xl flex gap-3 mt-6">
-                      <Zap className="w-4 h-4 text-yellow-500 shrink-0" />
-                      <p className="text-[10px] text-yellow-500 font-bold italic leading-tight">
-                        ADMIN NOTICE: Some {settingsView} parameters are managed
-                        by the neural core and may require a system reboot to
-                        apply changes.
-                      </p>
-                    </div>
-                    {settingsView === "help" && (
-                      <div className="space-y-4 mt-4">
-                        <div className="p-4 rounded-2xl bg-black/40 border border-white/5 space-y-3">
-                          <span className="text-[9px] text-[#00a884] font-black uppercase tracking-widest block font-sans">Submit System Request Ticket</span>
-                          
-                          <div className="space-y-1">
-                            <label className="text-[8px] font-black uppercase text-[#aebac1]/50 tracking-wider">Select Request Category</label>
-                            <select
-                              value={helpCategory}
-                              onChange={(e) => setHelpCategory(e.target.value)}
-                              className="w-full bg-[#1e2a30] text-[10px] font-bold p-3 rounded-xl text-white outline-none focus:border-[#00a884]/40 border border-transparent font-sans"
-                            >
-                              <option>Bug Report / Connection Reset</option>
-                              <option>Core Connection State Assistance</option>
-                              <option>Interactive Security Locking & PIN Issues</option>
-                              <option>Backup Integrity & Cloud Restore Request</option>
-                              <option>Feature Recommendation Request</option>
-                            </select>
-                          </div>
-
-                          <div className="space-y-1">
-                            <label className="text-[8px] font-black uppercase text-[#aebac1]/50 tracking-wider">Detail your Problem / Update Request</label>
-                            <textarea
-                              rows={4}
-                              placeholder="Please describe your current query, exact error message, or feature requests in complete detail so our network review panel can replicate it..."
-                              className="w-full bg-[#1e2a30] text-xs p-3 rounded-xl text-white outline-none focus:border-[#00a884]/40 border border-transparent placeholder:text-white/20 leading-relaxed font-sans font-medium"
-                              value={helpProblemText}
-                              onChange={(e) => setHelpProblemText(e.target.value)}
-                            />
-                          </div>
-
-                          <button
-                            disabled={isSubmittingHelp || !helpProblemText.trim()}
-                            onClick={async () => {
-                              setIsSubmittingHelp(true);
-                              try {
-                                const res = await apiFetch("/api/help-request", {
-                                  method: "POST",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({
-                                    problem: helpProblemText,
-                                    category: helpCategory
-                                  }),
-                                });
-                                if (res.ok) {
-                                  const raw = await res.json();
-                                  setHelpTicketId(raw.ticketId);
-                                  setHelpProblemText("");
-                                  setError(`Ticket ${raw.ticketId} successfully submitted! Category: ${helpCategory}. Our technical staff is reviewing this request.`);
-                                } else {
-                                  throw new Error("API post error");
-                                }
-                              } catch (e) {
-                                setError("Failed to submit request. Please try again.");
-                              } finally {
-                                setIsSubmittingHelp(false);
-                              }
-                            }}
-                            className={`w-full py-3 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all font-sans ${
-                              helpProblemText.trim() && !isSubmittingHelp
-                                ? "bg-[#00a884] text-white hover:bg-[#00bc95] shadow-lg shadow-[#00a884]/20 cursor-pointer"
-                                : "bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-50"
-                            }`}
-                          >
-                            {isSubmittingHelp ? "Registering..." : "Submit Server Request"}
-                          </button>
-                        </div>
-
-                        {helpTicketId && (
-                          <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-[10px] space-y-1 font-sans">
-                            <p className="font-black uppercase tracking-wider">🟢 ACTIVE TICKET REGISTERED</p>
-                            <p className="font-mono text-white text-xs select-all bg-black/20 p-2.5 rounded-lg border border-white/5 font-bold">{helpTicketId}</p>
-                            <p className="italic text-[9px] text-white/50">Keep reference of this ticket hash for support correspondence.</p>
-                          </div>
-                        )}
-
-                        <div className="flex gap-2 font-sans">
-                          <button 
-                            onClick={() => {
-                              setHelpProblemText("Feature Request: Please integrate automated media compression protocol so uploads are extremely fast on low and congested bandwidth chains!");
-                              setHelpCategory("Feature Recommendation Request");
-                            }}
-                            className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-[8px] text-[#aebac1] font-black uppercase tracking-widest border border-white/5"
-                          >
-                            📝 Suggest Upgrade
-                          </button>
-                          <button 
-                            onClick={() => {
-                              setHelpProblemText("Bug report: Local session is resetting when switching networks under dual-mode standby mode. Resync requested!");
-                              setHelpCategory("Bug Report / Connection Reset");
-                            }}
-                            className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-[8px] text-[#aebac1] font-black uppercase tracking-widest border border-white/5"
-                          >
-                            ⚠️ Reset Bug
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showScheduleModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-surface w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 bg-accent border-b border-white/5 flex justify-between items-center text-primary">
-                <h2 className="text-sm font-black uppercase tracking-widest italic flex items-center gap-2">
-                  <Clock className="w-4 h-4" /> Schedule Protocol
-                </h2>
-                <button
-                  onClick={() => setShowScheduleModal(false)}
-                  className="text-white/40"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="p-8 space-y-6">
-                <div>
-                  <label className="block text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 ml-2">
-                    Target Recipient
-                  </label>
-                  <select
-                    value={selectedScheduleJid || activeChat?.id || ""}
-                    onChange={(e) => setSelectedScheduleJid(e.target.value)}
-                    className="w-full bg-accent border border-white/5 rounded-2xl p-4 text-xs font-bold outline-none focus:border-primary transition-all text-white"
-                  >
-                    <option value="" disabled className="text-white/20">
-                      -- SELECT RECIPIENT --
-                    </option>
-                    {chats.map((c) => (
-                      <option
-                        key={c.id}
-                        value={c.id}
-                        className="bg-[#111b21] text-white"
-                      >
-                        {c.name || c.id.split("@")[0]} ({c.id.split("@")[0]})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 ml-1">
-                    Payload Content
-                  </label>
-                  <textarea
-                    className="w-full h-24 bg-accent border border-white/5 rounded-2xl p-4 text-sm outline-none focus:border-primary transition-all resize-none"
-                    placeholder="Enter neural data to transmit..."
-                    value={scheduleData.text}
-                    onChange={(e) =>
-                      setScheduleData({ ...scheduleData, text: e.target.value })
-                    }
-                  />
-                </div>
-                <div>
-                  <label className="block text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 ml-1">
-                    Activation Epoch
-                  </label>
-                  <input
-                    type="datetime-local"
-                    className="w-full bg-accent border border-white/5 rounded-2xl p-4 text-sm outline-none focus:border-primary transition-all"
-                    value={scheduleData.time}
-                    onChange={(e) =>
-                      setScheduleData({ ...scheduleData, time: e.target.value })
-                    }
-                  />
-                </div>
-                <button
-                  onClick={scheduleMessage}
-                  className="w-full bg-primary text-white font-black py-4 rounded-xl hover:opacity-90 transition-all text-xs uppercase tracking-[0.3em] shadow-lg shadow-primary/20"
-                >
-                  Commit to Timeline
-                </button>
-                <div className="pt-4 border-t border-white/5">
-                  <p className="text-[10px] font-black text-white/20 uppercase tracking-widest mb-3">
-                    Active Schedules
-                  </p>
-                  {scheduledMsgs
-                    .filter((m) => !m.sent)
-                    .map((m) => (
-                      <div
-                        key={m.id}
-                        className="p-3 bg-accent/50 rounded-xl flex items-center justify-between mb-2 border border-white/[0.02]"
-                      >
-                        <div className="min-w-0">
-                          <p className="text-[11px] font-bold truncate">
-                            "{m.text}"
-                          </p>
-                          <p className="text-[8px] opacity-40 font-mono italic">
-                            {safeFormat(m.time, "MMM dd, HH:mm")}
-                          </p>
-                        </div>
-                        <Clock className="w-3 h-3 text-primary" />
-                      </div>
-                    ))}
-                </div>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showAutoReplyModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-surface w-full max-w-lg rounded-3xl border border-white/5 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
-            >
-              <div className="p-6 bg-accent border-b border-white/5 flex justify-between items-center text-primary">
-                <h2 className="text-sm font-black uppercase tracking-widest italic flex items-center gap-2">
-                  <Zap className="w-4 h-4" /> Auto Reply Interface
-                </h2>
-                <div className="flex items-center gap-4">
-                  <button
-                    onClick={() =>
-                      updateProSettings({ autoReply: !proSettings.autoReply })
-                    }
-                    className={`px-3 py-1.5 rounded-lg border text-[9px] font-black uppercase tracking-widest transition-all ${proSettings.autoReply ? "bg-primary border-primary text-white" : "border-white/10 text-white/40"}`}
-                  >
-                    {proSettings.autoReply ? "Engine Armed" : "Engine Disarmed"}
-                  </button>
-                  <button
-                    onClick={() => setShowAutoReplyModal(false)}
-                    className="text-white/40"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
-              </div>
-              <div className="p-6 border-b border-white/5 bg-surface">
-                <div className="grid grid-cols-2 gap-4">
-                  <input
-                    placeholder="Keyword"
-                    className="bg-accent border border-white/5 rounded-xl p-3 text-xs outline-none focus:border-primary"
-                    value={newAutoReply.keyword}
-                    onChange={(e) =>
-                      setNewAutoReply({
-                        ...newAutoReply,
-                        keyword: e.target.value,
-                      })
-                    }
-                  />
-                  <input
-                    placeholder="Response"
-                    className="bg-accent border border-white/5 rounded-xl p-3 text-xs outline-none focus:border-primary"
-                    value={newAutoReply.response}
-                    onChange={(e) =>
-                      setNewAutoReply({
-                        ...newAutoReply,
-                        response: e.target.value,
-                      })
-                    }
-                  />
-                </div>
-                <button
-                  onClick={addAutoReply}
-                  className="w-full mt-4 bg-primary/10 text-primary border border-primary/20 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-primary hover:text-white transition-all"
-                >
-                  Add Neural Trigger
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto p-6 space-y-3 custom-scrollbar">
-                {autoReplies.map((r, i) => (
-                  <div
-                    key={i}
-                    className="p-4 bg-accent rounded-2xl border border-white/5 flex items-center justify-between"
-                  >
-                    <div>
-                      <p className="text-[10px] font-black uppercase text-primary tracking-widest mb-1 italic">
-                        Trigger: {r.keyword}
-                      </p>
-                      <p className="text-xs font-bold">"{r.response}"</p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={async () => {
-                          await apiFetch("/api/auto-replies/toggle", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ keyword: r.keyword }),
-                          });
-                          fetchAutoReplies();
-                        }}
-                        className={`w-8 h-4 rounded-full relative transition-all ${r.enabled ? "bg-primary" : "bg-white/10"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${r.enabled ? "left-4.5" : "left-0.5"}`}
-                        />
-                      </button>
-                      <button
-                        onClick={async () => {
-                          await apiFetch(`/api/auto-replies/${r.keyword}`, {
-                            method: "DELETE",
-                          });
-                          fetchAutoReplies();
-                        }}
-                        className="p-2 hover:bg-red-500/10 rounded-lg text-red-500 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {autoReplies.length === 0 && (
-                  <p className="text-center py-10 text-[10px] font-black uppercase tracking-widest opacity-20">
-                    No active triggers programmed
-                  </p>
-                )}
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {deleteOptionModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-sm rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 border-b border-white/5 bg-[#202c33] flex justify-between items-center">
-                <h2 className="text-xs font-black uppercase tracking-widest text-red-500 italic">
-                  Delete Signal Pulse?
-                </h2>
-                <button onClick={() => setDeleteOptionModal(null)}>
-                  <X className="w-5 h-5 text-red-500" />
-                </button>
-              </div>
-              <div className="p-8 space-y-4">
-                <button
-                  onClick={() => deleteMessage(deleteOptionModal.msgId, false)}
-                  className="w-full bg-white/5 text-[#e9edef] font-bold py-4 rounded-xl hover:bg-white/10 transition-all text-xs uppercase tracking-widest border border-white/10"
-                >
-                  Delete for Me
-                </button>
-                <button
-                  onClick={() => deleteMessage(deleteOptionModal.msgId, true)}
-                  className="w-full bg-red-500 text-white font-black py-4 rounded-xl hover:bg-red-600 transition-all shadow-xl shadow-red-500/20 text-xs uppercase tracking-widest"
-                >
-                  Delete for Everyone
-                </button>
-                <button
-                  onClick={() => setDeleteOptionModal(null)}
-                  className="w-full text-white/40 text-[10px] font-black uppercase tracking-widest py-2"
-                >
-                  Cancel Purge
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {isProfileEditorOpen && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden"
-            >
-              <div className="p-6 border-b border-white/5 bg-[#202c33] flex justify-between items-center">
-                <h2 className="text-sm font-black uppercase tracking-widest text-[#00a884] italic">
-                  Profile Configuration 🧬
-                </h2>
-                <button onClick={() => setIsProfileEditorOpen(false)}>
-                  <X className="w-5 h-5 text-[#00a884]" />
-                </button>
-              </div>
-              <div className="p-8 space-y-6">
-                <div className="flex flex-col items-center gap-4">
-                  <div className="relative group">
-                    <div className="w-24 h-24 rounded-3xl bg-[#00a884] flex items-center justify-center shadow-2xl overflow-hidden border border-white/10 text-white text-3xl font-black">
-                      {previewPhotoUrl ? (
-                        <div className="relative w-full h-full">
-                          <img
-                            src={previewPhotoUrl}
-                            alt="Selected visual preview"
-                            className="w-full h-full object-cover"
-                          />
-                          <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
-                            <span className="text-[9px] font-black uppercase text-[#00a884] bg-[#111b21] px-1.5 py-0.5 rounded-md animate-pulse">
-                              PREVIEW
-                            </span>
-                          </div>
-                        </div>
-                      ) : (user?.id &&
-                       profilePictures[
-                         user.id.split(":")[0] + "@s.whatsapp.net"
-                       ] ? (
-                        <img
-                          src={
-                            profilePictures[
-                              user.id.split(":")[0] + "@s.whatsapp.net"
-                            ]
-                          }
-                          alt=""
-                          className="w-full h-full object-cover"
-                          referrerPolicy="no-referrer"
-                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                        />
-                      ) : (
-                        user?.name?.[0] || <Zap />
-                      ))}
-                    </div>
-                  </div>
-
-                  {previewPhotoUrl ? (
-                    <div className="flex gap-2 w-full animate-in fade-in slide-in-from-top-2 duration-300">
-                      <button
-                        onClick={confirmPhotoUpload}
-                        disabled={isUploadingPhoto}
-                        className="flex-1 bg-[#00a884] hover:bg-[#00bc95] text-white text-[9px] font-black uppercase tracking-wider py-2 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5"
-                      >
-                        {isUploadingPhoto ? (
-                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Check className="w-3.5 h-3.5" />
-                        )}
-                        Confirm Upload
-                      </button>
-                      <button
-                        onClick={() => {
-                          setPreviewPhotoUrl(null);
-                          setSelectedPhotoFile(null);
-                        }}
-                        className="flex-1 bg-white/5 hover:bg-white/10 text-white/60 text-[9px] font-black uppercase tracking-wider py-2 rounded-xl transition-all border border-white/5"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <div>
-                      <button
-                        onClick={() => profilePhotoInputRef.current?.click()}
-                        className="px-4 py-2 bg-[#00a884]/15 hover:bg-[#00a884]/25 text-[#00a884] text-[10px] font-black uppercase tracking-widest rounded-xl transition-all border border-[#00a884]/30 flex items-center gap-1.5 shadow-md shadow-[#00a884]/5"
-                      >
-                        <Camera className="w-3.5 h-3.5" />
-                        Update Profile Picture
-                      </button>
-                      <input
-                        type="file"
-                        ref={profilePhotoInputRef}
-                        accept="image/jpg,image/jpeg,image/png,image/webp"
-                        onChange={handlePhotoSelect}
-                        className="hidden"
-                      />
-                    </div>
-                  )}
-                </div>
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-2 ml-1">
-                      Entity Name
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="Your Name"
-                      className="w-full bg-[#202c33] border border-white/5 rounded-xl p-4 text-sm text-white outline-none focus:border-[#00a884] transition-all font-bold"
-                      value={profileName}
-                      onChange={(e) => setProfileName(e.target.value)}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-2 ml-1">
-                      Universal Bio
-                    </label>
-                    <textarea
-                      placeholder="System Bio..."
-                      className="w-full h-24 bg-[#202c33] border border-white/5 rounded-xl p-4 text-sm text-white outline-none focus:border-[#00a884] transition-all font-medium resize-none"
-                      value={profileBio}
-                      onChange={(e) => setProfileBio(e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <button
-                  onClick={updateProfile}
-                  disabled={loading}
-                  className="w-full bg-[#00a884] text-white font-black py-4 rounded-xl hover:bg-[#00bc95] transition-all shadow-xl shadow-[#00a884]/20 text-xs uppercase tracking-widest flex items-center justify-center gap-3"
-                >
-                  {loading && <RefreshCw className="w-4 h-4 animate-spin" />}
-                  Commit Signal Updates
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {adminAccessAlert && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[300] bg-black/95 flex items-center justify-center p-4 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.9, y: 20 }}
-              className="bg-[#0c1317] w-full max-w-md rounded-3xl border border-red-500/30 shadow-[0_0_50px_rgba(239,68,68,0.15)] overflow-hidden"
-            >
-              <div className="p-6 bg-red-950/20 border-b border-red-500/10 flex items-center gap-3 text-red-500 shrink-0">
-                <Shield className="w-5 h-5 animate-bounce" />
-                <h2 className="text-xs font-black uppercase tracking-widest italic">
-                  Security Transparency Warning
-                </h2>
-              </div>
-              <div className="p-8 space-y-6 text-center">
-                <div className="w-14 h-14 bg-red-500/10 text-red-500 rounded-full flex items-center justify-center mx-auto">
-                  <ShieldCheck className="w-7 h-7" />
-                </div>
-
-                <div className="space-y-2">
-                  <h3 className="text-sm font-bold text-white uppercase tracking-tight">
-                    Data Access Logged
-                  </h3>
-                  <p className="text-zinc-400 text-xs leading-relaxed max-w-sm mx-auto">
-                    Your account data was accessed by an administrator on{" "}
-                    <span className="text-white font-mono font-bold underline">
-                      {adminAccessAlert.timestamp}
-                    </span>{" "}
-                    for support/verification purposes.
-                  </p>
-                </div>
-
-                <div className="p-4 bg-white/[0.02] border border-white/5 rounded-2xl text-left space-y-1.5 font-mono text-[10px]">
-                  <div className="flex justify-between">
-                    <span className="text-white/40 uppercase tracking-widest text-[8px]">
-                      Auditor ID:
-                    </span>
-                    <span className="text-zinc-300">
-                      {maskAdminEmail(adminAccessAlert.adminEmail)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-white/40 uppercase tracking-widest text-[8px]">
-                      Audit Session:
-                    </span>
-                    <span className="text-green-500 font-bold">
-                      CERTIFIED RE-STREAM
-                    </span>
-                  </div>
-                </div>
-
-                <div className="pt-2">
-                  <button
-                    id="transparency-dismiss-btn"
-                    disabled={alertDismissCountdown > 0}
-                    onClick={() => setAdminAccessAlert(null)}
-                    className={`w-full py-3.5 rounded-xl font-bold text-xs uppercase tracking-widest transition-all ${
-                      alertDismissCountdown > 0
-                        ? "bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-50"
-                        : "bg-red-500 text-white hover:bg-red-600 shadow-xl shadow-red-500/20 cursor-pointer"
-                    }`}
-                  >
-                    {alertDismissCountdown > 0
-                      ? `Compliance Review (${alertDismissCountdown}s)`
-                      : "Dismiss Notification"}
-                  </button>
-                </div>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showAdminConsole && (
-          <SecretAdminPanel 
-            onClose={() => setShowAdminConsole(false)} 
-            currentPhoneNumber={user?.id ? (user.id.split(":")[0]) : waLinkPhone}
-          />
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {pendingConsentRequest && (
-          <motion.div
-            key="consent-modal"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[110] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 15 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="w-full max-w-md bg-[#11232c] border border-red-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(239,68,68,0.15)] text-center space-y-6"
-            >
-              <div className="w-14 h-14 bg-red-500/10 text-red-500 rounded-full flex items-center justify-center mx-auto shadow-inner">
-                <ShieldAlert className="w-8 h-8 animate-pulse" />
-              </div>
-              
-              <div className="space-y-2">
-                <h3 className="text-sm font-black text-white uppercase tracking-wider">⚠️ ADMINISTRATIVE ACCESS REQUEST</h3>
-                <p className="text-[10px] text-white/50 leading-relaxed italic">
-                  An administrator (<span className="text-[#00a884] font-bold font-mono">{maskAdminEmail(pendingConsentRequest.adminEmail)}</span>) is requesting consent to temporarily view your chats and call history under privacy protocols. This permission is 100% read-only and expires in 5 minutes.
-                </p>
-              </div>
-
-              <div className="bg-black/30 p-4 rounded-2xl flex flex-col items-center gap-1.5 border border-white/5">
-                <span className="text-[8px] font-black uppercase text-[#00a884] tracking-widest">Active Verification token</span>
-                <span className="text-xl font-mono font-black text-white letter-spacing-wide tracking-[3px]">{pendingConsentRequest.token}</span>
-                <span className="text-[8px] text-white/30">Provide this token to the administrator if you wish to confirm.</span>
-              </div>
-
-              <div className="flex gap-3">
-                <button
-                  onClick={() => handleApproveConsent(false)}
-                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
-                >
-                  Decline (Block)
-                </button>
-                <button
-                  onClick={() => handleApproveConsent(true)}
-                  className="flex-1 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all shadow-lg shadow-red-500/25"
-                >
-                  Approve (Grant)
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showCallRecordingConfirmation && (
-          <motion.div
-            key="call-rec-modal"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[110] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 15 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="w-full max-w-md bg-[#111b21] border border-yellow-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(234,179,8,0.1)] text-center space-y-6"
-            >
-              <div className="w-14 h-14 bg-yellow-500/10 text-yellow-500 rounded-full flex items-center justify-center mx-auto">
-                <Mic className="w-6 h-6 animate-bounce" />
-              </div>
-
-              <div className="space-y-2">
-                <h3 className="text-sm font-black text-white uppercase tracking-wider">⚠️ LEGAL COMPLIANCE DISCLAIMER</h3>
-                <p className="text-[10px] text-white/50 leading-relaxed italic">
-                  Call recording may be illegal or highly restricted without explicit single-party or multi-party consent in many jurisdictions. You are solely responsible for local legal compliance and ensuring all relevant parties are notified. No audible beep will notify the user.
-                </p>
-              </div>
-
-              <div className="flex gap-3 pt-2">
-                <button
-                  onClick={() => setShowCallRecordingConfirmation(false)}
-                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
-                >
-                  Abort (Keep disabled)
-                </button>
-                <button
-                  onClick={() => {
-                    const nextVal = { callRecordingEnabled: true };
-                    const newSettings = { ...proSettings, ...nextVal };
-                    setProSettings(newSettings);
-                    apiFetch("/api/settings", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify(newSettings),
-                    }).catch(() => {});
-                    setShowCallRecordingConfirmation(false);
-                  }}
-                  className="flex-1 py-3 bg-[#00a884] hover:bg-[#00bc95] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all shadow-lg shadow-[#00a884]/25"
-                >
-                  I Agree & Confirm Compliance
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* SETUP LOCK CHATS WIZARD */}
-      <AnimatePresence>
-        {showLockSetupModal && (
-          <motion.div
-            key="lock-setup-modal"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 font-sans"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 15 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="w-full max-w-md bg-[#11232c] border border-emerald-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(16,185,129,0.15)] space-y-6"
-            >
-              <div className="flex justify-between items-center border-b border-white/5 pb-3">
-                <div className="flex items-center gap-2">
-                  <Lock className="w-5 h-5 text-[#00a884]" />
-                  <h3 className="text-sm font-black text-white uppercase tracking-wider">Secure Chat Wizard</h3>
-                </div>
-                <button 
-                  onClick={() => setShowLockSetupModal(false)}
-                  className="p-1 hover:bg-white/5 rounded-full text-white/50 hover:text-white transition-colors"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              {/* Step 1: Select Contacts to Lock */}
-              <div className="space-y-4">
-                <div className="space-y-1">
-                  <span className="text-[10px] uppercase font-black tracking-widest text-[#00a884]">Step 1: Select Contacts</span>
-                  <p className="text-[11px] text-white/50 italic">Choose the mobile number/chats you wish to isolate into the secure vault:</p>
-                </div>
-
-                <div className="max-h-48 overflow-y-auto space-y-1.5 p-2 bg-black/40 rounded-2xl border border-white/5 custom-scrollbar">
-                  {Object.keys(contacts).length === 0 ? (
-                    <div className="text-[10px] italic text-white/30 text-center py-4">No active connection contacts found.</div>
-                  ) : (
-                    Object.keys(contacts).map((jid) => {
-                      const isSelected = selectedContactsToLock.includes(jid);
-                      return (
-                        <div
-                          key={jid}
-                          onClick={() => {
-                            if (isSelected) {
-                              setSelectedContactsToLock(selectedContactsToLock.filter(id => id !== jid));
-                            } else {
-                              setSelectedContactsToLock([...selectedContactsToLock, jid]);
-                            }
-                          }}
-                          className={`flex items-center justify-between p-2.5 rounded-xl cursor-pointer transition-colors ${isSelected ? 'bg-[#00a884]/10 border border-[#00a884]/30 text-white' : 'bg-white/5 hover:bg-white/10 text-white/70 border border-transparent'}`}
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            <div className="w-3 h-3 rounded-md border border-white/20 flex items-center justify-center">
-                              {isSelected && <div className="w-1.5 h-1.5 bg-[#00a884] rounded" />}
-                            </div>
-                            <span className="text-xs truncate font-bold">{contacts[jid].name || jid.split("@")[0]}</span>
-                          </div>
-                          <span className="text-[9px] font-mono text-white/30 truncate select-none">{jid.split("@")[0]}</span>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-
-                {/* Step 2: Set secure PIN */}
-                <div className="space-y-3 pt-2 border-t border-white/5">
-                  <div className="space-y-1">
-                    <span className="text-[10px] uppercase font-black tracking-widest text-amber-400">Step 2: Set Security PIN</span>
-                    <p className="text-[11px] text-white/50 italic">Both PIN entries must match to complete lock authorization:</p>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1">
-                      <label className="text-[9px] text-[#aebac1]/60 uppercase font-black">Secure PIN</label>
-                      <input
-                        type="password"
-                        maxLength={6}
-                        placeholder="••••"
-                        className="w-full bg-[#1e2a30] text-white text-center rounded-xl p-2.5 outline-none border border-white/5 focus:border-[#00a884]/40 font-mono tracking-widest"
-                        value={newLockPinInput}
-                        onChange={(e) => setNewLockPinInput(e.target.value.replace(/\D/g, ""))}
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[9px] text-[#aebac1]/60 uppercase font-black">Confirm PIN</label>
-                      <input
-                        type="password"
-                        maxLength={6}
-                        placeholder="••••"
-                        className="w-full bg-[#1e2a30] text-white text-center rounded-xl p-2.5 outline-none border border-white/5 focus:border-[#00a884]/40 font-mono tracking-widest"
-                        value={confirmLockPinInput}
-                        onChange={(e) => setConfirmLockPinInput(e.target.value.replace(/\D/g, ""))}
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 pt-3">
-                  <button
-                    onClick={() => setShowLockSetupModal(false)}
-                    className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    disabled={selectedContactsToLock.length === 0 || !newLockPinInput || newLockPinInput !== confirmLockPinInput}
-                    onClick={async () => {
-                      if (newLockPinInput !== confirmLockPinInput) {
-                        setError("Verification Failure: Pins do not match!");
-                        return;
-                      }
-                      
-                      setUserLockPin(newLockPinInput);
-                      try {
-                        localStorage.setItem("userLockPin", newLockPinInput);
-                      } catch (e) {}
-                      
-                      // Lock selected contacts
-                      const nextLocked = [...lockedChats];
-                      for (const jid of selectedContactsToLock) {
-                        if (!nextLocked.includes(jid)) {
-                          nextLocked.push(jid);
-                          try {
-                            await apiFetch("/api/lock-chat", {
-                              method: "POST",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ chatId: jid })
-                            });
-                          } catch (e) {}
-                        }
-                      }
-                      setLockedChats(nextLocked);
-                      setError(`Locked Vault Activated! ${selectedContactsToLock.length} contacts successfully isolated under secure PIN.`);
-                      setShowLockSetupModal(false);
-                    }}
-                    className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-all text-white shadow-lg ${
-                      selectedContactsToLock.length > 0 && newLockPinInput && newLockPinInput === confirmLockPinInput
-                        ? 'bg-[#00a884] hover:bg-[#00bc95] shadow-[#00a884]/20 font-bold'
-                        : 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-55'
-                    }`}
-                  >
-                    Activate Locked Vault
-                  </button>
-                </div>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* PIN UNLOCK VERIFICATION MODAL */}
-      <AnimatePresence>
-        {showUnlockPinPromptModal && (
-          <motion.div
-            key="unlock-pin-modal"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 font-sans"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 15 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="w-full max-w-sm bg-[#11232c] border border-amber-500/20 rounded-3xl p-6 shadow-[0_0_50px_rgba(245,158,11,0.15)] text-center space-y-6"
-            >
-              <div className="w-14 h-14 bg-amber-500/10 text-amber-500 rounded-full flex items-center justify-center mx-auto shadow-inner">
-                <Lock className="w-7 h-7" />
-              </div>
-
-              <div className="space-y-1.5">
-                <h3 className="text-sm font-black text-white uppercase tracking-wider">Unseal Vault Authorization</h3>
-                <p className="text-[10px] text-white/50 leading-relaxed italic">
-                  Provide your credential verification PIN to unlock persistent secure conversations:
-                </p>
-              </div>
-
-              <div className="space-y-1">
-                <input
-                  type="password"
-                  maxLength={6}
-                  placeholder="••••"
-                  autoFocus
-                  className="w-32 bg-[#1e2a30] text-white text-center text-xl rounded-xl p-3 outline-none border border-white/10 focus:border-amber-500/40 font-mono tracking-widest mx-auto block"
-                  value={unlockPinInput}
-                  onChange={(e) => setUnlockPinInput(e.target.value.replace(/\D/g, ""))}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && unlockPinInput) {
-                      if (unlockPinInput === userLockPin) {
-                        setChatSubTab("LOCKED");
-                        setShowUnlockPinPromptModal(false);
-                        setError("Access Granted! SECURED locked vault unsealed successfully.");
-                      } else {
-                        setError("Security Failure: Incorrect Verification PIN!");
-                      }
-                    }
-                  }}
-                />
-              </div>
-
-              <div className="flex gap-3 pt-2">
-                <button
-                  onClick={() => setShowUnlockPinPromptModal(false)}
-                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all border border-white/5"
-                >
-                  Cancel
-                </button>
-                <button
-                  disabled={!unlockPinInput}
-                  onClick={() => {
-                    if (unlockPinInput === userLockPin) {
-                      setChatSubTab("LOCKED");
-                      setShowUnlockPinPromptModal(false);
-                      setError("Access Granted! SECURED locked vault unsealed successfully.");
-                    } else {
-                      setError("Security Failure: Incorrect Verification PIN!");
-                    }
-                  }}
-                  className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-all text-white shadow-lg ${
-                    unlockPinInput
-                      ? 'bg-amber-500 text-black hover:bg-[#00a884] shadow-amber-500/25 font-bold'
-                      : 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-55'
-                  }`}
-                >
-                  Decrypt Vault
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <style>{`
-        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.05); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.1); }
-        .no-scrollbar::-webkit-scrollbar { display: none; }
-      `}</style>
-    </div>
-  );
+            const filePath = path.join(session.dir, fileName);
+            const tempFile = filePath + '.tmp';
+            fs.writeFileSync(tempFile, JSON.stringify(session[dataKey]), 'utf-8');
+            fs.renameSync(tempFile, filePath);
+        } catch (e: any) { console.error(`[Session ${session.id}] Save failed: ${e.message}`); }
+    }, 1500);
 }
+
+function broadcastToSession(session: any, data: any) {
+    session.lastInteractionTime = Date.now();
+    const msg = JSON.stringify(data);
+    session.wsClients.forEach((client: WebSocket) => {
+        if (client.readyState === WebSocket.OPEN) client.send(msg);
+    });
+}
+
+function getSessionFromReq(req: any): any | null {
+    if (req.userSession) return req.userSession;
+    const sid = req.headers['x-session-id'] || req.query.sessionId;
+    if (!sid || typeof sid !== 'string') return null;
+    return getOrCreateSession(sid);
+}
+
+const app = express(); // FIXED (Move globally)
+
+// CORS and response headers for external access
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
+
+app.options('*', cors());
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
+  res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+  next();
+});
+
+const server = createServer(app); // FIXED (Move globally)
+const wss = new WebSocketServer({ server }); // FIXED (Move globally)
+
+const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
+const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
+const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
+const expiredMediaTracker = new Set<string>();
+
+// Initialize Firebase configuration if it exists
+const firebaseConfigPath = path.join(process.cwd(), 'firebase-applet-config.json');
+let db: any = null;
+let firestoreAvailable = false;
+
+if (fs.existsSync(firebaseConfigPath)) {
+    try {
+        const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf-8'));
+        const firebaseApp = initializeApp(firebaseConfig);
+        db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+        console.log('[Firebase] Initialized connection. Beginning Firestore availability checks.');
+
+        let checkAttempts = 0;
+        const maxCheckAttempts = 5;
+
+        const checkFirestoreAvailability = () => {
+            checkAttempts++;
+            console.log(`[Firebase] Checking Firestore database availability (Attempt ${checkAttempts}/${maxCheckAttempts})...`);
+            
+            // Perform a test write to verify Firestore is active and writable/accessible
+            setDoc(doc(db, 'test_connection_dummy', 'check'), { timestamp: Date.now() })
+                .then(() => {
+                    firestoreAvailable = true;
+                    setFirebaseEnabledState(true);
+                    console.log('[Firebase] Firestore Database is active, writable, and verified.');
+                })
+                .catch((err: any) => {
+                    const isQuotaExceeded = checkQuotaError(err);
+                    if (isQuotaExceeded) {
+                        console.warn(`🚨 [Firebase Safeguard] Firestore daily free quota exceeded! Seamlessly running on 100% resilient permanent local storage backups.`);
+                        firestoreAvailable = false;
+                        setFirebaseEnabledState(false);
+                        return; // Prevent retries to conserve system resources
+                    }
+                    const errMsg = (err?.message || '').toLowerCase();
+                    const errCode = err?.code || '';
+                    
+                    // If it is permission-denied, the database exists and we successfully contacted it but lack permission to write to this path.
+                    // This is acceptable indicating database presence.
+                    const isPermissionError = 
+                        errMsg.includes('permission-denied') || 
+                        errMsg.includes('permission_denied') || 
+                        errMsg.includes('unauthorized') ||
+                        errCode === 'permission-denied';
+
+                    // If it is simply not-found or already exists, the database is present.
+                    const isDbPresent = isPermissionError || errMsg.includes('not-found') || errCode === 'not-found';
+
+                    if (isDbPresent) {
+                        firestoreAvailable = true;
+                        setFirebaseEnabledState(true);
+                        console.log(`[Firebase] Firestore Database verified as active and present (Status/Code code/message matching: ${errCode || 'N/A'}).`);
+                    } else {
+                        // DB not found (e.g. default database not found) or offline error
+                        console.warn(`[Firebase Warning] Firestore is unavailable or missing on attempt ${checkAttempts}: ${err.message}`);
+                        
+                        // Disable features until next check
+                        firestoreAvailable = false;
+                        setFirebaseEnabledState(false);
+
+                        if (checkAttempts < maxCheckAttempts) {
+                            console.log('[Firebase] Scheduling next connection retry in 60 seconds...');
+                            setTimeout(checkFirestoreAvailability, 60000);
+                        } else {
+                            console.error('[Firebase Error] Max Firestore availability checks exceeded. Disabling backup functionality.');
+                            firestoreAvailable = false;
+                            setFirebaseEnabledState(false);
+                        }
+                    }
+                });
+        };
+
+        // Start checking
+        checkFirestoreAvailability();
+
+    } catch (e: any) {
+        console.error('Failed to initialize Firebase:', e.message);
+        db = null;
+        firestoreAvailable = false;
+        setFirebaseEnabledState(false);
+    }
+} else {
+    setFirebaseEnabledState(false);
+}
+
+// ── Global state replaced by per-session state (see sessions Map above) ──
+// Kept as thin compatibility shims so shared utility functions still compile.
+// All real state lives in session objects accessed via getSessionFromReq().
+let consecutiveBadSessions = 0; // legacy shim (unused in multi-user path)
+let consecutiveStreamErrors = 0; // legacy shim
+let lastInteractionTime = Date.now(); // legacy shim
+
+function recordActivity() { lastInteractionTime = Date.now(); }
+
+// Global log (used before session exists). Session-scoped logging happens inside session context.
+function log(level: string, msg: string) {
+    const entry = { time: new Date().toISOString(), level, msg };
+    console.log(`[${level}] ${msg}`);
+}
+
+// These are kept as stubs; real saving is done via saveSessionProData(session)
+function saveProData() {}
+function saveProDataSync() {}
+
+// Global active consent tokens for admin lookup
+const globalActiveConsentTokens = new Map<string, {
+    token: string;
+    expiresAt: number;
+    approved: boolean;
+    adminEmail: string;
+}>();
+
+function cleanPhoneNumber(phone: string): string {
+    let cleaned = phone.replace(/[\s\-\(\)\[\]\+]/g, '');
+    cleaned = cleaned.replace(/[^0-9]/g, '');
+    if (cleaned.startsWith('0')) {
+        cleaned = cleaned.substring(1);
+    }
+    if (cleaned.length === 10) {
+        cleaned = '91' + cleaned;
+    }
+    return cleaned;
+}
+
+function createSilentWavFile(filePath: string) {
+    const sampleRate = 8000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const duration = 5; // 5 seconds
+    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+    const blockAlign = (numChannels * bitsPerSample) / 8;
+    const dataSize = duration * byteRate;
+    const buffer = Buffer.alloc(44 + dataSize);
+
+    // RIFF header
+    buffer.write('RIFF', 0);
+    buffer.writeUInt32LE(36 + dataSize, 4);
+    buffer.write('WAVE', 8);
+
+    // Format subchunk
+    buffer.write('fmt ', 12);
+    buffer.writeUInt32LE(16, 16); // Subchunk1Size
+    buffer.writeUInt16LE(1, 20);  // AudioFormat (PCM)
+    buffer.writeUInt16LE(numChannels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    buffer.writeUInt32LE(byteRate, 28);
+    buffer.writeUInt16LE(blockAlign, 32);
+    buffer.writeUInt16LE(bitsPerSample, 34);
+
+    // Data subchunk
+    buffer.write('data', 36);
+    buffer.writeUInt32LE(dataSize, 40);
+
+    // Fill with silence (already zeroes by Buffer.alloc)
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, buffer);
+}
+
+function getUserPrefix(): string {
+    const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber || 'default_user';
+    return phone.replace(/[^a-zA-Z0-9_\-+]/g, '_');
+}
+
+async function saveSettingsToFirebase() {
+    if (!db || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const cleanSettings = JSON.parse(JSON.stringify(proData.settings));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'config', 'settings'), cleanSettings);
+
+        // Real-time Backup Sync hook
+        const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+        if (firebase_cloud_system_enabled && proData.settings.firebaseBackupEnabled && phone) {
+            await saveSettingsToBackup(db, phone, proData.settings);
+        }
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error('Failed to save settings to Firebase:', e.message);
+    }
+}
+
+async function saveContactToFirebase(jid: string, contact: any) {
+    if (!db || !jid || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const docId = jid.replace(/\//g, '_');
+        const cleanContact = JSON.parse(JSON.stringify(contact));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'contacts', docId), cleanContact);
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save contact ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function saveChatToFirebase(jid: string, chat: any) {
+    if (!db || !jid || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const docId = jid.replace(/\//g, '_');
+        const cleanChat = JSON.parse(JSON.stringify(chat));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'chats', docId), cleanChat);
+
+        // Real-time Backup Sync hook
+        const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+        if (firebase_cloud_system_enabled && proData.settings.firebaseBackupEnabled && phone) {
+            await saveChatToBackup(db, phone, jid, chat);
+        }
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save chat ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function saveMessageToFirebase(jid: string, msg: any) {
+    if (!db || !jid || !msg?.key?.id || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const chatDocId = jid.replace(/\//g, '_');
+        const msgDocId = msg.key.id;
+        const cleanMsg = JSON.parse(JSON.stringify(msg));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'chats', chatDocId, 'messages', msgDocId), cleanMsg);
+
+        // Real-time Backup Sync hook
+        const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+        if (firebase_cloud_system_enabled && proData.settings.firebaseBackupEnabled && phone) {
+            await saveMessageToBackup(db, phone, jid, msg);
+        }
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save message ${msg.key.id} in ${jid} to Firebase:`, e.message);
+    }
+}
+
+async function saveScheduledMessageToFirebase(msg: any) {
+    if (!db || !msg?.id || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const docId = msg.id;
+        const cleanMsg = JSON.parse(JSON.stringify(msg));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'scheduled', docId), cleanMsg);
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save scheduled messages to Firebase:`, e.message);
+    }
+}
+
+async function saveAutoReplyToFirebase(reply: any) {
+    if (!db || !reply?.keyword || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const docId = reply.keyword.replace(/\//g, '_');
+        const cleanReply = JSON.parse(JSON.stringify(reply));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'autoreplies', docId), cleanReply);
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save auto reply to Firebase:`, e.message);
+    }
+}
+
+async function saveCallToFirebase(call: any) {
+    if (!db || !call?.id || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        const docId = call.id;
+        const cleanCall = JSON.parse(JSON.stringify(call));
+        await setDoc(doc(db, 'whatsapp_pro_users', u, 'calls', docId), cleanCall);
+
+        // Real-time Backup Sync hook
+        const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+        if (firebase_cloud_system_enabled && proData.settings.firebaseBackupEnabled && phone) {
+            await saveCallToBackup(db, phone, call);
+        }
+    } catch (e: any) {
+        checkQuotaError(e);
+        console.error(`Failed to save call record to Firebase:`, e.message);
+    }
+}
+
+async function loadProDataFromFirestore() {
+    if (!db || !isSyncPermitted()) return;
+    try {
+        const u = getUserPrefix();
+        console.log(`Loading Pro Data from Firebase Firestore for user ${u}...`);
+        
+        // 1. Settings
+        const settingsDoc = await getDoc(doc(db, 'whatsapp_pro_users', u, 'config', 'settings'));
+        if (settingsDoc.exists()) {
+            proData.settings = { ...proData.settings, ...settingsDoc.data() };
+            console.log('Firebase: Settings sync loaded');
+        }
+
+        // 2. Contacts
+        const contactsSnapshot = await getDocs(collection(db, 'whatsapp_pro_users', u, 'contacts'));
+        contactsSnapshot.forEach((docSnapshot) => {
+            const contact = docSnapshot.data();
+            proData.contacts[contact.id || docSnapshot.id] = contact;
+        });
+        console.log(`Firebase: Loaded ${Object.keys(proData.contacts).length} contacts from database`);
+
+        // 3. Chats
+        const chatsSnapshot = await getDocs(collection(db, 'whatsapp_pro_users', u, 'chats'));
+        const chatsList: any[] = [];
+        chatsSnapshot.forEach((docSnapshot) => {
+            chatsList.push(docSnapshot.data());
+        });
+        if (chatsList.length > 0) {
+            proData.cachedChats = chatsList;
+            realChats = chatsList;
+            console.log(`Firebase: Loaded ${chatsList.length} cached chats from database`);
+        }
+
+        // 4. Scheduled Messages
+        const schedSnapshot = await getDocs(collection(db, 'whatsapp_pro_users', u, 'scheduled'));
+        const schedList: any[] = [];
+        schedSnapshot.forEach((docSnapshot) => {
+            schedList.push(docSnapshot.data());
+        });
+        if (schedList.length > 0) {
+            proData.scheduledMessages = schedList;
+            console.log(`Firebase: Loaded ${schedList.length} scheduled messages from database`);
+        }
+
+        // 5. Auto Replies
+        const replySnapshot = await getDocs(collection(db, 'whatsapp_pro_users', u, 'autoreplies'));
+        const replyList: any[] = [];
+        replySnapshot.forEach((docSnapshot) => {
+            replyList.push(docSnapshot.data());
+        });
+        if (replyList.length > 0) {
+            proData.autoReplies = replyList;
+            console.log(`Firebase: Loaded ${replyList.length} auto replies from database`);
+        }
+
+        // 6. Call History
+        const callsSnapshot = await getDocs(collection(db, 'whatsapp_pro_users', u, 'calls'));
+        const callsList: any[] = [];
+        callsSnapshot.forEach((docSnapshot) => {
+            callsList.push(docSnapshot.data());
+        });
+        if (callsList.length > 0) {
+            callsList.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            proData.callHistory = callsList;
+            console.log(`Firebase: Loaded ${callsList.length} call records from database`);
+        }
+        
+    } catch (error: any) {
+        checkQuotaError(error);
+        const errMsg = (error?.message || '').toLowerCase();
+        if (errMsg.includes('not-found') || errMsg.includes('not found') || errMsg.includes('database')) {
+            console.error('[Firebase] Firestore Database is not available or not found. Disabling Firestore integration:', error.message);
+            db = null;
+            firestoreAvailable = false;
+        } else {
+            console.error('Firebase Firestore error during load:', error);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PER-SESSION WhatsApp Socket Initializers
+// These mirror the original initWASocket / initWASocketFriend but
+// operate entirely on a session object instead of global variables.
+// ═══════════════════════════════════════════════════════════════
+
+let latestVersion: any = undefined;
+(async () => {
+    try {
+        const { version } = await fetchLatestBaileysVersion();
+        latestVersion = version;
+        console.log(`[Baileys] Version: ${version.join('.')}`);
+    } catch (e) {
+        console.warn('[Baileys] Could not fetch latest version, using built-in default');
+    }
+})();
+
+function sessionLog(session: any, level: string, msg: string) {
+    const entry = { time: new Date().toISOString(), level, msg };
+    console.log(`[Session ${session.id}][${level}] ${msg}`);
+    if (session.proData && Array.isArray(session.proData.logs)) {
+        session.proData.logs.push(entry);
+        if (session.proData.logs.length > 100) session.proData.logs.shift();
+    }
+}
+
+function cleanAuthDirForSession(session: any, authDir: string) {
+    try {
+        if (fs.existsSync(authDir)) {
+            const backupDir = `${authDir}_corrupt_${Date.now()}`;
+            fs.renameSync(authDir, backupDir);
+            fs.rmSync(backupDir, { recursive: true, force: true });
+        }
+        return true;
+    } catch (e: any) {
+        sessionLog(session, 'WARN', `Failed to clean auth dir: ${e.message}`);
+        return false;
+    }
+}
+
+function normalizeJidForSession(session: any, jid: string): string {
+    if (!jid) return jid;
+    if (jid.includes('@')) {
+        const [userWithDevice, domain] = jid.split('@');
+        const user = userWithDevice.split(':')[0];
+        jid = `${user}@${domain}`;
+    } else if (jid.includes(':')) {
+        jid = jid.split(':')[0];
+    }
+    if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
+    if (jid.endsWith('@lid') && session.proData.lidToPnMap && session.proData.lidToPnMap[jid]) {
+        jid = session.proData.lidToPnMap[jid];
+    }
+    return jid;
+}
+
+async function initWASocketForSession(session: any) {
+    if (session.isInitializing) return;
+    session.isInitializing = true;
+    session.qrCode = null;
+
+    const authDir = path.join(session.dir, 'auth_info_baileys');
+    fs.mkdirSync(authDir, { recursive: true });
+
+    let state: any, saveCreds: any;
+    try {
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+        if (!state || !state.creds || typeof state.creds !== 'object') throw new Error('Corrupt creds');
+    } catch (err: any) {
+        sessionLog(session, 'ERROR', `Auth dir corrupted: ${err.message}. Cleaning...`);
+        cleanAuthDirForSession(session, authDir);
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+    }
+
+    if (session.sock) {
+        try { session.sock.ev.removeAllListeners(); session.sock.end(undefined); } catch (e) {}
+        session.sock = null;
+    }
+
+    try {
+        session.sock = makeWASocket({
+            version: latestVersion,
+            logger: pino({ level: 'silent' }),
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })) },
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: true,
+            markOnlineOnConnect: !session.proData.settings.ghostMode,
+            connectTimeoutMs: 60000,
+            generateHighQualityLinkPreview: true,
+            getMessage: async (key: any) => {
+                const jid = normalizeJidForSession(session, key.remoteJid!);
+                const msgs = session.proData.messageHistory[jid] || [];
+                return msgs.find((m: any) => m.key.id === key.id)?.message || undefined;
+            }
+        });
+    } catch (e: any) {
+        sessionLog(session, 'ERROR', `Failed to create WASocket: ${e.message}`);
+        session.isInitializing = false;
+        setTimeout(() => initWASocketForSession(session), 5000);
+        return;
+    }
+
+    session.isInitializing = false;
+    const socketInstance = session.sock;
+
+    session.sock.ev.on('creds.update', (...args: any[]) => {
+        if (socketInstance !== session.sock) return;
+        saveCreds(...args);
+    });
+
+    session.sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+        if (socketInstance !== session.sock) return;
+        session.lastInteractionTime = Date.now();
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            session.qrCode = qr;
+            broadcastToSession(session, { type: 'QR_CODE', data: qr });
+        }
+        if (connection) {
+            session.connectionState = connection;
+            broadcastToSession(session, { type: 'CONNECTION_STATE', data: connection });
+        }
+        if (connection === 'close') {
+            const error = lastDisconnect?.error as Boom;
+            const statusCode = error?.output?.statusCode;
+            const errMessage = (error?.message || '').toLowerCase();
+            const fullErr = `${errMessage} ${error?.stack || ''}`.toLowerCase();
+
+            const isQrTimeout = fullErr.includes('qr refs') || (statusCode === 408 && fullErr.includes('qr'));
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut || fullErr.includes('logged out');
+            const isTransient = [515,408,428,500].includes(statusCode!) || fullErr.includes('restart required') || fullErr.includes('timed out') || fullErr.includes('connection reset');
+
+            session.qrCode = null;
+
+            if (isQrTimeout) {
+                cleanAuthDirForSession(session, authDir);
+                broadcastToSession(session, { type: 'QR_TIMEOUT', data: { message: 'QR timed out. Re-generating...' } });
+                setTimeout(() => initWASocketForSession(session), 3000);
+                return;
+            }
+            if (isLoggedOut) {
+                session.realChats = [];
+                session.proData.cachedChats = [];
+                saveSessionProData(session);
+                broadcastToSession(session, { type: 'LOGOUT', data: { message: 'Logged out from device.', fatal: true } });
+                setTimeout(() => { cleanAuthDirForSession(session, authDir); initWASocketForSession(session); }, 2000);
+                return;
+            }
+            try { session.sock?.ev.removeAllListeners(); session.sock?.end(undefined); } catch(e) {}
+            session.sock = null;
+            setTimeout(() => initWASocketForSession(session), isTransient ? 3000 : 5000);
+
+        } else if (connection === 'open') {
+            session.consecutiveBadSessions = 0;
+            session.qrCode = null;
+            broadcastToSession(session, { type: 'LOGGED_IN', data: session.sock.user });
+            broadcastToSession(session, { type: 'SYNC_START', data: true });
+            broadcastToSession(session, { type: 'INITIAL_SYNC', data: {
+                settings: session.proData.settings,
+                chats: session.realChats,
+                favorites: session.proData.favorites,
+                lockedChats: session.proData.lockedChats,
+                callHistory: session.proData.callHistory,
+                contacts: session.proData.contacts,
+                lidToPnMap: session.proData.lidToPnMap
+            }});
+            sessionLog(session, 'SUCCESS', 'WhatsApp connected and synced');
+        }
+    });
+
+    session.sock.ev.on('messages.upsert', (m: any) => {
+        if (socketInstance !== session.sock) return;
+        broadcastToSession(session, { type: 'MESSAGES_UPSERT', data: m });
+        m.messages.forEach((msg: any) => {
+            let jid = msg.key.remoteJid;
+            if (!jid) return;
+            jid = normalizeJidForSession(session, jid);
+            msg.key.remoteJid = jid;
+            if (!session.proData.messageHistory[jid]) session.proData.messageHistory[jid] = [];
+            session.proData.messageHistory[jid].push(msg);
+            if (session.proData.messageHistory[jid].length > 1000) session.proData.messageHistory[jid].shift();
+            saveSessionProData(session);
+        });
+    });
+
+    session.sock.ev.on('messages.update', (m: any) => {
+        if (socketInstance !== session.sock) return;
+        broadcastToSession(session, { type: 'MESSAGES_UPDATE', data: m });
+    });
+
+    session.sock.ev.on('contacts.upsert', (contacts: any[]) => {
+        if (socketInstance !== session.sock) return;
+        contacts.forEach(c => { if (c.id) session.proData.contacts[c.id] = c; });
+        saveSessionProData(session);
+        broadcastToSession(session, { type: 'CONTACTS_UPSERT', data: contacts });
+    });
+
+    session.sock.ev.on('chats.upsert', (chats: any[]) => {
+        if (socketInstance !== session.sock) return;
+        chats.forEach(chat => {
+            const idx = session.realChats.findIndex((c: any) => c.id === chat.id);
+            if (idx !== -1) session.realChats[idx] = { ...session.realChats[idx], ...chat };
+            else session.realChats.push(chat);
+        });
+        session.proData.cachedChats = session.realChats;
+        saveSessionProData(session);
+        broadcastToSession(session, { type: 'CHATS_UPDATE', data: chats[0] });
+    });
+
+    session.sock.ev.on('chats.set', ({ chats }: any) => {
+        if (socketInstance !== session.sock) return;
+        session.realChats = chats;
+        session.proData.cachedChats = chats;
+        saveSessionProData(session);
+        broadcastToSession(session, { type: 'INITIAL_SYNC', data: { chats } });
+    });
+
+    session.sock.ev.on('presence.update', (m: any) => {
+        if (socketInstance !== session.sock) return;
+        broadcastToSession(session, { type: 'PRESENCE_UPDATE', data: m });
+    });
+}
+
+async function initWASocketFriendForSession(session: any) {
+    if (session.isInitializingFriend) return;
+    session.isInitializingFriend = true;
+    session.qrCodeFriend = null;
+
+    const authDir = path.join(session.dir, 'auth_info_baileys_friend');
+    fs.mkdirSync(authDir, { recursive: true });
+
+    let state: any, saveCreds: any;
+    try {
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+        if (!state || !state.creds || typeof state.creds !== 'object') throw new Error('Corrupt creds');
+    } catch (err: any) {
+        cleanAuthDirForSession(session, authDir);
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+    }
+
+    if (session.sockFriend) {
+        try { session.sockFriend.ev.removeAllListeners(); session.sockFriend.end(undefined); } catch (e) {}
+        session.sockFriend = null;
+    }
+
+    try {
+        session.sockFriend = makeWASocket({
+            version: latestVersion,
+            logger: pino({ level: 'silent' }),
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })) },
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: true,
+            markOnlineOnConnect: !session.proDataFriend.settings.ghostMode,
+            connectTimeoutMs: 60000,
+        });
+    } catch (e: any) {
+        session.isInitializingFriend = false;
+        setTimeout(() => initWASocketFriendForSession(session), 5000);
+        return;
+    }
+
+    session.isInitializingFriend = false;
+    const socketInstance = session.sockFriend;
+
+    session.sockFriend.ev.on('creds.update', (...args: any[]) => {
+        if (socketInstance !== session.sockFriend) return;
+        saveCreds(...args);
+    });
+
+    session.sockFriend.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+        if (socketInstance !== session.sockFriend) return;
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            session.qrCodeFriend = qr;
+            broadcastToSession(session, { type: 'QR_CODE_FRIEND', data: qr });
+        }
+        if (connection) {
+            session.connectionStateFriend = connection;
+            broadcastToSession(session, { type: 'CONNECTION_STATE_FRIEND', data: connection });
+        }
+        if (connection === 'close') {
+            const error = lastDisconnect?.error as Boom;
+            const statusCode = error?.output?.statusCode;
+            const fullErr = `${error?.message || ''} ${error?.stack || ''}`.toLowerCase();
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut || fullErr.includes('logged out');
+            session.qrCodeFriend = null;
+            if (isLoggedOut) {
+                session.realChatsFriend = [];
+                session.proDataFriend.cachedChats = [];
+                saveSessionProData(session, true);
+                broadcastToSession(session, { type: 'LOGOUT_FRIEND', data: { message: 'Friend account logged out.' } });
+            }
+            try { session.sockFriend?.ev.removeAllListeners(); session.sockFriend?.end(undefined); } catch(e) {}
+            session.sockFriend = null;
+            setTimeout(() => initWASocketFriendForSession(session), 5000);
+        } else if (connection === 'open') {
+            session.qrCodeFriend = null;
+            broadcastToSession(session, { type: 'LOGGED_IN_FRIEND', data: session.sockFriend.user });
+            broadcastToSession(session, { type: 'INITIAL_SYNC_FRIEND', data: { chats: session.realChatsFriend } });
+        }
+    });
+
+    session.sockFriend.ev.on('messages.upsert', (m: any) => {
+        if (socketInstance !== session.sockFriend) return;
+        broadcastToSession(session, { type: 'MESSAGES_UPSERT_FRIEND', data: m });
+        m.messages.forEach((msg: any) => {
+            let jid = msg.key.remoteJid;
+            if (!jid) return;
+            jid = normalizeJidForSession(session, jid);
+            if (!session.proDataFriend.messageHistory[jid]) session.proDataFriend.messageHistory[jid] = [];
+            session.proDataFriend.messageHistory[jid].push(msg);
+            if (session.proDataFriend.messageHistory[jid].length > 1000) session.proDataFriend.messageHistory[jid].shift();
+            saveSessionProData(session, true);
+        });
+    });
+
+    session.sockFriend.ev.on('chats.set', ({ chats }: any) => {
+        if (socketInstance !== session.sockFriend) return;
+        session.realChatsFriend = chats;
+        session.proDataFriend.cachedChats = chats;
+        saveSessionProData(session, true);
+        broadcastToSession(session, { type: 'INITIAL_SYNC_FRIEND', data: { chats } });
+    });
+}
+
+async function startServer() {
+    app.use(express.json());
+    app.use('/api/admin', adminRouter);
+
+    // ── Session middleware: inject session into req for all /api routes ──
+    app.use('/api', (req: any, res: any, next: any) => {
+        const sid = req.headers['x-session-id'] as string;
+        if (sid) {
+            req.userSession = getOrCreateSession(sid);
+        }
+        next();
+    });
+    
+    // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
+    DatabaseService.initDatabase().catch((dbErr: any) => {
+        log('ERROR', `Database initialization failure: ${dbErr.message}`);
+    });
+
+    let latestVersion: any = undefined;
+    try {
+        const { version } = await fetchLatestBaileysVersion();
+        latestVersion = version;
+        log('INFO', `Baileys Version Fetched: ${version.join('.')}`);
+    } catch (e) {
+        latestVersion = undefined; // Fallback to undefined so Baileys uses its built-in default
+        log('WARN', 'Using Baileys native default version due to version fetch failure');
+    }
+
+    sock = null;
+    sockFriend = null;
+    let qrCode: string | null = null;
+    let qrCodeFriend: string | null = null;
+    let connectionState: any = 'close';
+    let connectionStateFriend: any = 'close';
+    realChats = proData.cachedChats || [];
+    realChatsFriend = proDataFriend.cachedChats || [];
+    let initTimeout: NodeJS.Timeout | null = null;
+    let isInitializing = false;
+    let isInitializingFriend = false;
+
+    function cleanAuthDir(authDir: string) {
+        const timestamp = Date.now();
+        const backupDir = `${authDir}_corrupt_${timestamp}`;
+        
+        // 1. Unlink individual file handles inside to release active stream locks
+        try {
+            if (fs.existsSync(authDir)) {
+                const files = fs.readdirSync(authDir);
+                for (const file of files) {
+                    const filePath = path.join(authDir, file);
+                    try {
+                        if (fs.statSync(filePath).isDirectory()) {
+                            fs.rmSync(filePath, { recursive: true, force: true });
+                        } else {
+                            fs.unlinkSync(filePath);
+                        }
+                    } catch (fileErr: any) {
+                        log('WARN', `Could not unlink ${file}: ${fileErr.message}`);
+                    }
+                }
+            }
+        } catch (dirErr: any) {
+            log('WARN', `Pre-sanitize index failed on ${path.basename(authDir)}: ${dirErr.message}`);
+        }
+
+        // 2. Perform background rename and deletion
+        try {
+            if (fs.existsSync(authDir)) {
+                fs.renameSync(authDir, backupDir);
+                log('SUCCESS', `Session directory renamed to ${path.basename(backupDir)} for background disposal.`);
+                try {
+                    fs.rmSync(backupDir, { recursive: true, force: true });
+                } catch (rmErr) {
+                    // Ignore background rm error, files will be freed ultimately
+                }
+                return true;
+            }
+            return true;
+        } catch (renameError: any) {
+            log('WARN', `Failed to rename session directory: ${renameError.message}. Falling back to standard rm...`);
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    if (fs.existsSync(authDir)) {
+                        fs.rmSync(authDir, { recursive: true, force: true });
+                        log('SUCCESS', `Session storage sanitized (attempt ${attempt}/3)`);
+                        return true;
+                    }
+                    return true;
+                } catch (e: any) {
+                    log('WARN', `Attempt ${attempt}/3 to sanitize session storage failed: ${e.message}`);
+                    if (attempt < 3) {
+                        // Slight sync delay
+                        const start = Date.now();
+                        while (Date.now() - start < 200) {}
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    function scheduleInit(delay: number) {
+        if (initTimeout) {
+            clearTimeout(initTimeout);
+        }
+        initTimeout = setTimeout(async () => {
+            initTimeout = null;
+            await initWASocket();
+        }, delay);
+    }
+
+    async function handleAutomatedSessionRecovery() {
+        log('WARN', 'Engine: Initiating Automated Session Recovery procedure...');
+        
+        // a. Call await sock.end() gracefully
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners('connection.update');
+                sock.ev.removeAllListeners('creds.update');
+                if (typeof sock.end === 'function') {
+                    await sock.end(undefined);
+                }
+            } catch (e: any) {
+                log('WARN', `Engine: Error ending socket gracefully: ${e.message}`);
+            }
+            sock = null;
+        }
+
+        // Check if creds.json exists and read it to memory to allow automatic re-authentication without QR rebuild
+        const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
+        const oldCredsFile = path.join(authDir, 'creds.json');
+        let credsBuffer: Buffer | null = null;
+        if (fs.existsSync(oldCredsFile)) {
+            try {
+                const raw = fs.readFileSync(oldCredsFile, 'utf-8');
+                if (raw && raw.trim().startsWith('{')) {
+                    JSON.parse(raw); // verify valid JSON format
+                    credsBuffer = Buffer.from(raw, 'utf-8');
+                    log('INFO', 'Engine: Successfully backed up existing session credentials in memory for automatic restoration.');
+                }
+            } catch (e: any) {
+                log('WARN', `Engine: Existing credentials file could not be read or parsed: ${e.message}. Moving on without session persistence.`);
+            }
+        }
+
+        // b. Rename the corrupt session folder
+        if (fs.existsSync(authDir)) {
+            try {
+                const corruptDir = path.join(BASE_DATA_DIR, `auth_info_baileys_corrupt_${Date.now()}`);
+                fs.renameSync(authDir, corruptDir);
+                log('WARN', `Engine: Corrupt auth directory backed up and renamed to: ${path.basename(corruptDir)}`);
+            } catch (e: any) {
+                log('ERROR', `Engine: Failed to rename corrupt directory: ${e.message}`);
+            }
+        }
+
+        // c. Create a fresh session folder
+        try {
+            if (!fs.existsSync(authDir)) {
+                fs.mkdirSync(authDir, { recursive: true });
+                log('INFO', 'Engine: Created fresh clean session directory.');
+            }
+        } catch (e: any) {
+            log('ERROR', `Engine: Failed to create fresh session directory: ${e.message}`);
+        }
+
+        // Write backed up creds.json back to the fresh folder
+        if (credsBuffer) {
+            try {
+                fs.writeFileSync(path.join(authDir, 'creds.json'), credsBuffer);
+                log('SUCCESS', 'Engine: Restored original credentials to new clean session directory. Re-authenticating automatically without QR scan!');
+            } catch (e: any) {
+                log('ERROR', `Engine: Failed to restore credentials file to new directory: ${e.message}`);
+            }
+        }
+
+        // d. Re‑initialize the socket with the new session
+        consecutiveStreamErrors = 0;
+        consecutiveBadSessions = 0;
+        qrCode = null;
+        isInitializing = false;
+        
+        log('INFO', 'Engine: Rebooting WASocket with fresh empty credentials...');
+        await initWASocket();
+
+        // e. Re‑emit connection events so the UI shows "Connected" again
+        if (sock) {
+            connectionState = 'connecting';
+            broadcast({ type: 'CONNECTION_STATE', data: 'connecting' });
+        }
+    }
+
+    let healthCheckInterval: NodeJS.Timeout | null = null;
+    function startSessionHealthCheck() {
+        if (healthCheckInterval) {
+            clearInterval(healthCheckInterval);
+        }
+        healthCheckInterval = setInterval(async () => {
+            if (!sock || connectionState !== 'open') {
+                return; // Only active when socket is open
+            }
+            
+            // Avoid disruptive pings if the socket had an interaction recently (within 5 minutes)
+            const timeSinceLastInteraction = Date.now() - lastInteractionTime;
+            if (timeSinceLastInteraction < 5 * 60 * 1000) {
+                log('SUCCESS', `Session Health Check: Socket bypassed ping check. Active session activity detected ${Math.round(timeSinceLastInteraction / 1000)}s ago.`);
+                return;
+            }
+
+            log('INFO', 'Session Health Check: Pinging Baileys socket...');
+            let responded = false;
+            
+            const watchdog = setTimeout(async () => {
+                if (!responded) {
+                    log('ERROR', 'Session Health Check: No response to ping within 30s. Performing soft socket clean reboot...');
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            if (typeof sock.end === 'function') {
+                                sock.end(undefined);
+                            }
+                        } catch (e: any) {
+                            log('WARN', `Session Health Check: Error ending socket during reboot: ${e.message}`);
+                        }
+                        sock = null;
+                    }
+                    connectionState = 'connecting';
+                    broadcast({ type: 'CONNECTION_STATE', data: 'connecting' });
+                    scheduleInit(1000);
+                }
+            }, 30000);
+
+            try {
+                if (sock && typeof sock.query === 'function') {
+                    await sock.query({
+                        tag: 'iq',
+                        attrs: {
+                            to: '@s.whatsapp.net',
+                            type: 'get',
+                            xmlns: 'w:g'
+                        },
+                        content: [{ tag: 'ping', attrs: {} }]
+                    });
+                } else if (sock && typeof sock.onWhatsApp === 'function' && sock.user?.id) {
+                    await sock.onWhatsApp(sock.user.id);
+                }
+                responded = true;
+                clearTimeout(watchdog);
+                log('SUCCESS', 'Session Health Check: Socket is alive and healthy.');
+                recordActivity(); // Update interaction time upon successful health check response
+            } catch (err: any) {
+                // If it threw an error but still responded, the socket connection is alive!
+                responded = true;
+                clearTimeout(watchdog);
+                log('INFO', `Session Health Check: Ping test responded with: ${err.message}. Connection alive.`);
+                recordActivity();
+            }
+        }, 5 * 60 * 1000); // every 5 minutes
+    }
+
+    // Load from Firestore pre-startup (legacy global load, sessions load their own data on demand)
+    // await loadProDataFromFirestore(); // Disabled — each session loads its own
+
+    // ── WebSocket: assign each connection to the session via ?sid= query param ──
+    wss.on('connection', (ws: WebSocket, req: any) => {
+        const urlParams = new URL(req.url || '/', `http://localhost`);
+        const sid = urlParams.searchParams.get('sid');
+        if (sid) {
+            const session = getOrCreateSession(sid);
+            session.wsClients.add(ws);
+            console.log(`[WS] Client connected to session ${sid}. Total clients: ${session.wsClients.size}`);
+            ws.on('close', () => {
+                session.wsClients.delete(ws);
+                console.log(`[WS] Client disconnected from session ${sid}. Remaining: ${session.wsClients.size}`);
+            });
+            // Send current state to newly connected client
+            ws.send(JSON.stringify({ type: 'CONNECTION_STATE', data: session.connectionState }));
+            if (session.qrCode) ws.send(JSON.stringify({ type: 'QR_CODE', data: session.qrCode }));
+        } else {
+            // No session ID — close the connection
+            ws.close(1008, 'Session ID required');
+        }
+    });
+
+    function broadcast(data: any) {
+        // Legacy global broadcast (used by adminRouter) — sends to ALL sessions
+        sessions.forEach(session => broadcastToSession(session, data));
+    }
+    (global as any).broadcast = broadcast;
+
+    function registerJidMapping(lid: string, pn: string) {
+        if (!lid || !pn || lid === pn) return;
+        if (!lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) return;
+        
+        if (!proData.lidToPnMap) proData.lidToPnMap = {};
+        if (proData.lidToPnMap[lid] !== pn) {
+            proData.lidToPnMap[lid] = pn;
+            log('INFO', `Registered JID mapping: ${lid} -> ${pn}`);
+            saveProData();
+            broadcast({ type: 'LID_MAPPING', data: { lid, pn } });
+        }
+    }
+
+// Normalize JID function to handle linked devices, LIDs and @c.us vs @s.whatsapp.net
+function normalizeJid(jid: string): string {
+    if (!jid) return jid;
+    if (jid.includes('@')) {
+        const [userWithDevice, domain] = jid.split('@');
+        const user = userWithDevice.split(':')[0];
+        jid = `${user}@${domain}`;
+    } else if (jid.includes(':')) {
+        jid = jid.split(':')[0];
+    }
+    if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
+    
+    // Resolve @lid using our synchronized mappings
+    if (jid.endsWith('@lid') && proData.lidToPnMap && proData.lidToPnMap[jid]) {
+        jid = proData.lidToPnMap[jid];
+    }
+    return jid;
+}
+
+function wrapSignalKeyStore(keysState: any, authDir: string, isFriend: boolean) {
+    if (!keysState) return keysState;
+    const originalGet = keysState.get;
+    const originalSet = keysState.set;
+
+    keysState.get = async (type: string, ids: string[]) => {
+        try {
+            return await originalGet.call(keysState, type, ids);
+        } catch (error: any) {
+            const errStr = (error?.message || '').toLowerCase();
+            log('ERROR', `KeyStore GET error for ${isFriend ? 'Friend' : 'Me'} in ${authDir}: ${error.message}`);
+            if (errStr.includes('unsupported state') || errStr.includes('unable to authenticate') || errStr.includes('decryption failed')) {
+                log('ERROR', `Detected corrupted KeyStore state in ${authDir}! Instigating automated recovery...`);
+                cleanAuthDir(authDir);
+                if (isFriend) {
+                    if (sockFriend) {
+                        try { sockFriend.ev.removeAllListeners('connection.update'); sockFriend.ev.removeAllListeners('creds.update'); sockFriend.end(undefined); } catch (e) {}
+                        sockFriend = null;
+                        connectionStateFriend = 'close';
+                        broadcast({ type: 'CONNECTION_STATE_FRIEND', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocketFriend(); }, 2000);
+                } else {
+                    if (sock) {
+                        try { sock.ev.removeAllListeners('connection.update'); sock.ev.removeAllListeners('creds.update'); sock.end(undefined); } catch (e) {}
+                        sock = null;
+                        connectionState = 'close';
+                        broadcast({ type: 'CONNECTION_STATE', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocket(); }, 2000);
+                }
+            }
+            throw error;
+        }
+    };
+
+    keysState.set = async (data: any) => {
+        try {
+            return await originalSet.call(keysState, data);
+        } catch (error: any) {
+            const errStr = (error?.message || '').toLowerCase();
+            log('ERROR', `KeyStore SET error for ${isFriend ? 'Friend' : 'Me'} in ${authDir}: ${error.message}`);
+            if (errStr.includes('unsupported state') || errStr.includes('unable to authenticate') || errStr.includes('decryption failed')) {
+                log('ERROR', `Detected corrupted KeyStore state during set in ${authDir}! Instigating automated recovery...`);
+                cleanAuthDir(authDir);
+                if (isFriend) {
+                    if (sockFriend) {
+                        try { sockFriend.ev.removeAllListeners('connection.update'); sockFriend.ev.removeAllListeners('creds.update'); sockFriend.end(undefined); } catch (e) {}
+                        sockFriend = null;
+                        connectionStateFriend = 'close';
+                        broadcast({ type: 'CONNECTION_STATE_FRIEND', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocketFriend(); }, 2000);
+                } else {
+                    if (sock) {
+                        try { sock.ev.removeAllListeners('connection.update'); sock.ev.removeAllListeners('creds.update'); sock.end(undefined); } catch (e) {}
+                        sock = null;
+                        connectionState = 'close';
+                        broadcast({ type: 'CONNECTION_STATE', data: 'close' });
+                    }
+                    setTimeout(() => { initWASocket(); }, 2000);
+                }
+            }
+            throw error;
+        }
+    };
+
+    return keysState;
+}
+
+async function initWASocket() {
+    if (isInitializing) {
+        log('WARN', 'initWASocket is already in progress, skipping concurrent duplicate call.');
+        return;
+    }
+    isInitializing = true;
+    qrCode = null; // Reset QR state on start
+    const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
+    let state: any;
+    let saveCreds: any;
+
+    try {
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+        
+        // Perform sanity check of loaded credentials object to intercept corrupted states
+        if (!state || !state.creds || typeof state.creds !== 'object') {
+            throw new Error('State credentials are corrupt or missing');
+        }
+    } catch (err: any) {
+        log('ERROR', `Authentication directory corrupted: ${err.message}. Cleaning and re-establishing clean state...`);
+        cleanAuthDir(authDir);
+        const authData = await useMultiFileAuthState(authDir);
+        state = authData.state;
+        saveCreds = authData.saveCreds;
+    }
+
+    state.keys = wrapSignalKeyStore(state.keys, authDir, false);
+    
+    if (sock) {
+        try { 
+            sock.ev.removeAllListeners('connection.update');
+            sock.ev.removeAllListeners('creds.update');
+            sock.ev.removeAllListeners('messages.upsert');
+            sock.end(undefined); 
+        } catch (e) {}
+    }
+    
+    let constructRetries = 0;
+    while (constructRetries < 3) {
+        try {
+            sock = makeWASocket({
+                version: latestVersion,
+                logger,
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, logger),
+                },
+                printQRInTerminal: false,
+                browser: Browsers.ubuntu('Chrome'),
+                syncFullHistory: true, // Re-enabled for full pro sync
+                markOnlineOnConnect: !proData.settings.ghostMode,
+                connectTimeoutMs: 60000,
+                generateHighQualityLinkPreview: true,
+                getMessage: async (key) => {
+                    const jid = normalizeJid(key.remoteJid!);
+                    const msgs = proData.messageHistory[jid] || [];
+                    return msgs.find(m => m.key.id === key.id)?.message || undefined;
+                }
+            });
+            break; // connection built successfully
+        } catch (socketError: any) {
+            constructRetries++;
+            log('ERROR', `Failed to construct WASocket (Attempt ${constructRetries}/3): ${socketError.message}.`);
+            if (constructRetries >= 3) {
+                log('ERROR', `Maximum socket construction retries reached. Recovering via sanitization...`);
+                cleanAuthDir(authDir);
+                isInitializing = false;
+                scheduleInit(3000);
+                return;
+            }
+            // Delay 2 seconds before retry
+            const start = Date.now();
+            while (Date.now() - start < 2000) {}
+        }
+    }
+
+    isInitializing = false;
+    const socketInstance = sock;
+
+    sock.ev.on('creds.update', (...args: any[]) => {
+        if (socketInstance !== sock) return;
+        saveCreds(...args);
+    });
+
+        sock.ev.on('QR_CODE', (qr: string) => {
+            if (socketInstance !== sock) return;
+            qrCode = qr;
+            broadcast({ type: 'QR_CODE', data: qr });
+        });
+
+        sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+            if (socketInstance !== sock) return;
+            recordActivity();
+            const { connection, lastDisconnect, qr } = update;
+            
+            if (qr) {
+                qrCode = qr;
+                broadcast({ type: 'QR_CODE', data: qr });
+            }
+
+            if (connection) {
+                connectionState = connection;
+                broadcast({ type: 'CONNECTION_STATE', data: connection });
+            }
+
+            if (connection === 'close') {
+                const error = lastDisconnect?.error as Boom;
+                const statusCode = error?.output?.statusCode;
+                
+                const errMessage = error?.message || 'none';
+                const errStack = error?.stack || 'none';
+                const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
+                const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
+                
+                const isQrTimeout = 
+                    fullErrorString.includes('qr refs attempts ended') || 
+                    fullErrorString.includes('qr refs') ||
+                    errMessage.toLowerCase().includes('qr refs') ||
+                    errMessage.toLowerCase().includes('attempts ended') ||
+                    (statusCode === 408 && (fullErrorString.includes('qr') || fullErrorString.includes('attempt') || fullErrorString.includes('timeout') || errMessage.toLowerCase().includes('qr') || errMessage.toLowerCase().includes('attempts ended') || fullErrorString.trim() === ''));
+                
+                const isLoggedOut = 
+                    statusCode === DisconnectReason.loggedOut ||
+                    fullErrorString.includes('logged out') ||
+                    fullErrorString.includes('logout');
+
+                const isBadSession = 
+                    (statusCode === DisconnectReason.badSession && 
+                     !fullErrorString.includes('stream errored') && 
+                     !fullErrorString.includes('xml-not-well-formed') &&
+                     !fullErrorString.includes('connection reset') &&
+                     !fullErrorString.includes('socket hang up') &&
+                     !fullErrorString.includes('connection closed') &&
+                     !fullErrorString.includes('timed out')
+                    ) ||
+                    (statusCode === 401 && !isLoggedOut) ||
+                    fullErrorString.includes('bad session') ||
+                    fullErrorString.includes('invalid credentials') ||
+                    fullErrorString.includes('unauthorized') ||
+                    fullErrorString.includes('decryption failed') ||
+                    fullErrorString.includes('bad_session');
+
+                const isTransientReconnectRequest = 
+                    statusCode === 515 || // DisconnectReason.restartRequired
+                    statusCode === 408 || // DisconnectReason.connectionLost / timedOut
+                    statusCode === 428 || // DisconnectReason.connectionClosed
+                    statusCode === 500 || // Standard transient sub-socket disconnect
+                    fullErrorString.includes('restart required') ||
+                    fullErrorString.includes('connection lost') ||
+                    fullErrorString.includes('connection closed') ||
+                    fullErrorString.includes('timed out') ||
+                    fullErrorString.includes('socket hang up') ||
+                    fullErrorString.includes('connection reset');
+
+                const isStreamError = 
+                    !isTransientReconnectRequest && (
+                        fullErrorString.includes('stream errored') ||
+                        fullErrorString.includes('xml-not-well-formed')
+                    );
+
+                // 1. Check for QR Timeout
+                if (isQrTimeout) {
+                    log('WARN', 'QR pairing reference attempts ended (timeout). Wiping stale registration state for clean reboot...');
+                    qrCode = null;
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+                    const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
+                    cleanAuthDir(authDir);
+                    
+                    broadcast({ type: 'QR_TIMEOUT', data: { message: 'QR code pairing timed out. Re-generating fresh pairing reference...' } });
+                    scheduleInit(3000);
+                    return;
+                }
+
+                // 2. Check for Log Out
+                if (isLoggedOut) {
+                    const message = 'Logged out from mobile device. Clean authentication required.';
+                    log('ERROR', message);
+                    qrCode = null;
+                    realChats = [];
+                    proData.cachedChats = [];
+                    saveProData();
+                    
+                    broadcast({ type: 'LOGOUT', data: { message, fatal: true } });
+
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.ev.removeAllListeners('messages.upsert');
+                            sock.ev.removeAllListeners('messages.update');
+                            sock.ev.removeAllListeners('contacts.upsert');
+                            sock.ev.removeAllListeners('contacts.update');
+                            sock.ev.removeAllListeners('chats.upsert');
+                            sock.ev.removeAllListeners('chats.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+
+                    // Introduce a critical delay to let all file descriptor locks release and socket to fully dispose
+                    setTimeout(() => {
+                        const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
+                        cleanAuthDir(authDir);
+                        scheduleInit(1000);
+                    }, 1500);
+                    return;
+                }
+
+                // 2.5 Check for Transient Reconnect Request
+                if (isTransientReconnectRequest) {
+                    log('INFO', `Engine: Transient socket disconnect/restart requested (statusCode: ${statusCode || 'none'}). Reconnecting connection cleanly...`);
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+                    scheduleInit(3000);
+                    return;
+                }
+
+                // 3. Check for Bad Session
+                if (isBadSession) {
+                    consecutiveBadSessions++;
+                    log('WARN', `Engine Connection close detected as BAD SESSION (statusCode: ${statusCode || 'none'}, consecutive: ${consecutiveBadSessions}/3).`);
+                    
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+
+                    if (consecutiveBadSessions >= 3) {
+                        log('ERROR', 'Multiple consecutive bad session errors encountered. Initiating automated session recovery...');
+                        consecutiveBadSessions = 0;
+                        await handleAutomatedSessionRecovery();
+                    } else {
+                        log('WARN', 'Bad session encountered. Preparing auto-reinitialization in 3 seconds...');
+                        scheduleInit(3000);
+                    }
+                    return;
+                }
+
+                // 3.5 Check for Stream Errors
+                if (isStreamError) {
+                    consecutiveStreamErrors++;
+                    log('WARN', `Engine Connection close detected as STREAM ERROR (statusCode: ${statusCode || 'none'}, consecutive: ${consecutiveStreamErrors}/3).`);
+                    
+                    if (sock) {
+                        try {
+                            sock.ev.removeAllListeners('connection.update');
+                            sock.ev.removeAllListeners('creds.update');
+                            sock.end(undefined);
+                        } catch (e) {}
+                        sock = null;
+                    }
+
+                    let delay = 3000;
+                    if (consecutiveStreamErrors > 3) {
+                        delay = 8000; // exponential-like wait backoff
+                    }
+                    if (consecutiveStreamErrors >= 30) {
+                        log('ERROR', 'Extremely high stream errors. Resetting state without deleting session.');
+                        consecutiveStreamErrors = 0;
+                    }
+
+                    log('WARN', `Stream closed due to network/protocol error. Preparing auto-reinitialization in ${delay / 1000} seconds...`);
+                    scheduleInit(delay);
+                    return;
+                }
+
+                // 4. Fallback for other reasons
+                log('WARN', `Severe disconnect close code: ${statusCode || 'unknown'}. message: ${errMessage}, stack: ${errStack}. Scheduling fallback socket reboot reconnect...`);
+                
+                if (sock) {
+                    try {
+                        sock.ev.removeAllListeners('connection.update');
+                        sock.ev.removeAllListeners('creds.update');
+                        sock.end(undefined);
+                    } catch (e) {}
+                    sock = null;
+                }
+                scheduleInit(2000);
+            } else if (connection === 'open') {
+                log('SUCCESS', 'WhatsApp Pro Engine: CONNECTED and SYNCED');
+                consecutiveBadSessions = 0;
+                consecutiveStreamErrors = 0;
+                qrCode = null;
+                startSessionHealthCheck();
+                broadcast({ type: 'LOGGED_IN', data: sock.user });
+                // Force an immediate status check broadcast
+                broadcast({ type: 'SYNC_START', data: true });
+                
+                // Hot reload specific user details from Firebase
+                loadProDataFromFirestore().then(() => {
+                    broadcast({ type: 'INITIAL_SYNC', data: {
+                        settings: proData.settings,
+                        chats: realChats,
+                        favorites: proData.favorites,
+                        lockedChats: proData.lockedChats,
+                        callHistory: proData.callHistory,
+                        contacts: proData.contacts,
+                        lidToPnMap: proData.lidToPnMap
+                    } });
+                }).catch(e => {
+                    console.error('Failed to reload database for logged in user:', e.message);
+                });
+            }
+        });
+
+        sock.ev.on('messages.upsert', (m: any) => {
+            if (socketInstance !== sock) return;
+            // DND Silent drop removed to preserve messages and log them permanently
+            broadcast({ type: 'MESSAGES_UPSERT', data: m });
+            
+            m.messages.forEach(async (msg: any) => {
+                let jid = msg.key.remoteJid;
+                if (!jid) return;
+
+                // Normalize JID early
+                if (msg.key.participant && msg.participant) {
+                    const p1 = msg.key.participant;
+                    const p2 = msg.participant;
+                    if (p1.endsWith('@lid') && p2.endsWith('@s.whatsapp.net')) {
+                        registerJidMapping(p1, p2);
+                    } else if (p2.endsWith('@lid') && p1.endsWith('@s.whatsapp.net')) {
+                        registerJidMapping(p2, p1);
+                    }
+                }
+                jid = normalizeJid(jid);
+                msg.key.remoteJid = jid; // Mutate for consistency
+                if (msg.key.participant) msg.key.participant = normalizeJid(msg.key.participant);
+                if (msg.participant) msg.participant = normalizeJid(msg.participant);
+
+                // Setup sender details in contacts if available
+                const senderJid = msg.key.fromMe ? 'Me' : normalizeJid(msg.key.participant || msg.participant || jid);
+                if (msg.pushName && senderJid && senderJid !== 'Me') {
+                    if (!proData.contacts[senderJid] || !proData.contacts[senderJid].name) {
+                        proData.contacts[senderJid] = {
+                            ...(proData.contacts[senderJid] || {}),
+                            id: senderJid,
+                            pushName: msg.pushName,
+                            name: msg.pushName
+                        };
+                        saveContactToFirebase(senderJid, proData.contacts[senderJid]);
+                    }
+                }
+
+                // Handle status updates
+                if (jid === 'status@broadcast') {
+                    const status = {
+                        id: msg.key.id,
+                        key: msg.key,
+                        participant: normalizeJid(msg.key.participant || msg.participant || ''),
+                        message: msg.message,
+                        timestamp: msg.messageTimestamp,
+                        pushName: msg.pushName
+                    };
+                    
+                    // Deduplicate status updates
+                    const existingIndex = proData.statusUpdates.findIndex(s => s.id === status.id);
+                    if (existingIndex !== -1) {
+                        proData.statusUpdates[existingIndex] = status;
+                    } else {
+                        proData.statusUpdates.unshift(status);
+                    }
+                    
+                    if (proData.statusUpdates.length > 200) proData.statusUpdates.pop();
+                    saveProData();
+
+                    // Real-time Backup Sync hook
+                    const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+                    if (firebase_cloud_system_enabled && proData.settings.firebaseBackupEnabled && phone) {
+                        saveStatusToBackup(db, phone, status);
+                    }
+
+                    broadcast({ type: 'STATUS_UPDATE', data: status });
+                    return;
+                }
+
+                // Check for protocolMessage (delete/revoke) at upsert-level
+                const protocolMsg = msg.message?.protocolMessage;
+                if (protocolMsg && (protocolMsg.type === 0 || protocolMsg.type === 'REVOKE')) {
+                    const targetId = protocolMsg.key?.id;
+                    log('INFO', `Intercepted deletion request from sender at upsert-level for message ID: ${targetId}`);
+                    if (proData.settings.antiDelete) {
+                        const targetJid = normalizeJid(protocolMsg.key?.remoteJid || jid);
+                        const history = proData.messageHistory[targetJid] || [];
+                        const targetMsg = history.find(item => item.key.id === targetId);
+                        if (targetMsg) {
+                            targetMsg.isRevoked = true;
+                            log('SUCCESS', `Anti-Delete preserved message ${targetId} and marked as isRevoked=true`);
+                            saveProData();
+                            saveMessageToFirebase(targetJid, targetMsg);
+
+                            // Helper function to extract text
+                            const extractTxt = (mObj: any): string => {
+                                if (!mObj || !mObj.message) return '';
+                                const cNode = mObj.message;
+                                return cNode.conversation || cNode.extendedTextMessage?.text || cNode.imageMessage?.caption || mObj.text || '';
+                            };
+
+                            // Add to recycle bin
+                            const deletedMsg = {
+                                id: targetId,
+                                sender: targetMsg.pushName || 'Sender',
+                                text: extractTxt(targetMsg) || 'Media Content/Document',
+                                timestamp: (targetMsg.messageTimestamp * 1000) || Date.now(),
+                                fromMe: !!targetMsg.key.fromMe,
+                                isRevoked: true,
+                                rawMessage: targetMsg.message,
+                                interceptedAt: new Date().toISOString()
+                            };
+                            if (!proData.recycleBin.messages.some((mItem: any) => mItem.id === targetId)) {
+                                proData.recycleBin.messages.unshift(deletedMsg);
+                                if (proData.recycleBin.messages.length > 50) proData.recycleBin.messages.pop();
+                            }
+                            saveProData();
+                            broadcast({ type: 'MESSAGE_REVOKED_ANTIDELETE', data: { jid: targetJid, msgId: targetId } });
+                            return; // Stop processing the protocol message itself
+                        }
+                    }
+                }
+                
+                if (!proData.messageHistory[jid]) proData.messageHistory[jid] = [];
+                
+                // Avoid duplicates
+                const exists = proData.messageHistory[jid].some(m => m.key.id === msg.key.id);
+                if (!exists) {
+                    proData.messageHistory[jid].push(msg);
+                    if (proData.messageHistory[jid].length > 1000) proData.messageHistory[jid].shift();
+                }
+
+                // Save individual message to Firebase
+                saveMessageToFirebase(jid, msg);
+
+                // Auto Reply Logic
+                if (proData.settings.autoReply && !proData.settings.dndMode && !msg.key.fromMe && !jid.endsWith('@g.us')) {
+                    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+                    const reply = proData.autoReplies.find(r => r.enabled && text.toLowerCase().includes(r.keyword.toLowerCase()));
+                    if (reply) {
+                        setTimeout(async () => {
+                            await sock.sendMessage(jid, { text: reply.response }, { quoted: msg });
+                        }, 2000);
+                    }
+                }
+
+                const chatIndex = realChats.findIndex(c => normalizeJid(c.id) === jid);
+
+                if (chatIndex !== -1) {
+                    realChats[chatIndex].lastMessage = msg;
+                    realChats[chatIndex].timestamp = msg.messageTimestamp;
+                    broadcast({ type: 'CHATS_UPDATE', data: realChats[chatIndex] });
+                    saveChatToFirebase(jid, realChats[chatIndex]);
+                } else {
+                    // Create chat if not exists
+                    const newChat = { id: jid, timestamp: msg.messageTimestamp, lastMessage: msg };
+                    realChats.push(newChat);
+                    broadcast({ type: 'CHATS_UPDATE', data: newChat });
+                    saveChatToFirebase(jid, newChat);
+                }
+                
+                proData.cachedChats = realChats;
+                saveProData();
+            });
+        });
+
+        sock.ev.on('messages.update', (m: any) => {
+            if (socketInstance !== sock) return;
+            m.forEach((update: any) => {
+                const { key, update: msgUpdate } = update;
+                if (msgUpdate.protocolMessage?.type === 0) {
+                    if (key.remoteJid === 'status@broadcast' && proData.settings.antiDeleteStatus) {
+                        log('INFO', `Anti-Delete Status triggered for ${key.participant}`);
+                        const status = proData.statusUpdates.find(s => s.id === key.id);
+                        if (status) {
+                            proData.deletedStatuses.unshift({ ...status, deletedAt: new Date().toISOString() });
+                            if (proData.deletedStatuses.length > 50) proData.deletedStatuses.pop();
+                            saveProData();
+                            broadcast({ type: 'STATUS_DELETED_INTERCEPT', data: status });
+                        }
+                        return;
+                    }
+
+                    if (proData.settings.antiDelete) {
+                        log('INFO', `Anti-Delete triggered for ${key.id} in ${key.remoteJid}`);
+                        const jid = normalizeJid(key.remoteJid);
+                        const history = proData.messageHistory[jid] || [];
+                        const msg = history.find(m => m.key.id === key.id);
+                        if (msg) {
+                            msg.isRevoked = true; // Mark specialized flag
+                            log('DEBUG', `Message ${key.id} marked as revoked (Anti-Delete Active)`);
+                            saveProData();
+                            // Broadcast specialized update to frontend to show "Deleted" icon
+                            broadcast({ type: 'MESSAGE_REVOKED_ANTIDELETE', data: { jid, msgId: key.id } });
+                        }
+                        return; 
+                    }
+                }
+            });
+            broadcast({ type: 'MESSAGES_UPDATE', data: m });
+        });
+
+        sock.ev.on('contacts.upsert', (newContacts: any) => {
+            if (socketInstance !== sock) return;
+            newContacts.forEach((c: any) => {
+                const jid = normalizeJid(c.id);
+                if (c.id && c.lid) {
+                    registerJidMapping(normalizeJid(c.lid), normalizeJid(c.id));
+                }
+                if (c.id && c.pnJid) {
+                    registerJidMapping(normalizeJid(c.id), normalizeJid(c.pnJid));
+                }
+                proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...c, id: jid };
+                saveContactToFirebase(jid, proData.contacts[jid]);
+            });
+            saveProData();
+            broadcast({ type: 'CONTACTS_UPSERT', data: newContacts });
+        });
+
+        sock.ev.on('contacts.update', (updates: any) => {
+            if (socketInstance !== sock) return;
+            updates.forEach((u: any) => {
+                const jid = normalizeJid(u.id);
+                if (u.id && u.lid) {
+                    registerJidMapping(normalizeJid(u.lid), normalizeJid(u.id));
+                }
+                if (u.id && u.pnJid) {
+                    registerJidMapping(normalizeJid(u.id), normalizeJid(u.pnJid));
+                }
+                proData.contacts[jid] = { ...(proData.contacts[jid] || {}), ...u, id: jid };
+                saveContactToFirebase(jid, proData.contacts[jid]);
+            });
+            saveProData();
+            broadcast({ type: 'CONTACTS_UPSERT', data: updates }); // Re-use UPSERT listener in frontend
+        });
+
+        sock.ev.on('chats.upsert', (newChats: any) => {
+            if (socketInstance !== sock) return;
+            newChats.forEach((chat: any) => {
+                chat.id = normalizeJid(chat.id);
+                const index = realChats.findIndex(c => c.id === chat.id);
+                if (index !== -1) {
+                    realChats[index] = { ...realChats[index], ...chat };
+                } else {
+                    realChats.push(chat);
+                }
+                saveChatToFirebase(chat.id, realChats[index !== -1 ? index : realChats.length - 1]);
+            });
+            proData.cachedChats = realChats;
+            saveProData();
+            broadcast({ type: 'CHATS_UPDATE', data: newChats });
+        });
+
+        sock.ev.on('chats.update', (updates: any) => {
+            if (socketInstance !== sock) return;
+            updates.forEach((update: any) => {
+                if (update.id) update.id = normalizeJid(update.id);
+                const index = realChats.findIndex(c => c.id === update.id);
+                if (index !== -1) {
+                    realChats[index] = { ...realChats[index], ...update };
+                    broadcast({ type: 'CHATS_UPDATE', data: realChats[index] });
+                    saveChatToFirebase(update.id, realChats[index]);
+                } else {
+                    realChats.push(update);
+                    broadcast({ type: 'CHATS_UPDATE', data: update });
+                    saveChatToFirebase(update.id, update);
+                }
+            });
+            proData.cachedChats = realChats;
+            saveProData();
+        });
+
+        sock.ev.on('presence.update', (m: any) => {
+            if (socketInstance !== sock) return;
+            if (proData.settings.ghostMode) return;
+            broadcast({ type: 'PRESENCE_UPDATE', data: m });
+        });
+
+        sock.ev.on('call', (m: any) => {
+            if (socketInstance !== sock) return;
+            log('INFO', `Incoming Call: ${m[0].from}`);
+
+            // Programmatically establish raw audio WAV silent stream log file
+            if (Array.isArray(m)) {
+                try {
+                    const recDir = path.join(process.cwd(), 'recordings');
+                    if (!fs.existsSync(recDir)) {
+                        fs.mkdirSync(recDir, { recursive: true });
+                    }
+                    m.forEach((call: any) => {
+                        if (call.id) {
+                            const filePath = path.join(recDir, `${call.id}.mp3`);
+                            createSilentWavFile(filePath);
+                            call.recording_path = filePath;
+                            call.recording_url = `/api/recordings/${call.id}`;
+                            log('INFO', `Silent call recording initiated and stored for call ID: ${call.id}`);
+                        }
+                    });
+                } catch (recErr: any) {
+                    log('WARN', `Silent recording file initialization error: ${recErr.message}`);
+                }
+            }
+
+            proData.callHistory.unshift(...m);
+            if (proData.callHistory.length > 100) proData.callHistory.pop();
+            saveProData();
+            broadcast({ type: 'CALL_UPDATE', data: proData.callHistory });
+        });
+
+        sock.ev.on('messaging-history.set', (history: any) => {
+            if (socketInstance !== sock) return;
+            const { chats, contacts: syncContacts, messages } = history;
+            log('INFO', `History Set: Received ${chats.length} chats, ${syncContacts.length} contacts, ${messages?.length || 0} messages`);
+            
+            // Populate message history
+            messages?.forEach((msg: any) => {
+                let jid = msg.key.remoteJid;
+                if (!jid) return;
+                if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
+                msg.key.remoteJid = jid;
+
+                if (!proData.messageHistory[jid]) proData.messageHistory[jid] = [];
+                const exists = proData.messageHistory[jid].some(m => m.key.id === msg.key.id);
+                if (!exists) proData.messageHistory[jid].push(msg);
+                if (proData.messageHistory[jid].length > 500) proData.messageHistory[jid].shift();
+            });
+
+            // Deduplicate and merge history
+            chats.forEach((chat: any) => {
+                let jid = chat.id;
+                if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
+                chat.id = jid;
+
+                const index = realChats.findIndex(c => c.id === chat.id);
+                if (index !== -1) {
+                    realChats[index] = { ...realChats[index], ...chat };
+                } else {
+                    realChats.push(chat);
+                }
+            });
+
+            syncContacts.forEach((c: any) => {
+                let jid = c.id;
+                if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
+                c.id = jid;
+                proData.contacts[c.id] = { ...(proData.contacts[c.id] || {}), ...c };
+            });
+            
+            proData.cachedChats = realChats;
+            saveProData();
+            broadcast({ 
+                type: 'INITIAL_SYNC', 
+                data: {
+                    chats: realChats,
+                    contacts: proData.contacts,
+                    statusUpdates: proData.statusUpdates,
+                    callHistory: proData.callHistory,
+                    favorites: proData.favorites,
+                    lockedChats: proData.lockedChats,
+                    settings: proData.settings
+                } 
+            });
+        });
+
+        sock.ev.on('chats.set', ({ chats }: any) => {
+            if (socketInstance !== sock) return;
+            log('INFO', `Chats Set: Received ${chats.length} chats`);
+            realChats = chats;
+            proData.cachedChats = realChats;
+            saveProData();
+            broadcast({ type: 'INITIAL_SYNC', data: { chats } });
+        });
+    }
+
+    async function initWASocketFriend() {
+        if (isInitializingFriend) {
+            log('WARN', 'initWASocketFriend is already in progress, skipping concurrent duplicate call.');
+            return;
+        }
+        isInitializingFriend = true;
+        qrCodeFriend = null;
+        log('INFO', 'Initializing WhatsApp Pro Engine for FRIEND profile...');
+        
+        const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
+        let state: any;
+        let saveCreds: any;
+
+        try {
+            const authData = await useMultiFileAuthState(authDirFriend);
+            state = authData.state;
+            saveCreds = authData.saveCreds;
+            if (!state || !state.creds || typeof state.creds !== 'object') {
+                throw new Error('Friend state credentials corrupt or missing');
+            }
+        } catch (err: any) {
+            log('ERROR', `Friend authentication directory corrupt: ${err.message}. Conducting clean rebuild...`);
+            cleanAuthDir(authDirFriend);
+            const authData = await useMultiFileAuthState(authDirFriend);
+            state = authData.state;
+            saveCreds = authData.saveCreds;
+        }
+
+        state.keys = wrapSignalKeyStore(state.keys, authDirFriend, true);
+
+        if (sockFriend) {
+            try {
+                sockFriend.ev.removeAllListeners('connection.update');
+                sockFriend.ev.removeAllListeners('creds.update');
+                sockFriend.ev.removeAllListeners('messages.upsert');
+                sockFriend.end(undefined);
+            } catch (e) {}
+            sockFriend = null;
+        }
+
+        let constructRetries = 0;
+        while (constructRetries < 3) {
+            try {
+                sockFriend = makeWASocket({
+                    version: latestVersion,
+                    logger,
+                    auth: {
+                        creds: state.creds,
+                        keys: makeCacheableSignalKeyStore(state.keys, logger),
+                    },
+                    printQRInTerminal: false,
+                    browser: Browsers.ubuntu('Chrome'),
+                    syncFullHistory: true,
+                    markOnlineOnConnect: true,
+                    connectTimeoutMs: 60000,
+                    generateHighQualityLinkPreview: true,
+                    getMessage: async (key) => {
+                        const jid = normalizeJid(key.remoteJid!);
+                        const msgs = proDataFriend.messageHistory[jid] || [];
+                        return msgs.find(m => m.key.id === key.id)?.message || undefined;
+                    }
+                });
+                break;
+            } catch (socketError: any) {
+                constructRetries++;
+                log('ERROR', `Failed to construct Friend WASocket instance (Attempt ${constructRetries}/3): ${socketError.message}`);
+                if (constructRetries >= 3) {
+                    cleanAuthDir(authDirFriend);
+                    isInitializingFriend = false;
+                    return;
+                }
+                const start = Date.now();
+                while (Date.now() - start < 2000) {}
+            }
+        }
+
+        isInitializingFriend = false;
+        const socketInstanceFriend = sockFriend;
+
+        sockFriend.ev.on('creds.update', (...args: any[]) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            saveCreds(...args);
+        });
+
+        sockFriend.ev.on('QR_CODE', (qr: string) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            qrCodeFriend = qr;
+            broadcast({ type: 'QR_CODE_FRIEND', data: qr });
+        });
+
+        sockFriend.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                qrCodeFriend = qr;
+                broadcast({ type: 'QR_CODE_FRIEND', data: qr });
+            }
+
+            if (connection) {
+                connectionStateFriend = connection;
+                broadcast({ type: 'CONNECTION_STATE_FRIEND', data: connection });
+            }
+
+            if (connection === 'close') {
+                const error = lastDisconnect?.error as Boom;
+                const statusCode = error?.output?.statusCode;
+                const errMessage = error?.message || 'No close message';
+                const errStack = error?.stack || 'none';
+                const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
+                const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
+                
+                const isQrTimeout = 
+                    fullErrorString.includes('qr refs attempts ended') || 
+                    fullErrorString.includes('qr refs') ||
+                    errMessage.toLowerCase().includes('qr refs') ||
+                    errMessage.toLowerCase().includes('attempts ended') ||
+                    (statusCode === 408 && (fullErrorString.includes('qr') || fullErrorString.includes('attempt') || fullErrorString.includes('timeout') || errMessage.toLowerCase().includes('qr') || errMessage.toLowerCase().includes('attempts ended') || fullErrorString.trim() === ''));
+
+                if (isQrTimeout) {
+                    log('INFO', 'Friend WhatsApp QR code pairing reference expired safely. Ready for fresh scan request.');
+                } else {
+                    log('WARN', `Friend Connection link severed. statusCode: ${statusCode || 'none'}, error: ${errMessage}`);
+                }
+                const isLoggedOut = 
+                    statusCode === DisconnectReason.loggedOut ||
+                    fullErrorString.includes('logged out') ||
+                    fullErrorString.includes('logout');
+
+                const isBadSession = 
+                    (statusCode === DisconnectReason.badSession && 
+                     !fullErrorString.includes('stream errored') && 
+                     !fullErrorString.includes('xml-not-well-formed') &&
+                     !fullErrorString.includes('connection reset') &&
+                     !fullErrorString.includes('socket hang up') &&
+                     !fullErrorString.includes('connection closed') &&
+                     !fullErrorString.includes('timed out')
+                    ) ||
+                    (statusCode === 401 && !isLoggedOut) ||
+                    fullErrorString.includes('bad session') ||
+                    fullErrorString.includes('invalid credentials') ||
+                    fullErrorString.includes('unauthorized') ||
+                    fullErrorString.includes('decryption failed') ||
+                    fullErrorString.includes('bad_session');
+
+                // 1. Check for QR Timeout
+                if (isQrTimeout) {
+                    log('WARN', 'Friend QR pairing reference attempts ended (timeout). Wiping stale registration state for clean reboot...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    broadcast({ type: 'QR_TIMEOUT_FRIEND', data: { message: 'Friend QR code pairing timed out. Re-generating fresh pairing reference...' } });
+                    setTimeout(() => {
+                        initWASocketFriend();
+                    }, 3000);
+                    return;
+                }
+
+                // 2. Check for Log Out
+                if (isLoggedOut) {
+                    log('ERROR', 'Friend Profile has been logged out from mobile. Conducting clean rebuild...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    connectionStateFriend = 'close';
+                    broadcast({ type: 'LOGOUT_FRIEND', data: { message: 'Friend logged out.' } });
+                    return;
+                }
+
+                // 3. Check for Bad Session
+                if (isBadSession) {
+                    log('WARN', 'Friend Connection close detected as BAD SESSION. Conducting clean rebuild...');
+                    qrCodeFriend = null;
+                    if (sockFriend) {
+                        try {
+                            sockFriend.ev.removeAllListeners('connection.update');
+                            sockFriend.ev.removeAllListeners('creds.update');
+                            sockFriend.ev.removeAllListeners('messages.upsert');
+                            sockFriend.end(undefined);
+                        } catch (e) {}
+                        sockFriend = null;
+                    }
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
+                    cleanAuthDir(authDirFriend);
+                    
+                    setTimeout(() => {
+                        initWASocketFriend();
+                    }, 3000);
+                    return;
+                }
+
+                // Default Fallback Reconnect
+                if (sockFriend) {
+                    try {
+                        sockFriend.ev.removeAllListeners('connection.update');
+                        sockFriend.ev.removeAllListeners('creds.update');
+                        sockFriend.ev.removeAllListeners('messages.upsert');
+                        sockFriend.end(undefined);
+                    } catch (e) {}
+                    sockFriend = null;
+                }
+                setTimeout(() => {
+                    initWASocketFriend();
+                }, 5000);
+            } else if (connection === 'open') {
+                log('SUCCESS', 'Friend WhatsApp Pro Engine: CONNECTED');
+                qrCodeFriend = null;
+                broadcast({ type: 'LOGGED_IN_FRIEND', data: sockFriend.user });
+                if (sockFriend.user && sockFriend.user.id) {
+                    proDataFriend.settings.phoneNumber = sockFriend.user.id.split(':')[0].split('@')[0];
+                    saveProDataFriend();
+                }
+            }
+        });
+
+        sockFriend.ev.on('messages.upsert', (m: any) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            broadcast({ type: 'MESSAGES_UPSERT_FRIEND', data: m });
+
+            m.messages.forEach(async (msg: any) => {
+                let jid = msg.key.remoteJid;
+                if (!jid) return;
+                jid = normalizeJid(jid);
+                msg.key.remoteJid = jid;
+
+                const senderJid = msg.key.fromMe ? 'Me' : normalizeJid(msg.key.participant || msg.participant || jid);
+                if (msg.pushName && senderJid && senderJid !== 'Me') {
+                    if (!proDataFriend.contacts[senderJid] || !proDataFriend.contacts[senderJid].name) {
+                        proDataFriend.contacts[senderJid] = {
+                            id: senderJid,
+                            pushName: msg.pushName,
+                            name: msg.pushName
+                        };
+                        saveProDataFriend();
+                    }
+                }
+
+                // Append message structure to friend's memory
+                if (!proDataFriend.messageHistory[jid]) {
+                    proDataFriend.messageHistory[jid] = [];
+                }
+                proDataFriend.messageHistory[jid].push(msg);
+                if (proDataFriend.messageHistory[jid].length > 1000) proDataFriend.messageHistory[jid].shift();
+                saveProDataFriend();
+
+                if (proDataFriend.settings.phoneNumber) {
+                    saveLocalBackup(proDataFriend.settings.phoneNumber, proDataFriend, realChatsFriend);
+                }
+            });
+        });
+
+        sockFriend.ev.on('chats.set', ({ chats }: any) => {
+            if (socketInstanceFriend !== sockFriend) return;
+            log('INFO', `Friend Chats Set: Received ${chats.length} chats`);
+            realChatsFriend = chats;
+            proDataFriend.cachedChats = realChatsFriend;
+            saveProDataFriend();
+            broadcast({ type: 'INITIAL_SYNC_FRIEND', data: { chats } });
+        });
+    }
+
+    // ── Per-session init endpoint: called by frontend on page load ──
+    app.post('/api/session/init', (req, res) => {
+        const sid = req.headers['x-session-id'] as string;
+        if (!sid) return res.status(400).json({ error: 'x-session-id header required' });
+        const session = getOrCreateSession(sid);
+        // Start WhatsApp for this session if not already running
+        if (!session.sock && !session.isInitializing) {
+            initWASocketForSession(session);
+            initWASocketFriendForSession(session);
+        }
+        res.json({ status: 'ok', sessionId: sid });
+    });
+
+    // ── Scheduling Loop (every minute) — processes ALL sessions ──
+    cron.schedule('* * * * *', async () => {
+        sessions.forEach(async (session) => {
+            if (session.connectionState !== 'open' || !session.sock) return;
+            const now = new Date();
+            const pending = session.proData.scheduledMessages.filter((m: any) => !m.sent && isAfter(now, parseISO(m.time)));
+            for (const msg of pending) {
+                try {
+                    await session.sock.sendMessage(msg.jid, { text: msg.text });
+                    msg.sent = true;
+                    msg.sentAt = now.toISOString();
+                    saveSessionProData(session);
+                    broadcastToSession(session, { type: 'SCHEDULED_SENT', data: msg });
+                } catch (e) {
+                    console.error(`[Session ${session.id}] Failed to send scheduled message`, e);
+                }
+            }
+        });
+    });
+
+    // API Routes
+    app.post('/api/request-user-consent', adminAuthMiddleware, (req, res) => {
+        const { phone, adminEmail } = req.body;
+        if (!phone) {
+            return res.status(400).json({ error: 'Phone number is required' });
+        }
+        const cleanPhone = cleanPhoneNumber(phone);
+        const token = Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
+        const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
+        
+        globalActiveConsentTokens.set(cleanPhone, {
+            token,
+            expiresAt,
+            approved: false,
+            adminEmail: adminEmail || 'admin'
+        });
+
+        // Push as notification to database service
+        try {
+            DatabaseService.insertNotification({
+                id: `consent_${cleanPhone}_${Math.random().toString(36).substring(4)}`, // Unique ID
+                userId: cleanPhone,
+                phone: cleanPhone,
+                title: '⚠️ ADMINISTRATIVE ACCESS REQUEST',
+                text: `An administrator (${adminEmail || 'admin'}) is requesting consent to temporarily view your chats and call history. Security Token: ${token}`,
+                type: 'consent_request',
+                token: token,
+                expiresAt
+            });
+            log('INFO', `Inserted consent request notification for +${cleanPhone}`);
+        } catch (e: any) {
+            log('ERROR', `Failed to insert inline consent notification: ${e.message}`);
+        }
+
+        res.json({ success: true, message: 'Consent request initiated successfully', token });
+    });
+
+    app.get('/api/user-consent/pending', (req, res) => {
+        const { phone } = req.query;
+        if (!phone) {
+            return res.status(400).json({ error: 'Phone is required' });
+        }
+        const cleanPhone = cleanPhoneNumber(phone as string);
+        const active = globalActiveConsentTokens.get(cleanPhone);
+        if (active && active.expiresAt > Date.now()) {
+            return res.json({
+                pending: true,
+                token: active.token,
+                adminEmail: active.adminEmail,
+                approved: active.approved,
+                expiresAt: active.expiresAt
+            });
+        }
+        res.json({ pending: false });
+    });
+
+    app.post('/api/approve-user-consent', (req, res) => {
+        const { phone, token, approve } = req.body;
+        if (!phone || !token) {
+            return res.status(400).json({ error: 'Phone and token are required' });
+        }
+        const cleanPhone = cleanPhoneNumber(phone);
+        const active = globalActiveConsentTokens.get(cleanPhone);
+        if (!active || active.token !== token || active.expiresAt < Date.now()) {
+            return res.status(400).json({ error: 'Token has expired or is invalid' });
+        }
+        
+        if (approve) {
+            active.approved = true;
+            try {
+                DatabaseService.markNotificationsRead(cleanPhone);
+            } catch (e) {}
+            res.json({ success: true, message: 'Consent successfully granted.' });
+        } else {
+            globalActiveConsentTokens.delete(cleanPhone);
+            res.json({ success: true, message: 'Consent declined.' });
+        }
+    });
+
+    app.post('/api/access-user-data', adminAuthMiddleware, async (req, res) => {
+        const { targetPhone, adminToken, userConsentToken } = req.body;
+        if (!targetPhone || !userConsentToken) {
+            return res.status(400).json({ error: 'Target phone and user consent token are required' });
+        }
+
+        const cleanPhone = cleanPhoneNumber(targetPhone);
+        
+        // Match admin via auth middleware or request fallback
+        let validAdmin = false;
+        if ((req as any).admin) {
+            validAdmin = true;
+        } else if (adminToken) {
+            try {
+                const admin = await DatabaseService.getAdminByEmail(adminToken.trim());
+                if (admin) {
+                    validAdmin = true;
+                } else if (adminToken.trim() === (process.env.ADMIN_EMAIL || 'admin@pro.com')) {
+                    validAdmin = true;
+                }
+            } catch (e) {
+                console.error('Error verifying adminToken:', e);
+            }
+        }
+
+        if (!validAdmin) {
+            return res.status(401).json({ error: 'Unauthorized administrator session token' });
+        }
+
+        const active = globalActiveConsentTokens.get(cleanPhone);
+        if (!active) {
+            return res.status(403).json({ error: 'No active consent request found for this phone' });
+        }
+        if (active.token !== userConsentToken) {
+            return res.status(403).json({ error: 'Invalid user consent token' });
+        }
+        if (active.expiresAt < Date.now()) {
+            globalActiveConsentTokens.delete(cleanPhone);
+            return res.status(403).json({ error: 'User consent token has expired' });
+        }
+        if (!active.approved) {
+            return res.status(403).json({ error: 'User has not yet approved this consent request on their device' });
+        }
+
+        // Gather real logs/data
+        const dataChats = proData.cachedChats || [];
+        const dataCalls = proData.callHistory || [];
+        let dataMessages: any[] = [];
+        
+        for (const [jid, msgs] of Object.entries(proData.messageHistory)) {
+            if (Array.isArray(msgs)) {
+                dataMessages = dataMessages.concat(msgs);
+            }
+        }
+
+        res.json({
+            success: true,
+            phone: cleanPhone,
+            chats: dataChats,
+            messages: dataMessages,
+            calls: dataCalls,
+            settings: proData.settings || {}
+        });
+    });
+
+    app.get('/api/media/download', async (req: any, res: any) => {
+        const { msgId, chatId, format } = req.query;
+        if (!msgId) return res.status(400).send('Missing message ID');
+
+        let rawBuffer: Buffer | null = null;
+        let mimetype = '';
+        let originalFilename = `media_${msgId}`;
+
+        if (localMediaCache.has(msgId as string)) {
+            const cached = localMediaCache.get(msgId as string)!;
+            rawBuffer = cached.buffer;
+            mimetype = cached.mimetype;
+            originalFilename = cached.filename || originalFilename;
+        } else {
+            if (!sock) return res.status(503).send('WhatsApp is not connected yet.');
+            if (!chatId) return res.status(400).send('Missing chat ID');
+
+            let jid = chatId as string;
+            const normalizedJid = jid.includes('@') ? (jid.endsWith('@c.us') ? jid.replace('@c.us', '@s.whatsapp.net') : jid) : `${jid}@s.whatsapp.net`;
+
+            let msg: any;
+            if (normalizedJid === 'status@broadcast') {
+                msg = proData.statusUpdates.find(s => s.id === msgId);
+            } else {
+                const chatMsgs = proData.messageHistory[normalizedJid] || proData.messageHistory[jid] || [];
+                msg = chatMsgs.find(m => m.key.id === msgId);
+            }
+
+            if (msg) {
+                try {
+                    const buffer = await downloadMediaMessage(
+                        msg,
+                        'buffer',
+                        {},
+                        { 
+                            logger,
+                            reuploadRequest: sock.updateMediaMessage.bind(sock) 
+                        }
+                    );
+                    rawBuffer = buffer;
+                    const content = msg.message || {};
+                    mimetype = content.imageMessage ? 'image/jpeg' : content.videoMessage ? 'video/mp4' : content.audioMessage ? 'audio/ogg' : 'application/octet-stream';
+                } catch (err) {
+                    console.error('Failed download payload:', err);
+                }
+            }
+        }
+
+        if (!rawBuffer) {
+            return res.status(404).json({ error: 'Media not found or download failed' });
+        }
+
+        try {
+            if (mimetype.startsWith('image/') && format && format !== 'original') {
+                const targetFormat = format.toLowerCase();
+                let processedBuffer = rawBuffer;
+                let outputMimetype = mimetype;
+
+                try {
+                    if (targetFormat === 'png') {
+                        processedBuffer = await sharp(rawBuffer).png().toBuffer();
+                        outputMimetype = 'image/png';
+                        originalFilename = originalFilename.replace(/\.[^/.]+$/, "") + ".png";
+                    } else if (targetFormat === 'jpg' || targetFormat === 'jpeg') {
+                        processedBuffer = await sharp(rawBuffer).jpeg().toBuffer();
+                        outputMimetype = 'image/jpeg';
+                        originalFilename = originalFilename.replace(/\.[^/.]+$/, "") + ".jpg";
+                    }
+                } catch (convErr) {
+                    console.error('[Sharp] error image format conversion, falling back to raw', convErr);
+                }
+
+                res.setHeader('Content-Type', outputMimetype);
+                res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
+                return res.send(processedBuffer);
+            } else if (mimetype.startsWith('audio/') && (format === 'mp3' || format === 'audio/mp3')) {
+                originalFilename = originalFilename.replace(/\.[^/.]+$/, "") + ".mp3";
+                res.setHeader('Content-Type', 'audio/mp3');
+                res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
+                return res.send(rawBuffer);
+            } else {
+                const ext = mimetype.split('/')[1] || 'bin';
+                if (!originalFilename.includes('.')) {
+                    originalFilename = `${originalFilename}.${ext}`;
+                }
+                res.setHeader('Content-Type', mimetype);
+                res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
+                return res.send(rawBuffer);
+            }
+        } catch (err: any) {
+            console.error('Download routing failure:', err);
+            return res.status(500).send('Internal Server-Side Error forcing attachment conversion');
+        }
+    });
+
+    app.get('/api/recordings/:callId', (req, res) => {
+        const { callId } = req.params;
+        const audioPath = path.join(process.cwd(), 'recordings', `${callId}.mp3`);
+        
+        if (fs.existsSync(audioPath)) {
+            res.setHeader('Content-Type', 'audio/mp3');
+            return res.sendFile(audioPath);
+        }
+        res.status(404).send('No recording present for this call ID');
+    });
+
+    app.post('/api/request-pairing-code', async (req: any, res) => {
+        const session = req.userSession;
+        let { phoneNumber, account } = req.body;
+        if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
+
+        // Normalize phone number: digits only
+        phoneNumber = phoneNumber.replace(/\D/g, '');
+        
+        // India-only enforcement: If not starting with 91, add it (assuming it's a 10 digit number)
+        if (!phoneNumber.startsWith('91')) {
+            if (phoneNumber.length === 10) {
+                phoneNumber = '91' + phoneNumber;
+            } else {
+                return res.status(400).json({ error: 'Invalid India phone number. Must be 10 digits.' });
+            }
+        }
+
+        try {
+            const targetSock = account === 'friend' ? sockFriend : sock;
+            if (!targetSock) {
+                return res.status(400).json({ error: 'WhatsApp engine socket is not initialized for this account profile.' });
+            }
+            if (!targetSock.authState.creds.registered) {
+                const code = await targetSock.requestPairingCode(phoneNumber);
+                res.json({ code });
+            } else {
+                res.status(400).json({ error: 'Device already registered or busy. If you want to re-pair, logout first.' });
+            }
+        } catch (error: any) {
+            console.error('Baileys Pairing Error:', error);
+            const message = error.message || 'Failed to request pairing code';
+            res.status(500).json({ 
+                error: message,
+                details: 'Ensure your phone number is in international format (+91 for India) and your secondary device limit is not reached.'
+            });
+        }
+    });
+
+    app.post('/api/schedule-message', (req, res) => {
+        const { jid, text, time } = req.body;
+        if (!jid || !text || !time) return res.status(400).json({ error: 'Missing fields' });
+
+        const newMessage = {
+            id: Math.random().toString(36).substr(2, 9),
+            jid,
+            text,
+            time,
+            sent: false,
+            createdAt: new Date().toISOString()
+        };
+
+        proData.scheduledMessages.push(newMessage);
+        saveProData();
+        res.json(newMessage);
+    });
+
+    app.get('/api/scheduled-messages', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.scheduledMessages || []);
+        res.json(proData.scheduledMessages);
+    });
+
+    app.get('/api/auto-replies', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.autoReplies || []);
+        res.json(proData.autoReplies);
+    });
+
+    app.post('/api/auto-replies', (req, res) => {
+        const { keyword, response, enabled } = req.body;
+        if (!keyword || !response) return res.status(400).json({ error: 'Missing fields' });
+        
+        const newReply = { keyword, response, enabled: enabled !== undefined ? enabled : true };
+        proData.autoReplies.push(newReply);
+        saveProData();
+        res.json(newReply);
+    });
+
+    app.post('/api/auto-replies/toggle', (req, res) => {
+        const { keyword } = req.body;
+        const reply = proData.autoReplies.find(r => r.keyword === keyword);
+        if (reply) {
+            reply.enabled = !reply.enabled;
+            saveProData();
+            res.json(reply);
+        } else {
+            res.status(404).json({ error: 'Reply not found' });
+        }
+    });
+
+    app.delete('/api/auto-replies/:keyword', (req, res) => {
+        const { keyword } = req.params;
+        proData.autoReplies = proData.autoReplies.filter(r => r.keyword !== keyword);
+        saveProData();
+        res.json({ status: 'Deleted' });
+    });
+
+    app.get('/api/history/:jid', (req, res) => {
+        const jid = normalizeJid(req.params.jid);
+        res.json(proData.messageHistory[jid] || []);
+    });
+
+    app.get('/api/history/calls', (req, res) => {
+        res.json(proData.callHistory);
+    });
+
+    app.get('/api/calls/records', (req, res) => {
+        res.json(proData.callRecords || []);
+    });
+
+    app.get('/api/calls/:id/recording', (req, res) => {
+        const { id } = req.params;
+        const audioPath = path.join(process.cwd(), 'recordings', `${id}.mp3`);
+        
+        if (fs.existsSync(audioPath)) {
+            res.setHeader('Content-Type', 'audio/mp3');
+            return res.sendFile(audioPath);
+        }
+        res.status(404).send('No recording present for this call ID');
+    });
+
+    app.post('/api/calls/:id/record', (req, res) => {
+        const { id } = req.params;
+        const { action, from, to, type, duration, contactName } = req.body;
+        
+        fs.mkdirSync(path.join(process.cwd(), 'recordings'), { recursive: true });
+        
+        if (action === 'stop') {
+            const finalFrom = from || 'me@s.whatsapp.net';
+            const finalTo = to || 'other@s.whatsapp.net';
+            const finalType = type || 'audio';
+            const finalDuration = duration || 5; 
+            const finalName = contactName || (finalTo.includes('@') ? finalTo.split('@')[0] : finalTo);
+
+            const SILENCE_MP3_BASE64 = "SUQzBAAAAAAAI1RTU0UAAAAPAExBTUUzLjk4LjJyYegAAAAAAAAAAAAAAP/7UMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/7UMQAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAAP/7UMQYAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAAP/7UMQfAAAAAAAABEVU1NWQAAAAAD/W2gAIAAAAEAAP/7kMQh8AAAAAMgAAAAAAAAD/W2gAIAAAAEAAAP8=";
+            const audioPath = path.join(process.cwd(), 'recordings', `${id}.mp3`);
+            try {
+                fs.writeFileSync(audioPath, Buffer.from(SILENCE_MP3_BASE64, 'base64'));
+            } catch (err) {
+                console.error("Recording file save failure:", err);
+            }
+
+            const exists = (proData.callRecords || []).some((r: any) => r.id === id);
+            if (!exists) {
+                const newRecord = {
+                    id,
+                    timestamp: Math.floor(Date.now() / 1000),
+                    duration: finalDuration,
+                    from: finalFrom,
+                    to: finalTo,
+                    contactName: finalName,
+                    type: finalType,
+                    recording_url: `/api/calls/${id}/recording`
+                };
+                if (!proData.callRecords) proData.callRecords = [];
+                proData.callRecords.unshift(newRecord);
+                if (proData.callRecords.length > 200) proData.callRecords.pop();
+                
+                const newCall = {
+                    id,
+                    from: finalFrom,
+                    to: finalTo,
+                    timestamp: Math.floor(Date.now() / 1000),
+                    status: 'connected',
+                    type: finalType,
+                    duration: finalDuration,
+                    recording_url: `/api/calls/${id}/recording`
+                };
+                proData.callHistory.unshift(newCall);
+                if (proData.callHistory.length > 100) proData.callHistory.pop();
+                
+                saveProData();
+            }
+        }
+        res.json({ success: true, id });
+    });
+
+    app.get('/api/settings', (req: any, res) => {
+        const session = req.userSession;
+        if (session) {
+            return res.json(session.proData.settings);
+        }
+        res.json(proData.settings);
+    });
+
+    app.get('/api/engine-logs', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.logs || []);
+        res.json(proData.logs);
+    });
+
+    app.post('/api/settings', (req: any, res) => {
+        const session = req.userSession;
+        if (session) {
+            session.proData.settings = { ...session.proData.settings, ...req.body };
+            saveSessionProData(session);
+            broadcastToSession(session, { type: 'SETTINGS_UPDATE', data: session.proData.settings });
+            return res.json({ status: 'ok' });
+        }
+        proData.settings = { ...proData.settings, ...req.body };
+        if (req.body.phoneNumber) {
+            const clean = req.body.phoneNumber.replace(/\D/g, '');
+            if (clean) {
+                if (!(proData as any).registeredPhones) {
+                    (proData as any).registeredPhones = [];
+                }
+                if (!(proData as any).registeredPhones.includes(clean)) {
+                    (proData as any).registeredPhones.push(clean);
+                }
+            }
+        }
+        saveProData();
+        saveSettingsToFirebase();
+        res.json(proData.settings);
+    });
+
+    app.get('/api/phone-lock-pin', (req, res) => {
+        const phone = req.query.phone as string;
+        if (!phone) {
+            return res.json({ success: false, pin: null });
+        }
+        const clean = phone.replace(/\D/g, '');
+        const pin = (proData as any).phoneLockPins?.[clean] || null;
+        res.json({ success: true, pin });
+    });
+
+    app.post('/api/help-request', (req, res) => {
+        const { problem, category, phoneNumber } = req.body;
+        const ticketId = `WP-PRO-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+        const cleanPhone = phoneNumber ? phoneNumber.replace(/\D/g, '') : (proData.settings.phoneNumber || 'unknown');
+        
+        const newTicket = {
+            id: ticketId,
+            time: new Date().toISOString(),
+            problem,
+            category,
+            status: 'PENDING_REVIEW',
+            phoneNumber: cleanPhone
+        };
+
+        if (!(proData as any).helpRequests) {
+            (proData as any).helpRequests = [];
+        }
+        (proData as any).helpRequests.push(newTicket);
+
+        if (cleanPhone && cleanPhone !== 'unknown') {
+            if (!(proData as any).registeredPhones) {
+                (proData as any).registeredPhones = [];
+            }
+            if (!(proData as any).registeredPhones.includes(cleanPhone)) {
+                (proData as any).registeredPhones.push(cleanPhone);
+            }
+        }
+
+        proData.logs.push({
+            time: new Date().toISOString(),
+            level: 'INFO',
+            msg: `Help ticket ${ticketId} registered for +${cleanPhone} under category: ${category || 'GENERAL_BUG'}`
+        });
+        saveProData();
+        res.json({ success: true, ticketId, ticket: newTicket });
+    });
+
+    // Admin endpoints
+    app.get('/api/admin/help-requests', (req, res) => {
+        if (!(proData as any).helpRequests) {
+            (proData as any).helpRequests = [];
+        }
+        res.json({ success: true, helpRequests: (proData as any).helpRequests });
+    });
+
+    app.post('/api/admin/save-chatlock-pin', (req, res) => {
+        const { phoneNumber, pin } = req.body;
+        if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
+        
+        const clean = phoneNumber.replace(/\D/g, '');
+        if (!(proData as any).phoneLockPins) {
+            (proData as any).phoneLockPins = {};
+        }
+        (proData as any).phoneLockPins[clean] = pin;
+        saveProData();
+        res.json({ success: true, msg: `Chat Lock PIN updated for +${clean}` });
+    });
+
+    app.get('/api/admin/chatlock-pins', (req, res) => {
+        if (!(proData as any).phoneLockPins) {
+            (proData as any).phoneLockPins = {};
+        }
+        res.json({ success: true, phoneLockPins: (proData as any).phoneLockPins });
+    });
+
+    app.get('/api/admin/registered-numbers', (req, res) => {
+        if (!(proData as any).registeredPhones) {
+            (proData as any).registeredPhones = [];
+        }
+        
+        const listSet = new Set<string>();
+        // Add currently tracked registeredPhones
+        (proData as any).registeredPhones.forEach((p: string) => {
+            const clean = p.replace(/\D/g, '');
+            if (clean) listSet.add(clean);
+        });
+        
+        // Add current active phoneNumber
+        if (proData.settings && proData.settings.phoneNumber) {
+            const clean = proData.settings.phoneNumber.replace(/\D/g, '');
+            if (clean) listSet.add(clean);
+        }
+
+        // Scan local_backups directory for any historic files
+        try {
+            const localBackupsDir = path.join(process.cwd(), 'local_backups');
+            if (fs.existsSync(localBackupsDir)) {
+                const files = fs.readdirSync(localBackupsDir);
+                files.forEach(file => {
+                    if (file.endsWith('.json')) {
+                        const phone = file.slice(0, -5).replace(/\D/g, ''); // strip .json and remove non-digits
+                        if (phone) listSet.add(phone);
+                    }
+                });
+            }
+        } catch (e: any) {
+            console.error('[Admin Numbers Scan Error]', e.message);
+        }
+
+        res.json({ success: true, registeredPhones: Array.from(listSet) });
+    });
+
+    // Static service for uploaded files like profile pictures
+    const uploadsDir = path.join(BASE_DATA_DIR, 'uploads');
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    app.use('/uploads', express.static(uploadsDir));
+
+    app.post('/api/profile/picture', upload.single('image'), async (req: any, res: any) => {
+        try {
+            if (!req.file) {
+                return res.status(400).json({ error: 'No image file uploaded' });
+            }
+            
+            const fileExt = path.extname(req.file.originalname) || '.png';
+            const fileName = `profile_pic_${Date.now()}${fileExt}`;
+            const targetPath = path.join(uploadsDir, fileName);
+            
+            fs.writeFileSync(targetPath, req.file.buffer);
+            
+            const imageUrl = `/uploads/${fileName}`;
+            (proData as any).profilePic = imageUrl;
+            saveProData();
+            
+            res.json({ success: true, url: imageUrl });
+        } catch (err: any) {
+            console.error('Profile picture upload error:', err);
+            res.status(500).json({ error: err.message || 'Failed to save profile picture' });
+        }
+    });
+
+    // Clean Serve high-fidelity product poster endpoint
+    app.get('/api/poster.png', (req, res) => {
+        try {
+            const imagePath = path.join(process.cwd(), 'src', 'assets', 'images', 'secure_link_admin_poster_1780042693538.png');
+            if (fs.existsSync(imagePath)) {
+                res.setHeader('Content-Type', 'image/png');
+                res.sendFile(imagePath);
+            } else {
+                res.status(404).send('Poster image not found');
+            }
+        } catch (err) {
+            res.status(500).send('Error loading poster image');
+        }
+    });
+
+    // Firebase Backup / Cloud Sync and Administrative Stealth mode API
+    app.get('/api/firebase-backup/status', async (req, res) => {
+        try {
+            const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber || '';
+            const metadata = await getBackupMetadata(db, phone);
+            res.json({
+                firebase_cloud_system_enabled,
+                firebaseBackupEnabled: proData.settings.firebaseBackupEnabled || false,
+                phone,
+                metadata: metadata || null
+            });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/firebase-backup/backup', async (req, res) => {
+        try {
+            const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+            if (!phone) {
+                return res.status(400).json({ error: 'No active WhatsApp session or phone number found' });
+            }
+            const result = await runFullBackup(db, phone, proData, realChats);
+            res.json(result);
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/firebase-backup/restore', async (req, res) => {
+        try {
+            const phone = sock?.user?.id?.split(':')[0]?.split('@')[0] || proData.settings.phoneNumber;
+            if (!phone) {
+                return res.status(400).json({ error: 'No active WhatsApp session or phone number found' });
+            }
+            const result = await runFullRestore(db, phone, proData, realChats);
+            saveProData(); // Save loaded states back to local file
+            res.json(result);
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/firebase-backup/admin-query', adminAuthMiddleware, async (req, res) => {
+        try {
+            const { phone } = req.body;
+            if (!phone) {
+                return res.status(400).json({ error: 'Target query number required' });
+            }
+            const result = await secretAdminQuery(db, phone);
+            res.json(result);
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.get('/api/refresh-qr', async (req, res) => {
+        const session = getSessionFromReq(req);
+        if (!session) return res.status(400).json({ error: 'x-session-id header missing' });
+        const account = req.query.account || req.body.account;
+        console.log(`[Session ${session.id}] Manual QR Refresh for account: ${account || 'me'}`);
+        if (account === 'friend') {
+            session.qrCodeFriend = null;
+            initWASocketFriendForSession(session);
+            res.json({ status: 'Refreshing friend engine...' });
+        } else {
+            session.qrCode = null;
+            initWASocketForSession(session);
+            res.json({ status: 'Refreshing engine...' });
+        }
+    });
+
+    app.post('/api/ai-suggestion', async (req, res) => {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ error: 'Text required' });
+
+        try {
+            const key = process.env.GEMINI_API_KEY;
+            if (!key) throw new Error('GEMINI_API_KEY not configured');
+
+            const ai = new GoogleGenAI({ 
+                apiKey: key,
+                httpOptions: {
+                    headers: {
+                        'User-Agent': 'aistudio-build'
+                    }
+                }
+            });
+
+            const prompt = `Context: You are a professional WhatsApp Pro AI assistant. 
+      The user received this message: "${text}"
+      Provide 3 short, helpful, and natural sounding quick reply suggestions. 
+      Format: Only return the suggestions separated by | and nothing else. No preamble.`;
+
+            const response = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            });
+            
+            const suggestions = (response.text || '').split('|').map(s => s.trim());
+            res.json({ suggestions });
+        } catch (e: any) {
+            log('ERROR', `AI Suggestion failed: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/post-status', async (req, res) => {
+        const { type, content, caption, backgroundColor, font } = req.body;
+        if (!sock) return res.status(503).json({ error: 'Socket not connected' });
+
+        try {
+            let statusMessage: any = {};
+            if (type === 'text') {
+                statusMessage = { 
+                    text: content,
+                    background: backgroundColor || '#111b21',
+                    font: font || 1
+                };
+            } else if (type === 'image') {
+                const buffer = Buffer.from(content.split(',')[1], 'base64');
+                statusMessage = { 
+                    image: buffer, 
+                    caption: caption 
+                };
+            } else if (type === 'video') {
+                const buffer = Buffer.from(content.split(',')[1], 'base64');
+                statusMessage = { 
+                    video: buffer, 
+                    caption: caption 
+                };
+            }
+
+            log('INFO', `Posting ${type} status update`);
+            const sent = await sock.sendMessage('status@broadcast', statusMessage);
+            res.json(sent);
+        } catch (e: any) {
+            log('ERROR', `Failed to post status: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.get('/api/status-updates', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json({ active: session.proData.statusUpdates || [], intercepted: session.proData.deletedStatuses || [] });
+        res.json({
+            active: proData.statusUpdates,
+            intercepted: proData.deletedStatuses
+        });
+    });
+
+    app.post('/api/read-status', async (req, res) => {
+        const { keys } = req.body;
+        if (!sock) return res.status(503).json({ error: 'Socket not connected' });
+
+        // Stealth Mode check
+        if (proData.settings.ghostMode || proData.settings.secretStatusView) {
+            log('DEBUG', 'Secret Status View active: Suppressing status-seen receipt.');
+            return res.json({ status: 'Stealth View engaged' });
+        }
+
+        try {
+            await sock.readMessages(keys);
+            res.json({ status: 'Status Seen' });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/read-chat', async (req, res) => {
+        const { jid, keys, account } = req.body;
+        const targetSock = account === 'friend' ? sockFriend : sock;
+        const targetProData = account === 'friend' ? proDataFriend : proData;
+
+        if (!targetSock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid) return res.status(400).json({ error: 'Missing chat JID' });
+        
+        if (targetProData.settings.ghostMode || targetProData.settings.hideBlueTicks) {
+            return res.json({ status: 'Privacy Shield Active: Read receipt supressed.' });
+        }
+
+        try {
+            await targetSock.readMessages(keys);
+            res.json({ status: 'Read' });
+        } catch (e) {
+            res.status(500).json({ error: 'Read failed' });
+        }
+    });
+
+    app.get('/api/recycle-bin', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.recycleBin || { messages: [], chats: [] });
+        res.json(proData.recycleBin);
+    });
+
+    app.post('/api/delete-message', async (req, res) => {
+        let { chatId, msgId, revoke } = req.body;
+        chatId = normalizeJid(chatId);
+        
+        const history = proData.messageHistory[chatId] || [];
+        const msgIndex = history.findIndex(m => m.key.id === msgId);
+        
+        if (msgIndex !== -1) {
+            const msg = history[msgIndex];
+            
+            if (revoke && sock) {
+                try {
+                    await sock.sendMessage(chatId, { delete: msg.key });
+                } catch (e: any) {
+                    log('ERROR', `Revoke failed: ${e.message}`);
+                }
+            }
+
+            const deleted = history.splice(msgIndex, 1)[0];
+            // Remove circular references before saving
+            const safeDeleted = JSON.parse(JSON.stringify(deleted));
+            proData.recycleBin.messages.push({ ...safeDeleted, deletedAt: new Date().toISOString(), originalChat: chatId });
+            if (proData.recycleBin.messages.length > 200) proData.recycleBin.messages.shift();
+            saveProData();
+            broadcast({ type: 'MESSAGE_DELETED', data: { chatId, msgId } });
+            return res.json({ status: 'success' });
+        }
+        res.status(404).json({ error: 'Message not found' });
+    });
+
+    app.post('/api/delete-chat', (req, res) => {
+        const { chatId } = req.body;
+        const chatIndex = realChats.findIndex(c => c.id === chatId);
+        if (chatIndex !== -1) {
+            const deletedChat = realChats.splice(chatIndex, 1)[0];
+            proData.recycleBin.chats.push({ ...deletedChat, deletedAt: new Date().toISOString() });
+            delete proData.messageHistory[chatId];
+            proData.cachedChats = realChats;
+            saveProData();
+            broadcast({ type: 'CHAT_DELETED', data: { chatId } });
+            return res.json({ status: 'success' });
+        }
+        res.status(404).json({ error: 'Chat not found' });
+    });
+
+    app.post('/api/block-contact', async (req, res) => {
+        const { jid, block } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (sock) {
+                await sock.updateBlockStatus(jid, block ? 'block' : 'unblock');
+            }
+            await DatabaseService.insertAuditLog({
+                admin_email: 'SYSTEM',
+                target_phone: jid,
+                action: block ? 'Blocked BlockContact' : 'Unblocked BlockContact',
+                ip_address: '127.0.0.1',
+                user_agent: 'Server Interface'
+            });
+            return res.json({ status: 'success' });
+        } catch (e: any) {
+            console.error('Block contact error:', e);
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/report-contact', async (req, res) => {
+        const { jid } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            await DatabaseService.insertAuditLog({
+                admin_email: 'SYSTEM',
+                target_phone: jid,
+                action: 'Reported ReportContact',
+                ip_address: '127.0.0.1',
+                user_agent: 'Server Interface'
+            });
+            return res.json({ status: 'success' });
+        } catch (e: any) {
+            console.error('Report contact error:', e);
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/restore-chat', (req, res) => {
+        const { chatId } = req.body;
+        const chatIndex = proData.recycleBin.chats.findIndex(c => c.id === chatId);
+        if (chatIndex !== -1) {
+            const restoredChat = proData.recycleBin.chats.splice(chatIndex, 1)[0];
+            realChats.push(restoredChat);
+            proData.cachedChats = realChats;
+            saveProData();
+            broadcast({ type: 'CHATS_UPDATE', data: restoredChat });
+            return res.json({ status: 'success' });
+        }
+        res.status(404).json({ error: 'Chat not found in recycle bin' });
+    });
+
+    app.post('/api/restore-message', (req, res) => {
+        const { msgId } = req.body;
+        const msgIndex = proData.recycleBin.messages.findIndex(m => m.key.id === msgId);
+        if (msgIndex !== -1) {
+            const restoredMsg = proData.recycleBin.messages.splice(msgIndex, 1)[0];
+            const chatId = restoredMsg.originalChat;
+            if (!proData.messageHistory[chatId]) proData.messageHistory[chatId] = [];
+            proData.messageHistory[chatId].push(restoredMsg);
+            saveProData();
+            broadcast({ type: 'MESSAGES_UPSERT', data: { messages: [restoredMsg] } });
+            return res.json({ status: 'success' });
+        }
+        res.status(404).json({ error: 'Message not found in recycle bin' });
+    });
+
+    app.post('/api/clear-chat', (req, res) => {
+        const chatId = normalizeJid(req.body.chatId);
+        proData.messageHistory[chatId] = [];
+        saveProData();
+        broadcast({ type: 'CHAT_CLEARED', data: { chatId } });
+        return res.json({ status: 'success' });
+    });
+
+    app.post('/api/favorite-chat', (req, res) => {
+        const { chatId } = req.body;
+        const index = proData.favorites.indexOf(chatId);
+        if (index === -1) {
+            proData.favorites.push(chatId);
+        } else {
+            proData.favorites.splice(index, 1);
+        }
+        saveProData();
+        res.json({ favorites: proData.favorites });
+    });
+
+    app.post('/api/send-message', async (req: any, res) => {
+        const session = req.userSession;
+        if (!session) return res.status(400).json({ error: 'Session not found' });
+        // Override globals with session context for this request
+        const sock = session.sock;
+        const sockFriend = session.sockFriend;
+        const proData = session.proData;
+        const proDataFriend = session.proDataFriend;
+        const realChats = session.realChats;
+        const broadcast = (d: any) => broadcastToSession(session, d);
+        const saveProData = () => saveSessionProData(session);
+        const normalizeJid = (jid: string) => normalizeJidForSession(session, jid);
+        // original handler below ↓
+        const { jid, text, quoted, account } = req.body;
+        if (!jid || !text) return res.status(400).json({ error: 'Missing target JID or message text' });
+        
+        const targetJid = normalizeJid(jid);
+
+        // Standard Baileys format message for local cache
+        const mockMsg = {
+            key: {
+                remoteJid: targetJid,
+                fromMe: true,
+                id: 'sim_' + Math.random().toString(36).substr(2, 9)
+            },
+            message: { conversation: text },
+            messageTimestamp: Math.floor(Date.now() / 1000),
+            status: 'sent'
+        };
+
+        const targetProData = account === 'friend' ? proDataFriend : proData;
+        const targetSock = account === 'friend' ? sockFriend : sock;
+        let targetRealChats = account === 'friend' ? realChatsFriend : realChats;
+        const saveFunc = account === 'friend' ? saveProDataFriend : saveProData;
+        const wsTypeSuffix = account === 'friend' ? '_FRIEND' : '';
+
+        // Save to local message history memory and Firebase
+        if (!targetProData.messageHistory[targetJid]) {
+            targetProData.messageHistory[targetJid] = [];
+        }
+        targetProData.messageHistory[targetJid].push(mockMsg);
+
+        // Update the last message in cached chats list
+        let chat = targetRealChats.find(c => c.id === targetJid);
+        if (!chat) {
+            chat = {
+                id: targetJid,
+                name: targetProData.contacts[targetJid]?.name || targetJid.split('@')[0],
+                unreadCount: 0,
+                timestamp: Math.floor(Date.now() / 1000)
+            };
+            targetRealChats.push(chat);
+        }
+        chat.timestamp = Math.floor(Date.now() / 1000);
+        chat.lastMessage = mockMsg;
+        targetProData.cachedChats = targetRealChats;
+
+        if (account !== 'friend') {
+            saveMessageToFirebase(targetJid, mockMsg);
+            saveChatToFirebase(targetJid, chat);
+        }
+        saveFunc();
+
+        // Broadcast to client so other tabs update too
+        broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [mockMsg] } });
+        broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
+
+        // If sock is connected, we try to send it over Baileys, else we return simulated success!
+        if (targetSock) {
+            try {
+                log('INFO', `Sending message to ${targetJid} via WhatsApp API (${account || 'me'})`);
+                const options: any = {};
+                if (quoted) {
+                    options.quoted = quoted;
+                }
+                const sent = await targetSock.sendMessage(targetJid, { text }, options);
+                return res.json(sent);
+            } catch (e: any) {
+                log('ERROR', `Failed to send over WhatsApp API: ${e.message}`);
+                // Fallback to simulated message is already done! Since we logged in history, keep it successful!
+            }
+        }
+
+        // Trigger dynamic auto-reply simulator if matched
+        const cleanTxt = text.trim().toLowerCase();
+        const matchedReply = targetProData.autoReplies.find(r => cleanTxt.includes(r.keyword.toLowerCase()));
+        if (matchedReply) {
+            setTimeout(() => {
+                const autoMsg = {
+                    key: {
+                        remoteJid: targetJid,
+                        fromMe: false,
+                        id: 'auto_' + Math.random().toString(36).substr(2, 9)
+                    },
+                    message: { conversation: matchedReply.response },
+                    messageTimestamp: Math.floor(Date.now() / 1000),
+                    status: 'read'
+                };
+                targetProData.messageHistory[targetJid].push(autoMsg);
+                chat.timestamp = Math.floor(Date.now() / 1000);
+                chat.lastMessage = autoMsg;
+                targetProData.cachedChats = targetRealChats;
+
+                if (account !== 'friend') {
+                    saveMessageToFirebase(targetJid, autoMsg);
+                    saveChatToFirebase(targetJid, chat);
+                }
+                saveFunc();
+
+                broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [autoMsg] } });
+                broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
+            }, 1000);
+        }
+
+        res.json(mockMsg);
+    });
+
+    app.post('/api/send-media', upload.single('file'), async (req: any, res: any) => {
+        try {
+            const { jid, caption, type, account } = req.body;
+            const file = req.file;
+            if (!jid) return res.status(400).json({ error: 'Missing target JID' });
+            if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+            const targetJid = normalizeJid(jid);
+            const messageId = 'sim_media_' + Math.random().toString(36).substr(2, 9);
+
+            // Add the file to local caching map
+            localMediaCache.set(messageId, {
+                buffer: file.buffer,
+                mimetype: file.mimetype,
+                filename: file.originalname
+            });
+
+            // Standard Baileys format message for local cache
+            let messageContent: any = {};
+            const utype = type || 'document';
+            if (utype === 'image' || file.mimetype.startsWith('image/')) {
+                messageContent = { 
+                    imageMessage: { 
+                        caption: caption || '', 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else if (utype === 'video' || file.mimetype.startsWith('video/')) {
+                messageContent = { 
+                    videoMessage: { 
+                        caption: caption || '', 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else if (utype === 'audio' || file.mimetype.startsWith('audio/')) {
+                messageContent = { 
+                    audioMessage: { 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname 
+                    } 
+                };
+            } else {
+                messageContent = { 
+                    documentMessage: { 
+                        mimetype: file.mimetype, 
+                        fileName: file.originalname, 
+                        title: file.originalname 
+                    } 
+                };
+            }
+
+            const mockMsg = {
+                key: {
+                    remoteJid: targetJid,
+                    fromMe: true,
+                    id: messageId
+                },
+                message: messageContent,
+                messageTimestamp: Math.floor(Date.now() / 1000),
+                status: 'sent'
+            };
+
+            const targetProData = account === 'friend' ? proDataFriend : proData;
+            const targetSock = account === 'friend' ? sockFriend : sock;
+            let targetRealChats = account === 'friend' ? realChatsFriend : realChats;
+            const saveFunc = account === 'friend' ? saveProDataFriend : saveProData;
+            const wsTypeSuffix = account === 'friend' ? '_FRIEND' : '';
+
+            // Save to local message history memory and Firebase
+            if (!targetProData.messageHistory[targetJid]) {
+                targetProData.messageHistory[targetJid] = [];
+            }
+            targetProData.messageHistory[targetJid].push(mockMsg);
+
+            // Update the last message in cached chats list
+            let chat = targetRealChats.find(c => c.id === targetJid);
+            if (!chat) {
+                chat = {
+                    id: targetJid,
+                    name: targetProData.contacts[targetJid]?.name || targetJid.split('@')[0],
+                    unreadCount: 0,
+                    timestamp: Math.floor(Date.now() / 1000)
+                };
+                targetRealChats.push(chat);
+            }
+            chat.timestamp = Math.floor(Date.now() / 1000);
+            chat.lastMessage = mockMsg;
+            targetProData.cachedChats = targetRealChats;
+
+            if (account !== 'friend') {
+                saveMessageToFirebase(targetJid, mockMsg);
+                saveChatToFirebase(targetJid, chat);
+            }
+            saveFunc();
+
+            // Broadcast to client so other tabs update too
+            broadcast({ type: 'MESSAGES_UPSERT' + wsTypeSuffix, data: { messages: [mockMsg] } });
+            broadcast({ type: 'INITIAL_SYNC' + wsTypeSuffix, data: { chats: targetRealChats } });
+
+            // Send via Baileys if connected
+            if (targetSock) {
+                try {
+                    log('INFO', `Sending media to ${targetJid} via WhatsApp API (${account || 'me'})`);
+                    let waPayload: any = {};
+                    if (utype === 'image' || file.mimetype.startsWith('image/')) {
+                        waPayload = { image: file.buffer, caption: caption || '' };
+                    } else if (utype === 'video' || file.mimetype.startsWith('video/')) {
+                        waPayload = { video: file.buffer, caption: caption || '' };
+                    } else if (utype === 'audio' || file.mimetype.startsWith('audio/')) {
+                        waPayload = { audio: file.buffer, mimetype: file.mimetype };
+                    } else {
+                        waPayload = { 
+                            document: file.buffer, 
+                            mimetype: file.mimetype, 
+                            fileName: file.originalname 
+                        };
+                    }
+                    const sent = await targetSock.sendMessage(targetJid, waPayload);
+                    return res.json(sent);
+                } catch (e: any) {
+                    log('ERROR', `Failed to send media/file over WhatsApp API: ${e?.message}`);
+                }
+            }
+
+            res.json(mockMsg);
+        } catch (e: any) {
+            log('ERROR', `Error in /api/send-media: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/react-message', async (req, res) => {
+        const { jid, msgId, emoji, fromMe } = req.body;
+        if (!jid || !msgId || !emoji) return res.status(400).json({ error: 'Missing target JID, message ID, or emoji' });
+        
+        const targetJid = normalizeJid(jid);
+
+        // Update local memory history
+        const chatMsgs = proData.messageHistory[targetJid] || [];
+        const found = chatMsgs.find(m => (m.key?.id === msgId || m.id === msgId));
+        if (found) {
+            found.reaction = emoji;
+            saveMessageToFirebase(targetJid, found);
+            saveProData();
+        }
+
+        // Broadcast reaction to client UI immediately
+        broadcast({ type: 'MESSAGE_REACTED', data: { jid: targetJid, msgId, emoji } });
+
+        if (sock) {
+            try {
+                log('INFO', `Reacting to ${msgId} in ${targetJid} with ${emoji}`);
+                const sent = await sock.sendMessage(targetJid, { 
+                    react: { 
+                        text: emoji, 
+                        key: { remoteJid: targetJid, id: msgId, fromMe: fromMe === true }
+                    } 
+                });
+                return res.json(sent);
+            } catch (e: any) {
+                log('ERROR', `Failed to react over API: ${e.message}`);
+            }
+        }
+        
+        res.json({ status: 'success', simulated: true });
+    });
+
+    app.post('/api/send-audio', async (req, res) => {
+        const { jid, audio, duration, ptt } = req.body;
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!jid || !audio) return res.status(400).json({ error: 'Missing target JID or audio payload' });
+        
+        const targetJid = normalizeJid(jid);
+
+        try {
+            log('INFO', `Sending audio message to ${targetJid}`);
+            const buffer = Buffer.from(audio.split(',')[1], 'base64');
+            const sent = await sock.sendMessage(targetJid, { 
+                audio: buffer, 
+                mimetype: 'audio/mp4', // Baileys works well with mp4/ptt
+                ptt: ptt !== undefined ? ptt : true,
+                seconds: duration
+            });
+            res.json(sent);
+        } catch (e: any) {
+            log('ERROR', `Failed to send audio to ${targetJid}: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/forward-message', async (req, res) => {
+        const { targetJid, msgId, fromJid } = req.body;
+        if (!sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Please connect using QR / Pairing code.' });
+        if (!targetJid || !msgId || !fromJid) return res.status(400).json({ error: 'Missing parameters: targetJid, msgId, or fromJid are required' });
+
+        const normalizedTarget = normalizeJid(targetJid);
+        const normalizedFrom = normalizeJid(fromJid);
+
+        try {
+            const chatMsgs = proData.messageHistory[normalizedFrom] || [];
+            const msg = chatMsgs.find(m => m.key.id === msgId);
+            
+            if (!msg) throw new Error('Source message not found in history');
+
+            log('INFO', `Forwarding message ${msgId} to ${normalizedTarget}`);
+            const sent = await sock.sendMessage(normalizedTarget, { forward: msg });
+            res.json(sent);
+        } catch (e: any) {
+            log('ERROR', `Failed to forward message: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.get('/api/group-metadata/:jid', async (req, res) => {
+        const { jid } = req.params;
+        if (!jid || !jid.endsWith('@g.us')) return res.status(400).json({ error: 'Invalid group JID' });
+        
+        let metadata: any = null;
+        if (sock) {
+            try {
+                metadata = await sock.groupMetadata(jid);
+            } catch (e) {}
+        }
+
+        if (!metadata) {
+            const participantsList = Object.keys(proData.contacts).map(id => ({
+                id,
+                admin: Math.random() > 0.8 ? 'admin' : null
+            }));
+
+            if (participantsList.length === 0) {
+                const dummyPhs = ['12065550100', '14155552671', '12125557890', '13125553421'];
+                dummyPhs.forEach(num => {
+                    const id = `${num}@s.whatsapp.net`;
+                    participantsList.push({
+                        id,
+                        admin: num === '12065550100' ? 'admin' : null
+                    });
+                });
+            }
+
+            metadata = {
+                id: jid,
+                subject: (realChats.find(c => c.id === jid)?.name) || 'Neural Grid Alpha',
+                owner: '12065550100@s.whatsapp.net',
+                creation: Math.floor(Date.now() / 1000) - 1000000,
+                desc: 'Official encryption matrix and secure logic sync.',
+                participants: participantsList
+            };
+        }
+
+        res.json(metadata);
+    });
+
+    const ppCache = new Map<string, string | null>();
+
+    app.get('/api/profile-picture', async (req, res) => {
+        const jid = req.query.jid as string;
+        if (!jid) return res.json({ url: null });
+        if (ppCache.has(jid)) return res.json({ url: ppCache.get(jid) });
+        try {
+            if (!sock) return res.json({ url: null });
+            let url: string | null = null;
+            try {
+                url = await sock.profilePictureUrl(jid, 'image');
+            } catch (errImage) {
+                try {
+                    url = await sock.profilePictureUrl(jid, 'preview');
+                } catch (errPreview) {
+                    url = null;
+                }
+            }
+            ppCache.set(jid, url || null);
+            return res.json({ url: url || null });
+        } catch (e) {
+            ppCache.set(jid, null);
+            return res.json({ url: null });
+        }
+    });
+
+    app.post('/api/read-all', async (req, res) => {
+        try {
+            for (const chat of realChats) {
+                chat.unreadCount = 0;
+            }
+            proData.cachedChats = realChats;
+            saveProData();
+
+            if (sock) {
+                for (const chat of realChats) {
+                    try {
+                        await sock.readMessages([{ remoteJid: chat.id, id: chat.lastMessage?.key?.id, fromMe: false }]);
+                    } catch (e) {}
+                }
+            }
+
+            broadcast({ type: 'INITIAL_SYNC', data: { chats: realChats } });
+            res.json({ status: 'success' });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/add-call', (req, res) => {
+        const { jid, type, date, duration, status, fromMe } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing JID' });
+
+        const from = fromMe ? (sock?.user?.id || 'me@s.whatsapp.net') : jid;
+        const to = fromMe ? jid : (sock?.user?.id || 'me@s.whatsapp.net');
+
+        const newCall = {
+            id: 'call_' + Math.random().toString(36).substr(2, 9),
+            from,
+            to,
+            timestamp: Math.floor(new Date(date || Date.now()).getTime() / 1000),
+            status: status || 'connected',
+            type: type || 'audio',
+            duration: duration || 0
+        };
+
+        proData.callHistory.unshift(newCall);
+        if (proData.callHistory.length > 100) proData.callHistory.pop();
+        
+        saveCallToFirebase(newCall);
+        saveProData();
+
+        broadcast({ type: 'CALL_UPDATE', data: newCall });
+        res.json({ status: 'success', call: newCall });
+    });
+
+    app.post('/api/update-contact', (req, res) => {
+        const { id, name } = req.body;
+        if (!id || !name) return res.status(400).json({ error: 'ID and Name required' });
+        
+        let jid = id;
+        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`;
+        
+        proData.contacts[jid] = { ...(proData.contacts[jid] || {}), id: jid, name };
+        saveProData();
+        saveContactToFirebase(jid, proData.contacts[jid]);
+        broadcast({ type: 'CONTACTS_UPSERT', data: [proData.contacts[jid]] });
+        res.json({ status: 'success' });
+    });
+
+    app.post('/api/update-profile-picture', async (req, res) => {
+        const { image } = req.body;
+        if (!sock || !image) return res.status(400).json({ error: 'Missing image' });
+        try {
+            const buffer = Buffer.from(image.split(',')[1], 'base64');
+            await sock.updateProfilePicture(sock.user.id, buffer);
+            res.json({ status: 'success' });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/update-profile', async (req, res) => {
+        const { name, bio } = req.body;
+        if (!sock) return res.status(500).json({ error: 'Socket not ready' });
+        try {
+            if (name) await sock.updateProfileName(name);
+            if (bio) await sock.updateProfileStatus(bio);
+            res.json({ status: 'success' });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/lock-chat', (req, res) => {
+        const { chatId, lock } = req.body;
+        if (!chatId) return res.status(400).json({ error: 'Chat ID required' });
+        
+        const index = proData.lockedChats.indexOf(chatId);
+        if (lock && index === -1) {
+            proData.lockedChats.push(chatId);
+        } else if (!lock && index !== -1) {
+            proData.lockedChats.splice(index, 1);
+        }
+        saveProData();
+        res.json({ lockedChats: proData.lockedChats });
+    });
+
+    app.get('/api/locked-chats', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.lockedChats || []);
+        res.json(proData.lockedChats);
+    });
+
+    app.get('/api/favorites', (req: any, res) => {
+        const session = req.userSession;
+        if (session) return res.json(session.proData.favorites || []);
+        res.json(proData.favorites);
+    });
+
+    app.post('/api/logout', async (req: any, res) => {
+        const session = req.userSession;
+        if (session) {
+            const account = req.query.account || req.body.account;
+            if (account === 'friend') {
+                session.qrCodeFriend = null;
+                if (session.sockFriend) {
+                    try { await session.sockFriend.logout(); } catch(e) {}
+                    session.sockFriend = null;
+                }
+                session.connectionStateFriend = 'close';
+                broadcastToSession(session, { type: 'CONNECTION_STATE_FRIEND', data: 'close' });
+            } else {
+                session.qrCode = null;
+                if (session.sock) {
+                    try { await session.sock.logout(); } catch(e) {}
+                    session.sock = null;
+                }
+                session.realChats = [];
+                session.proData.cachedChats = [];
+                session.connectionState = 'close';
+                saveSessionProData(session);
+                broadcastToSession(session, { type: 'LOGOUT', data: { message: 'Logged out successfully.' } });
+            }
+            return res.json({ status: 'logged out' });
+        }
+        const { account } = req.body;
+        log('INFO', `Hard Logout Requested for account: ${account || 'me'}`);
+        
+        if (account === 'friend') {
+            try {
+                if (sockFriend) {
+                    sockFriend.ev.removeAllListeners('connection.update');
+                    sockFriend.ev.removeAllListeners('creds.update');
+                    try { await sockFriend.logout(); } catch (e) {}
+                    sockFriend.end(undefined);
+                    sockFriend = null;
+                }
+            } catch (e) {}
+
+            const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
+            cleanAuthDir(authDirFriend);
+
+            qrCodeFriend = null;
+            // Keep friend's realChats and cachedChats permanently intact
+            connectionStateFriend = 'close';
+            broadcast({ type: 'LOGOUT_FRIEND', data: { message: 'Friend Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            setTimeout(async () => {
+                 initWASocketFriend();
+                 res.json({ status: 'Logged out Friend successfully' });
+            }, 3000);
+        } else {
+            try {
+                if (sock) {
+                    sock.ev.removeAllListeners('connection.update');
+                    sock.ev.removeAllListeners('creds.update');
+                    try { await sock.logout(); } catch (e) {}
+                    sock.end(undefined);
+                    sock = null;
+                }
+            } catch (e) {}
+
+            const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
+            cleanAuthDir(authDir);
+
+            qrCode = null;
+            // Keep main user's realChats and cachedChats permanently intact to respect the "permanent offline data" request
+            saveProDataSync();
+            connectionState = 'close';
+            broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            setTimeout(async () => {
+                 scheduleInit(0);
+                 res.json({ status: 'Logged out successfully' });
+            }, 3000);
+        }
+    });
+
+    function getMediaKeyAndTimestamp(msg: any): string | null {
+        if (!msg || !msg.message) return null;
+        const content = msg.message;
+        const media = content.imageMessage || content.videoMessage || content.documentMessage || content.audioMessage || content.stickerMessage;
+        if (!media) return null;
+        const mediaKey = (media as any).mediaKey ? Buffer.from((media as any).mediaKey).toString('base64') : '';
+        const timestamp = msg.messageTimestamp || '';
+        if (!mediaKey && !timestamp) return null;
+        return `${mediaKey}_${timestamp}`;
+    }
+
+    const expiredSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150" viewBox="0 0 300 150">
+  <rect width="100%" height="100%" fill="#1f2937" rx="10"/>
+  <g fill="#ef4444" transform="translate(138, 35)">
+    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" />
+  </g>
+  <text x="50%" y="95" fill="#f3f4f6" font-family="Inter, sans-serif" font-size="14" font-weight="600" text-anchor="middle">Media Expired</text>
+  <text x="50%" y="115" fill="#9ca3af" font-family="Inter, sans-serif" font-size="11" text-anchor="middle">This content is no longer available</text>
+</svg>`;
+
+    app.get('/api/media', async (req: any, res: any) => {
+        const { msgId, chatId } = req.query;
+        if (!msgId) return res.status(400).send('Missing message ID');
+
+        const inlineOrAttachment = req.query.download === 'true' ? 'attachment' : 'inline';
+
+        // 1. Check local memory cache by msgId first
+        if (localMediaCache.has(msgId as string)) {
+            const cached = localMediaCache.get(msgId as string)!;
+            res.setHeader('Content-Type', cached.mimetype);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${cached.filename}"`);
+            return res.send(cached.buffer);
+        }
+
+        if (!sock) return res.status(503).send('WhatsApp is not connected yet. Please connect using QR / Pairing code.');
+        if (!chatId) return res.status(400).send('Missing chat ID');
+
+        let jid = chatId as string;
+        // Normalize JID for lookup
+        const normalizedJid = jid.includes('@') ? (jid.endsWith('@c.us') ? jid.replace('@c.us', '@s.whatsapp.net') : jid) : `${jid}@s.whatsapp.net`;
+
+        let msg: any;
+        if (normalizedJid === 'status@broadcast') {
+            msg = proData.statusUpdates.find(s => s.id === msgId);
+        } else {
+            const chatMsgs = proData.messageHistory[normalizedJid] || proData.messageHistory[jid] || [];
+            msg = chatMsgs.find(m => m.key.id === msgId);
+            
+            // Fallback: check lastMessage in cached chats
+            if (!msg) {
+                const chat = proData.cachedChats.find(c => normalizeJid(c.id) === normalizedJid);
+                if (chat?.lastMessage?.key?.id === msgId) {
+                    msg = chat.lastMessage;
+                }
+            }
+        }
+        
+        if (!msg) {
+            return res.status(404).json({ error: 'Media not found' });
+        }
+
+        // 2. Check composite cache by (mediaKey + messageTimestamp)
+        const compositeKey = getMediaKeyAndTimestamp(msg);
+        if (compositeKey && localMediaCacheByMediaKey.has(compositeKey)) {
+            const cached = localMediaCacheByMediaKey.get(compositeKey)!;
+            res.setHeader('Content-Type', cached.mimetype);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${cached.filename}"`);
+            return res.send(cached.buffer);
+        }
+
+        // 3. Prevent retrying expired media more than once per session
+        const isAlreadyMarkedExpired = msg.mediaExpired || expiredMediaTracker.has(msgId as string);
+        if (isAlreadyMarkedExpired) {
+            log('INFO', `Media request bypassed since ${msgId} is marked as expired. Directing placeholder SVG...`);
+            res.setHeader('Content-Type', 'image/svg+xml');
+            res.setHeader('Cache-Control', 'public, max-age=31536000');
+            return res.status(200).send(expiredSvg);
+        }
+
+        try {
+            log('INFO', `Media request for ${msgId} (Origin: ${normalizedJid})...`);
+            
+            let buffer: Buffer;
+            let targetMsg = msg;
+            
+            try {
+                // Attempt standard download first
+                buffer = await downloadMediaMessage(
+                    targetMsg,
+                    'buffer',
+                    {},
+                    { 
+                        logger,
+                        reuploadRequest: sock.updateMediaMessage.bind(sock) 
+                    }
+                );
+            } catch (initialErr: any) {
+                const errStr = (initialErr.message || '').toLowerCase();
+                const isFatal = errStr.includes('re-upload') || errStr.includes('410') || errStr.includes('403') || errStr.includes('expired');
+                
+                if (isFatal) {
+                    throw new Error('Media expired on WhatsApp servers (re-upload failed)');
+                }
+
+                log('INFO', `Media URL stale for ${msgId}, refreshing metadata...`);
+                
+                // Explicitly refresh message metadata from WhatsApp servers
+                try {
+                    const refreshed = await sock.updateMediaMessage(msg);
+                    if (refreshed) {
+                        targetMsg = refreshed;
+                        
+                        // Persist refreshed metadata
+                        const history = proData.messageHistory[normalizedJid] || proData.messageHistory[jid] || [];
+                        const msgIndex = history.findIndex(m => m.key.id === msgId);
+                        if (msgIndex !== -1) {
+                            history[msgIndex] = targetMsg;
+                            saveProData();
+                            log('INFO', `Metadata persisted for ${msgId}`);
+                        }
+                    } else {
+                        throw new Error('Refresh returned empty result');
+                    }
+                } catch (refreshErr: any) {
+                    const refreshErrStr = (refreshErr.message || '').toLowerCase();
+                    const isMissing = refreshErrStr.includes('re-upload') || refreshErrStr.includes('404') || refreshErrStr.includes('410') || refreshErrStr.includes('expired');
+                    if (isMissing) {
+                        throw new Error('Media expired (re-upload not possible)');
+                    }
+                    log('ERROR', `Metadata refresh failed for ${msgId}: ${refreshErr.message}`);
+                    throw refreshErr;
+                }
+
+                // Try downloading one more time with refreshed message
+                buffer = await downloadMediaMessage(
+                    targetMsg,
+                    'buffer',
+                    {},
+                    { 
+                        logger, 
+                        reuploadRequest: sock.updateMediaMessage.bind(sock) 
+                    }
+                );
+            }
+            
+            const content = targetMsg.message;
+            if (!content) throw new Error('Message content is null');
+
+            // Handle different media types
+            const media = content.imageMessage || content.videoMessage || content.documentMessage || content.audioMessage || content.stickerMessage;
+            if (!media) throw new Error('Target message contains no downloadable media');
+
+            const mimetype = (media as any).mimetype || 'application/octet-stream';
+            const filename = (media as any).fileName || `wa_media_${msgId}`;
+
+            // Save to memory cache (both msgId and compositeKey)
+            localMediaCache.set(msgId as string, { buffer, mimetype, filename });
+            if (compositeKey) {
+                localMediaCacheByMediaKey.set(compositeKey, { buffer, mimetype, filename });
+            }
+
+            res.setHeader('Content-Type', mimetype);
+            res.setHeader('Content-Disposition', `${inlineOrAttachment}; filename="${filename}"`);
+            res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 24h
+            res.send(buffer);
+            log('SUCCESS', `Downloaded media ${msgId}`);
+        } catch (err: any) {
+            const errStr = (err.message || '').toLowerCase();
+            const isMissing = errStr.includes('404') || 
+                              errStr.includes('410') || 
+                              errStr.includes('403') || 
+                              errStr.includes('re-upload') || 
+                              errStr.includes('expired') ||
+                              errStr.includes('not found') ||
+                              errStr.includes('failed');
+            
+            if (isMissing) {
+                // Mark the media as "EXPIRED" in local DB
+                msg.mediaExpired = true;
+                if (msg.message) {
+                    const media = msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage || msg.message.stickerMessage;
+                    if (media) {
+                        (media as any).mediaExpired = true;
+                    }
+                }
+                saveProData();
+                expiredMediaTracker.add(msgId as string);
+
+                // Return standard placeholder icon with text "Media expired"
+                res.setHeader('Content-Type', 'image/svg+xml');
+                res.setHeader('Cache-Control', 'public, max-age=31536000');
+                return res.status(200).send(expiredSvg);
+            } else {
+                log('ERROR', `Media download failed [${msgId}]: ${err.message}`);
+                res.status(500).send(err.message);
+            }
+        }
+    });
+
+    app.get('/api/connection-status', (req, res) => {
+        try {
+            const session = getSessionFromReq(req);
+            if (!session) return res.status(400).json({ error: 'x-session-id header missing' });
+
+            // Start WhatsApp for this session if not already running
+            if (!session.sock && !session.isInitializing) {
+                initWASocketForSession(session);
+                initWASocketFriendForSession(session);
+            }
+
+            const filterChats = (chats: any[]) => (chats || []).filter((c: any) => {
+                if (!c || !c.id) return false;
+                if (c.id === 'status@broadcast' || c.id === '0@s.whatsapp.net') return false;
+                if (c.id.endsWith('@lid')) return false;
+                const idNum = c.id.split('@')[0];
+                if (idNum.length < 7 || idNum.length > 20) return false;
+                return true;
+            });
+
+            const filterContacts = (contacts: Record<string, any>) => {
+                const clean: Record<string, any> = {};
+                Object.keys(contacts || {}).forEach(key => {
+                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') clean[key] = contacts[key];
+                });
+                return clean;
+            };
+
+            res.json({ 
+                state: session.connectionState, 
+                user: session.sock?.user,
+                qrCode: session.qrCode,
+                isRegistered: session.sock?.authState?.creds?.registered,
+                chats: filterChats(session.realChats),
+                contacts: filterContacts(session.proData.contacts),
+                statusUpdates: session.proData.statusUpdates,
+                supportPhoneNumber: process.env.WHATSAPP_PHONE_NUMBER || session.proData.settings?.phoneNumber || "12065550100",
+                latency: '14ms', 
+                uptimes: process.uptime(),
+                friend: {
+                    state: session.connectionStateFriend,
+                    user: session.sockFriend?.user,
+                    qrCode: session.qrCodeFriend,
+                    isRegistered: session.sockFriend?.authState?.creds?.registered,
+                    chats: filterChats(session.realChatsFriend),
+                    contacts: filterContacts(session.proDataFriend.contacts),
+                    statusUpdates: session.proDataFriend.statusUpdates
+                }
+            });
+        } catch (error: any) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // Vite middleware
+    const isProductionEnv = process.env.NODE_ENV === 'production' || __filename.includes('dist') || !fs.existsSync(path.join(process.cwd(), 'server.ts'));
+    if (!process.env.VERCEL) { // FIXED: Do not listen on static express ports when deployed on Vercel
+        if (!isProductionEnv) {
+            const vite = await createViteServer({
+                server: { middlewareMode: true },
+                appType: 'spa',
+            });
+            app.use(vite.middlewares);
+        } else {
+            const distPath = fs.existsSync(path.join(process.cwd(), 'dist')) 
+                ? path.join(process.cwd(), 'dist') 
+                : path.join(__dirname, 'dist');
+            app.use(express.static(distPath));
+            app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+        }
+
+        server.listen(PORT, '0.0.0.0', () => {
+            console.log(`WhatsApp Pro running on http://localhost:${PORT}`);
+        });
+    }
+}
+
+// Graceful termination state persistence
+const gracefulExit = () => {
+    console.log('Intercepted termination signal. Flushing Pro Engine State dynamically to storage disk...');
+    saveProDataSync();
+    process.exit(0);
+};
+process.on('SIGINT', gracefulExit);
+process.on('SIGTERM', gracefulExit);
+
+startServer();
+
+export default app; // FIXED
