@@ -45,7 +45,6 @@ import {
 import { DatabaseService } from './src/DatabaseService.js';
 import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
 import cors from 'cors';
-import { randomUUID } from 'crypto';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
@@ -54,115 +53,6 @@ const logger = pino({ level: 'silent' });
 const BASE_DATA_DIR = process.env.DATA_DIR || process.cwd();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const DATA_FILE = path.join(BASE_DATA_DIR, 'pro_data.json');
-
-// ═══════════════════════════════════════════════════════════════
-// MULTI-USER SESSION REGISTRY
-// Each browser gets a unique sessionId (UUID) via X-Session-ID header.
-// All state (sock, proData, qrCode, realChats, etc.) lives inside
-// the session object — completely isolated per user.
-// ═══════════════════════════════════════════════════════════════
-const sessions = new Map<string, any>();
-
-function getOrCreateSession(sessionId: string): any {
-    if (sessions.has(sessionId)) return sessions.get(sessionId);
-    const sessDir = path.join(BASE_DATA_DIR, 'sessions', sessionId);
-    fs.mkdirSync(sessDir, { recursive: true });
-    const session: any = {
-        id: sessionId,
-        dir: sessDir,
-        sock: null,
-        sockFriend: null,
-        realChats: [],
-        realChatsFriend: [],
-        qrCode: null,
-        qrCodeFriend: null,
-        connectionState: 'close',
-        connectionStateFriend: 'close',
-        wsClients: new Set<WebSocket>(),
-        isInitializing: false,
-        isInitializingFriend: false,
-        initTimeout: null,
-        consecutiveBadSessions: 0,
-        consecutiveStreamErrors: 0,
-        lastInteractionTime: Date.now(),
-        healthCheckInterval: null,
-        proData: createDefaultProData(),
-        proDataFriend: createDefaultProData(),
-        saveProDataTimeout: null,
-        saveProDataFriendTimeout: null,
-    };
-    // Load persisted data if exists
-    const dataFile = path.join(sessDir, 'pro_data.json');
-    if (fs.existsSync(dataFile)) {
-        try { session.proData = { ...session.proData, ...JSON.parse(fs.readFileSync(dataFile, 'utf-8')) }; } catch(e) {}
-    }
-    const dataFileFriend = path.join(sessDir, 'pro_data_friend.json');
-    if (fs.existsSync(dataFileFriend)) {
-        try { session.proDataFriend = { ...session.proDataFriend, ...JSON.parse(fs.readFileSync(dataFileFriend, 'utf-8')) }; } catch(e) {}
-    }
-    session.realChats = session.proData.cachedChats || [];
-    session.realChatsFriend = session.proDataFriend.cachedChats || [];
-    sessions.set(sessionId, session);
-    console.log(`[Session] New session created: ${sessionId}`);
-    return session;
-}
-
-function createDefaultProData() {
-    return {
-        scheduledMessages: [] as any[],
-        autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
-        messageHistory: {} as Record<string, any[]>,
-        callHistory: [] as any[],
-        callRecords: [] as any[],
-        statusUpdates: [] as any[],
-        deletedStatuses: [] as any[],
-        recycleBin: { messages: [] as any[], chats: [] as any[] },
-        favorites: [] as string[],
-        lockedChats: [] as string[],
-        cachedChats: [] as any[],
-        contacts: {} as Record<string, any>,
-        lidToPnMap: {} as Record<string, string>,
-        settings: {
-            autoTranslate: false, theme: 'elegant-dark', font: 'Inter',
-            aiContext: 'Professional Assistant', ghostMode: false, antiDelete: true,
-            antiDeleteStatus: true, hideNumbers: false, hideBlueTicks: false,
-            hideSecondTick: false, hideTyping: false, secretStatusView: true,
-            dndMode: false, autoReply: false, phoneNumber: '', firebaseBackupEnabled: false
-        },
-        logs: [] as { time: string, level: string, msg: string }[]
-    };
-}
-
-function saveSessionProData(session: any, isFriend = false) {
-    const key = isFriend ? 'saveProDataFriendTimeout' : 'saveProDataTimeout';
-    const dataKey = isFriend ? 'proDataFriend' : 'proData';
-    const fileName = isFriend ? 'pro_data_friend.json' : 'pro_data.json';
-    if (session[key]) clearTimeout(session[key]);
-    session[key] = setTimeout(() => {
-        session[key] = null;
-        try {
-            const filePath = path.join(session.dir, fileName);
-            const tempFile = filePath + '.tmp';
-            fs.writeFileSync(tempFile, JSON.stringify(session[dataKey]), 'utf-8');
-            fs.renameSync(tempFile, filePath);
-        } catch (e: any) { console.error(`[Session ${session.id}] Save failed: ${e.message}`); }
-    }, 1500);
-}
-
-function broadcastToSession(session: any, data: any) {
-    session.lastInteractionTime = Date.now();
-    const msg = JSON.stringify(data);
-    session.wsClients.forEach((client: WebSocket) => {
-        if (client.readyState === WebSocket.OPEN) client.send(msg);
-    });
-}
-
-function getSessionFromReq(req: any): any | null {
-    if (req.userSession) return req.userSession;
-    const sid = req.headers['x-session-id'] || req.query.sessionId;
-    if (!sid || typeof sid !== 'string') return null;
-    return getOrCreateSession(sid);
-}
 
 const app = express(); // FIXED (Move globally)
 
@@ -279,24 +169,213 @@ if (fs.existsSync(firebaseConfigPath)) {
     setFirebaseEnabledState(false);
 }
 
-// ── Global state replaced by per-session state (see sessions Map above) ──
-// Kept as thin compatibility shims so shared utility functions still compile.
-// All real state lives in session objects accessed via getSessionFromReq().
-let consecutiveBadSessions = 0; // legacy shim (unused in multi-user path)
-let consecutiveStreamErrors = 0; // legacy shim
-let lastInteractionTime = Date.now(); // legacy shim
+// Initialize data storage with persistence
+let proData = {
+    scheduledMessages: [] as any[],
+    autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
+    messageHistory: {} as Record<string, any[]>,
+    callHistory: [] as any[],
+    callRecords: [] as any[],
+    statusUpdates: [] as any[],
+    deletedStatuses: [] as any[],
+    recycleBin: {
+        messages: [] as any[],
+        chats: [] as any[]
+    },
+    favorites: [] as string[],
+    lockedChats: [] as string[],
+    cachedChats: [] as any[],
+    contacts: {} as Record<string, any>,
+    lidToPnMap: {} as Record<string, string>,
+    settings: {
+        autoTranslate: false,
+        theme: 'elegant-dark',
+        font: 'Inter',
+        aiContext: 'Professional Assistant',
+        ghostMode: false,
+        antiDelete: true,
+        antiDeleteStatus: true,
+        hideNumbers: false,
+        hideBlueTicks: false,
+        hideSecondTick: false,
+        hideTyping: false,
+        secretStatusView: true,
+        dndMode: false,
+        autoReply: false,
+        phoneNumber: '',
+        firebaseBackupEnabled: false
+    },
+    logs: [] as { time: string, level: string, msg: string }[]
+};
 
-function recordActivity() { lastInteractionTime = Date.now(); }
+(global as any).proData = proData;
+(global as any).saveProData = () => saveProData();
 
-// Global log (used before session exists). Session-scoped logging happens inside session context.
+let sock: any = null;
+let sockFriend: any = null;
+let realChats: any[] = [];
+let realChatsFriend: any[] = [];
+
+let proDataFriend = {
+    scheduledMessages: [] as any[],
+    autoReplies: [] as { keyword: string, response: string, enabled: boolean }[],
+    messageHistory: {} as Record<string, any[]>,
+    callHistory: [] as any[],
+    callRecords: [] as any[],
+    statusUpdates: [] as any[],
+    deletedStatuses: [] as any[],
+    recycleBin: {
+        messages: [] as any[],
+        chats: [] as any[]
+    },
+    favorites: [] as string[],
+    lockedChats: [] as string[],
+    cachedChats: [] as any[],
+    contacts: {} as Record<string, any>,
+    lidToPnMap: {} as Record<string, string>,
+    settings: {
+        autoTranslate: false,
+        theme: 'elegant-dark',
+        font: 'Inter',
+        aiContext: 'Professional Assistant',
+        ghostMode: false,
+        antiDelete: true,
+        antiDeleteStatus: true,
+        hideNumbers: false,
+        hideBlueTicks: false,
+        hideSecondTick: false,
+        hideTyping: false,
+        secretStatusView: true,
+        dndMode: false,
+        autoReply: false,
+        phoneNumber: '',
+        firebaseBackupEnabled: false
+    },
+    logs: [] as { time: string, level: string, msg: string }[]
+};
+
+(global as any).proDataFriend = proDataFriend;
+
+const DATA_FILE_FRIEND = path.join(BASE_DATA_DIR, 'pro_data_friend.json');
+if (fs.existsSync(DATA_FILE_FRIEND)) {
+    try {
+        const savedFriend = JSON.parse(fs.readFileSync(DATA_FILE_FRIEND, 'utf-8'));
+        proDataFriend = { ...proDataFriend, ...savedFriend };
+        (global as any).proDataFriend = proDataFriend;
+    } catch (e) {
+        console.error('Failed to load pro_data_friend.json');
+    }
+}
+
+let saveProDataFriendTimeout: NodeJS.Timeout | null = null;
+function saveProDataFriend() {
+    if (saveProDataFriendTimeout) {
+        clearTimeout(saveProDataFriendTimeout);
+    }
+    saveProDataFriendTimeout = setTimeout(() => {
+        saveProDataFriendTimeout = null;
+        try {
+            const tempFile = `${DATA_FILE_FRIEND}.tmp`;
+            fs.writeFileSync(tempFile, JSON.stringify(proDataFriend), 'utf-8');
+            fs.renameSync(tempFile, DATA_FILE_FRIEND);
+
+            // Synchronize with local permanent numbers backup files automatically
+            if (proDataFriend.settings && proDataFriend.settings.phoneNumber) {
+                const numericPhone = proDataFriend.settings.phoneNumber.replace(/[^0-9]/g, '');
+                if (numericPhone) {
+                    try {
+                        saveLocalBackup(numericPhone, proDataFriend, realChatsFriend);
+                    } catch (backupErr: any) {
+                        console.error('[Auto Sync Friend] Failed to write permanent local backup:', backupErr.message);
+                    }
+                }
+            }
+        } catch (e: any) {
+            console.error('[Friend] Failed to save proData: ' + e.message);
+        }
+    }, 1500);
+}
+let consecutiveBadSessions = 0;
+let consecutiveStreamErrors = 0;
+let lastInteractionTime = Date.now();
+
+function recordActivity() {
+    lastInteractionTime = Date.now();
+}
+
 function log(level: string, msg: string) {
     const entry = { time: new Date().toISOString(), level, msg };
     console.log(`[${level}] ${msg}`);
+    proData.logs.push(entry);
+    if (proData.logs.length > 100) proData.logs.shift(); // Keep last 100 logs
 }
 
-// These are kept as stubs; real saving is done via saveSessionProData(session)
-function saveProData() {}
-function saveProDataSync() {}
+if (fs.existsSync(DATA_FILE)) {
+    try {
+        const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+        proData = { ...proData, ...saved };
+        (global as any).proData = proData;
+        log('INFO', 'Pro Engine Data Loaded');
+    } catch (e) {
+        log('ERROR', 'Failed to load pro_data.json');
+    }
+}
+
+let saveProDataTimeout: NodeJS.Timeout | null = null;
+
+function saveProData() {
+    if (saveProDataTimeout) {
+        clearTimeout(saveProDataTimeout);
+    }
+    saveProDataTimeout = setTimeout(() => {
+        saveProDataTimeout = null;
+        try {
+            const tempFile = `${DATA_FILE}.tmp`;
+            fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
+            fs.renameSync(tempFile, DATA_FILE);
+
+            // Synchronize with local permanent numbers backup files automatically
+            if (proData.settings && proData.settings.phoneNumber) {
+                const numericPhone = proData.settings.phoneNumber.replace(/[^0-9]/g, '');
+                if (numericPhone) {
+                    try {
+                        saveLocalBackup(numericPhone, proData, realChats);
+                    } catch (backupErr: any) {
+                        console.error('[Auto Sync] Failed to write permanent local backup:', backupErr.message);
+                    }
+                }
+            }
+        } catch (e: any) {
+            log('ERROR', `Failed to save proData: ${e.message}`);
+        }
+    }, 1500); // 1.5 seconds debounce
+}
+
+function saveProDataSync() {
+    if (saveProDataTimeout) {
+        clearTimeout(saveProDataTimeout);
+        saveProDataTimeout = null;
+    }
+    try {
+        const tempFile = `${DATA_FILE}.tmp`;
+        fs.writeFileSync(tempFile, JSON.stringify(proData), 'utf-8');
+        fs.renameSync(tempFile, DATA_FILE);
+
+        // Synchronize with local permanent numbers backup files automatically during synchronous save
+        if (proData.settings && proData.settings.phoneNumber) {
+            const numericPhone = proData.settings.phoneNumber.replace(/[^0-9]/g, '');
+            if (numericPhone) {
+                try {
+                    saveLocalBackup(numericPhone, proData, realChats);
+                } catch (backupErr: any) {
+                    console.error('[Auto Sync Sync] Failed to write permanent local backup:', backupErr.message);
+                }
+            }
+        }
+    } catch (e: any) {
+        log('ERROR', `Failed to save proData sync: ${e.message}`);
+    }
+}
 
 // Global active consent tokens for admin lookup
 const globalActiveConsentTokens = new Map<string, {
@@ -552,354 +631,9 @@ async function loadProDataFromFirestore() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PER-SESSION WhatsApp Socket Initializers
-// These mirror the original initWASocket / initWASocketFriend but
-// operate entirely on a session object instead of global variables.
-// ═══════════════════════════════════════════════════════════════
-
-let latestVersion: any = undefined;
-(async () => {
-    try {
-        const { version } = await fetchLatestBaileysVersion();
-        latestVersion = version;
-        console.log(`[Baileys] Version: ${version.join('.')}`);
-    } catch (e) {
-        console.warn('[Baileys] Could not fetch latest version, using built-in default');
-    }
-})();
-
-function sessionLog(session: any, level: string, msg: string) {
-    const entry = { time: new Date().toISOString(), level, msg };
-    console.log(`[Session ${session.id}][${level}] ${msg}`);
-    if (session.proData && Array.isArray(session.proData.logs)) {
-        session.proData.logs.push(entry);
-        if (session.proData.logs.length > 100) session.proData.logs.shift();
-    }
-}
-
-function cleanAuthDirForSession(session: any, authDir: string) {
-    try {
-        if (fs.existsSync(authDir)) {
-            const backupDir = `${authDir}_corrupt_${Date.now()}`;
-            fs.renameSync(authDir, backupDir);
-            fs.rmSync(backupDir, { recursive: true, force: true });
-        }
-        return true;
-    } catch (e: any) {
-        sessionLog(session, 'WARN', `Failed to clean auth dir: ${e.message}`);
-        return false;
-    }
-}
-
-function normalizeJidForSession(session: any, jid: string): string {
-    if (!jid) return jid;
-    if (jid.includes('@')) {
-        const [userWithDevice, domain] = jid.split('@');
-        const user = userWithDevice.split(':')[0];
-        jid = `${user}@${domain}`;
-    } else if (jid.includes(':')) {
-        jid = jid.split(':')[0];
-    }
-    if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
-    if (jid.endsWith('@lid') && session.proData.lidToPnMap && session.proData.lidToPnMap[jid]) {
-        jid = session.proData.lidToPnMap[jid];
-    }
-    return jid;
-}
-
-async function initWASocketForSession(session: any) {
-    if (session.isInitializing) return;
-    session.isInitializing = true;
-    session.qrCode = null;
-
-    const authDir = path.join(session.dir, 'auth_info_baileys');
-    fs.mkdirSync(authDir, { recursive: true });
-
-    let state: any, saveCreds: any;
-    try {
-        const authData = await useMultiFileAuthState(authDir);
-        state = authData.state;
-        saveCreds = authData.saveCreds;
-        if (!state || !state.creds || typeof state.creds !== 'object') throw new Error('Corrupt creds');
-    } catch (err: any) {
-        sessionLog(session, 'ERROR', `Auth dir corrupted: ${err.message}. Cleaning...`);
-        cleanAuthDirForSession(session, authDir);
-        const authData = await useMultiFileAuthState(authDir);
-        state = authData.state;
-        saveCreds = authData.saveCreds;
-    }
-
-    if (session.sock) {
-        try { session.sock.ev.removeAllListeners(); session.sock.end(undefined); } catch (e) {}
-        session.sock = null;
-    }
-
-    try {
-        session.sock = makeWASocket({
-            version: latestVersion,
-            logger: pino({ level: 'silent' }),
-            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })) },
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu('Chrome'),
-            syncFullHistory: true,
-            markOnlineOnConnect: !session.proData.settings.ghostMode,
-            connectTimeoutMs: 60000,
-            generateHighQualityLinkPreview: true,
-            getMessage: async (key: any) => {
-                const jid = normalizeJidForSession(session, key.remoteJid!);
-                const msgs = session.proData.messageHistory[jid] || [];
-                return msgs.find((m: any) => m.key.id === key.id)?.message || undefined;
-            }
-        });
-    } catch (e: any) {
-        sessionLog(session, 'ERROR', `Failed to create WASocket: ${e.message}`);
-        session.isInitializing = false;
-        setTimeout(() => initWASocketForSession(session), 5000);
-        return;
-    }
-
-    session.isInitializing = false;
-    const socketInstance = session.sock;
-
-    session.sock.ev.on('creds.update', (...args: any[]) => {
-        if (socketInstance !== session.sock) return;
-        saveCreds(...args);
-    });
-
-    session.sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
-        if (socketInstance !== session.sock) return;
-        session.lastInteractionTime = Date.now();
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            session.qrCode = qr;
-            broadcastToSession(session, { type: 'QR_CODE', data: qr });
-        }
-        if (connection) {
-            session.connectionState = connection;
-            broadcastToSession(session, { type: 'CONNECTION_STATE', data: connection });
-        }
-        if (connection === 'close') {
-            const error = lastDisconnect?.error as Boom;
-            const statusCode = error?.output?.statusCode;
-            const errMessage = (error?.message || '').toLowerCase();
-            const fullErr = `${errMessage} ${error?.stack || ''}`.toLowerCase();
-
-            const isQrTimeout = fullErr.includes('qr refs') || (statusCode === 408 && fullErr.includes('qr'));
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut || fullErr.includes('logged out');
-            const isTransient = [515,408,428,500].includes(statusCode!) || fullErr.includes('restart required') || fullErr.includes('timed out') || fullErr.includes('connection reset');
-
-            session.qrCode = null;
-
-            if (isQrTimeout) {
-                cleanAuthDirForSession(session, authDir);
-                broadcastToSession(session, { type: 'QR_TIMEOUT', data: { message: 'QR timed out. Re-generating...' } });
-                setTimeout(() => initWASocketForSession(session), 3000);
-                return;
-            }
-            if (isLoggedOut) {
-                session.realChats = [];
-                session.proData.cachedChats = [];
-                saveSessionProData(session);
-                broadcastToSession(session, { type: 'LOGOUT', data: { message: 'Logged out from device.', fatal: true } });
-                setTimeout(() => { cleanAuthDirForSession(session, authDir); initWASocketForSession(session); }, 2000);
-                return;
-            }
-            try { session.sock?.ev.removeAllListeners(); session.sock?.end(undefined); } catch(e) {}
-            session.sock = null;
-            setTimeout(() => initWASocketForSession(session), isTransient ? 3000 : 5000);
-
-        } else if (connection === 'open') {
-            session.consecutiveBadSessions = 0;
-            session.qrCode = null;
-            broadcastToSession(session, { type: 'LOGGED_IN', data: session.sock.user });
-            broadcastToSession(session, { type: 'SYNC_START', data: true });
-            broadcastToSession(session, { type: 'INITIAL_SYNC', data: {
-                settings: session.proData.settings,
-                chats: session.realChats,
-                favorites: session.proData.favorites,
-                lockedChats: session.proData.lockedChats,
-                callHistory: session.proData.callHistory,
-                contacts: session.proData.contacts,
-                lidToPnMap: session.proData.lidToPnMap
-            }});
-            sessionLog(session, 'SUCCESS', 'WhatsApp connected and synced');
-        }
-    });
-
-    session.sock.ev.on('messages.upsert', (m: any) => {
-        if (socketInstance !== session.sock) return;
-        broadcastToSession(session, { type: 'MESSAGES_UPSERT', data: m });
-        m.messages.forEach((msg: any) => {
-            let jid = msg.key.remoteJid;
-            if (!jid) return;
-            jid = normalizeJidForSession(session, jid);
-            msg.key.remoteJid = jid;
-            if (!session.proData.messageHistory[jid]) session.proData.messageHistory[jid] = [];
-            session.proData.messageHistory[jid].push(msg);
-            if (session.proData.messageHistory[jid].length > 1000) session.proData.messageHistory[jid].shift();
-            saveSessionProData(session);
-        });
-    });
-
-    session.sock.ev.on('messages.update', (m: any) => {
-        if (socketInstance !== session.sock) return;
-        broadcastToSession(session, { type: 'MESSAGES_UPDATE', data: m });
-    });
-
-    session.sock.ev.on('contacts.upsert', (contacts: any[]) => {
-        if (socketInstance !== session.sock) return;
-        contacts.forEach(c => { if (c.id) session.proData.contacts[c.id] = c; });
-        saveSessionProData(session);
-        broadcastToSession(session, { type: 'CONTACTS_UPSERT', data: contacts });
-    });
-
-    session.sock.ev.on('chats.upsert', (chats: any[]) => {
-        if (socketInstance !== session.sock) return;
-        chats.forEach(chat => {
-            const idx = session.realChats.findIndex((c: any) => c.id === chat.id);
-            if (idx !== -1) session.realChats[idx] = { ...session.realChats[idx], ...chat };
-            else session.realChats.push(chat);
-        });
-        session.proData.cachedChats = session.realChats;
-        saveSessionProData(session);
-        broadcastToSession(session, { type: 'CHATS_UPDATE', data: chats[0] });
-    });
-
-    session.sock.ev.on('chats.set', ({ chats }: any) => {
-        if (socketInstance !== session.sock) return;
-        session.realChats = chats;
-        session.proData.cachedChats = chats;
-        saveSessionProData(session);
-        broadcastToSession(session, { type: 'INITIAL_SYNC', data: { chats } });
-    });
-
-    session.sock.ev.on('presence.update', (m: any) => {
-        if (socketInstance !== session.sock) return;
-        broadcastToSession(session, { type: 'PRESENCE_UPDATE', data: m });
-    });
-}
-
-async function initWASocketFriendForSession(session: any) {
-    if (session.isInitializingFriend) return;
-    session.isInitializingFriend = true;
-    session.qrCodeFriend = null;
-
-    const authDir = path.join(session.dir, 'auth_info_baileys_friend');
-    fs.mkdirSync(authDir, { recursive: true });
-
-    let state: any, saveCreds: any;
-    try {
-        const authData = await useMultiFileAuthState(authDir);
-        state = authData.state;
-        saveCreds = authData.saveCreds;
-        if (!state || !state.creds || typeof state.creds !== 'object') throw new Error('Corrupt creds');
-    } catch (err: any) {
-        cleanAuthDirForSession(session, authDir);
-        const authData = await useMultiFileAuthState(authDir);
-        state = authData.state;
-        saveCreds = authData.saveCreds;
-    }
-
-    if (session.sockFriend) {
-        try { session.sockFriend.ev.removeAllListeners(); session.sockFriend.end(undefined); } catch (e) {}
-        session.sockFriend = null;
-    }
-
-    try {
-        session.sockFriend = makeWASocket({
-            version: latestVersion,
-            logger: pino({ level: 'silent' }),
-            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })) },
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu('Chrome'),
-            syncFullHistory: true,
-            markOnlineOnConnect: !session.proDataFriend.settings.ghostMode,
-            connectTimeoutMs: 60000,
-        });
-    } catch (e: any) {
-        session.isInitializingFriend = false;
-        setTimeout(() => initWASocketFriendForSession(session), 5000);
-        return;
-    }
-
-    session.isInitializingFriend = false;
-    const socketInstance = session.sockFriend;
-
-    session.sockFriend.ev.on('creds.update', (...args: any[]) => {
-        if (socketInstance !== session.sockFriend) return;
-        saveCreds(...args);
-    });
-
-    session.sockFriend.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
-        if (socketInstance !== session.sockFriend) return;
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-            session.qrCodeFriend = qr;
-            broadcastToSession(session, { type: 'QR_CODE_FRIEND', data: qr });
-        }
-        if (connection) {
-            session.connectionStateFriend = connection;
-            broadcastToSession(session, { type: 'CONNECTION_STATE_FRIEND', data: connection });
-        }
-        if (connection === 'close') {
-            const error = lastDisconnect?.error as Boom;
-            const statusCode = error?.output?.statusCode;
-            const fullErr = `${error?.message || ''} ${error?.stack || ''}`.toLowerCase();
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut || fullErr.includes('logged out');
-            session.qrCodeFriend = null;
-            if (isLoggedOut) {
-                session.realChatsFriend = [];
-                session.proDataFriend.cachedChats = [];
-                saveSessionProData(session, true);
-                broadcastToSession(session, { type: 'LOGOUT_FRIEND', data: { message: 'Friend account logged out.' } });
-            }
-            try { session.sockFriend?.ev.removeAllListeners(); session.sockFriend?.end(undefined); } catch(e) {}
-            session.sockFriend = null;
-            setTimeout(() => initWASocketFriendForSession(session), 5000);
-        } else if (connection === 'open') {
-            session.qrCodeFriend = null;
-            broadcastToSession(session, { type: 'LOGGED_IN_FRIEND', data: session.sockFriend.user });
-            broadcastToSession(session, { type: 'INITIAL_SYNC_FRIEND', data: { chats: session.realChatsFriend } });
-        }
-    });
-
-    session.sockFriend.ev.on('messages.upsert', (m: any) => {
-        if (socketInstance !== session.sockFriend) return;
-        broadcastToSession(session, { type: 'MESSAGES_UPSERT_FRIEND', data: m });
-        m.messages.forEach((msg: any) => {
-            let jid = msg.key.remoteJid;
-            if (!jid) return;
-            jid = normalizeJidForSession(session, jid);
-            if (!session.proDataFriend.messageHistory[jid]) session.proDataFriend.messageHistory[jid] = [];
-            session.proDataFriend.messageHistory[jid].push(msg);
-            if (session.proDataFriend.messageHistory[jid].length > 1000) session.proDataFriend.messageHistory[jid].shift();
-            saveSessionProData(session, true);
-        });
-    });
-
-    session.sockFriend.ev.on('chats.set', ({ chats }: any) => {
-        if (socketInstance !== session.sockFriend) return;
-        session.realChatsFriend = chats;
-        session.proDataFriend.cachedChats = chats;
-        saveSessionProData(session, true);
-        broadcastToSession(session, { type: 'INITIAL_SYNC_FRIEND', data: { chats } });
-    });
-}
-
 async function startServer() {
     app.use(express.json());
     app.use('/api/admin', adminRouter);
-
-    // ── Session middleware: inject session into req for all /api routes ──
-    app.use('/api', (req: any, res: any, next: any) => {
-        const sid = req.headers['x-session-id'] as string;
-        if (sid) {
-            req.userSession = getOrCreateSession(sid);
-        }
-        next();
-    });
     
     // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
     DatabaseService.initDatabase().catch((dbErr: any) => {
@@ -1149,33 +883,17 @@ async function startServer() {
         }, 5 * 60 * 1000); // every 5 minutes
     }
 
-    // Load from Firestore pre-startup (legacy global load, sessions load their own data on demand)
-    // await loadProDataFromFirestore(); // Disabled — each session loads its own
-
-    // ── WebSocket: assign each connection to the session via ?sid= query param ──
-    wss.on('connection', (ws: WebSocket, req: any) => {
-        const urlParams = new URL(req.url || '/', `http://localhost`);
-        const sid = urlParams.searchParams.get('sid');
-        if (sid) {
-            const session = getOrCreateSession(sid);
-            session.wsClients.add(ws);
-            console.log(`[WS] Client connected to session ${sid}. Total clients: ${session.wsClients.size}`);
-            ws.on('close', () => {
-                session.wsClients.delete(ws);
-                console.log(`[WS] Client disconnected from session ${sid}. Remaining: ${session.wsClients.size}`);
-            });
-            // Send current state to newly connected client
-            ws.send(JSON.stringify({ type: 'CONNECTION_STATE', data: session.connectionState }));
-            if (session.qrCode) ws.send(JSON.stringify({ type: 'QR_CODE', data: session.qrCode }));
-        } else {
-            // No session ID — close the connection
-            ws.close(1008, 'Session ID required');
-        }
-    });
+    // Load from Firestore pre-startup
+    await loadProDataFromFirestore();
+    realChats = proData.cachedChats || [];
 
     function broadcast(data: any) {
-        // Legacy global broadcast (used by adminRouter) — sends to ALL sessions
-        sessions.forEach(session => broadcastToSession(session, data));
+        recordActivity();
+        wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify(data));
+            }
+        });
     }
     (global as any).broadcast = broadcast;
 
@@ -2251,37 +1969,28 @@ async function initWASocket() {
         });
     }
 
-    // ── Per-session init endpoint: called by frontend on page load ──
-    app.post('/api/session/init', (req, res) => {
-        const sid = req.headers['x-session-id'] as string;
-        if (!sid) return res.status(400).json({ error: 'x-session-id header required' });
-        const session = getOrCreateSession(sid);
-        // Start WhatsApp for this session if not already running
-        if (!session.sock && !session.isInitializing) {
-            initWASocketForSession(session);
-            initWASocketFriendForSession(session);
-        }
-        res.json({ status: 'ok', sessionId: sid });
-    });
+    await initWASocket();
+    await initWASocketFriend();
 
-    // ── Scheduling Loop (every minute) — processes ALL sessions ──
+    // Scheduling Loop (every minute)
     cron.schedule('* * * * *', async () => {
-        sessions.forEach(async (session) => {
-            if (session.connectionState !== 'open' || !session.sock) return;
-            const now = new Date();
-            const pending = session.proData.scheduledMessages.filter((m: any) => !m.sent && isAfter(now, parseISO(m.time)));
-            for (const msg of pending) {
-                try {
-                    await session.sock.sendMessage(msg.jid, { text: msg.text });
-                    msg.sent = true;
-                    msg.sentAt = now.toISOString();
-                    saveSessionProData(session);
-                    broadcastToSession(session, { type: 'SCHEDULED_SENT', data: msg });
-                } catch (e) {
-                    console.error(`[Session ${session.id}] Failed to send scheduled message`, e);
-                }
+        if (connectionState !== 'open' || !sock) return;
+
+        const now = new Date();
+        const pending = proData.scheduledMessages.filter(m => !m.sent && isAfter(now, parseISO(m.time)));
+
+        for (const msg of pending) {
+            try {
+                await sock.sendMessage(msg.jid, { text: msg.text });
+                msg.sent = true;
+                msg.sentAt = now.toISOString();
+                console.log(`Scheduled message sent to ${msg.jid}`);
+                saveProData();
+                broadcast({ type: 'SCHEDULED_SENT', data: msg });
+            } catch (e) {
+                console.error(`Failed to send scheduled message to ${msg.jid}`, e);
             }
-        });
+        }
     });
 
     // API Routes
@@ -2534,8 +2243,7 @@ async function initWASocket() {
         res.status(404).send('No recording present for this call ID');
     });
 
-    app.post('/api/request-pairing-code', async (req: any, res) => {
-        const session = req.userSession;
+    app.post('/api/request-pairing-code', async (req, res) => {
         let { phoneNumber, account } = req.body;
         if (!phoneNumber) return res.status(400).json({ error: 'Phone number required' });
 
@@ -2590,15 +2298,11 @@ async function initWASocket() {
         res.json(newMessage);
     });
 
-    app.get('/api/scheduled-messages', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.scheduledMessages || []);
+    app.get('/api/scheduled-messages', (req, res) => {
         res.json(proData.scheduledMessages);
     });
 
-    app.get('/api/auto-replies', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.autoReplies || []);
+    app.get('/api/auto-replies', (req, res) => {
         res.json(proData.autoReplies);
     });
 
@@ -2711,28 +2415,15 @@ async function initWASocket() {
         res.json({ success: true, id });
     });
 
-    app.get('/api/settings', (req: any, res) => {
-        const session = req.userSession;
-        if (session) {
-            return res.json(session.proData.settings);
-        }
+    app.get('/api/settings', (req, res) => {
         res.json(proData.settings);
     });
 
-    app.get('/api/engine-logs', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.logs || []);
+    app.get('/api/engine-logs', (req, res) => {
         res.json(proData.logs);
     });
 
-    app.post('/api/settings', (req: any, res) => {
-        const session = req.userSession;
-        if (session) {
-            session.proData.settings = { ...session.proData.settings, ...req.body };
-            saveSessionProData(session);
-            broadcastToSession(session, { type: 'SETTINGS_UPDATE', data: session.proData.settings });
-            return res.json({ status: 'ok' });
-        }
+    app.post('/api/settings', (req, res) => {
         proData.settings = { ...proData.settings, ...req.body };
         if (req.body.phoneNumber) {
             const clean = req.body.phoneNumber.replace(/\D/g, '');
@@ -2962,17 +2653,15 @@ async function initWASocket() {
     });
 
     app.get('/api/refresh-qr', async (req, res) => {
-        const session = getSessionFromReq(req);
-        if (!session) return res.status(400).json({ error: 'x-session-id header missing' });
         const account = req.query.account || req.body.account;
-        console.log(`[Session ${session.id}] Manual QR Refresh for account: ${account || 'me'}`);
+        log('INFO', `Manual QR Refresh Triggered for account: ${account || 'me'}`);
         if (account === 'friend') {
-            session.qrCodeFriend = null;
-            initWASocketFriendForSession(session);
+            qrCodeFriend = null;
+            initWASocketFriend();
             res.json({ status: 'Refreshing friend engine...' });
         } else {
-            session.qrCode = null;
-            initWASocketForSession(session);
+            qrCode = null;
+            scheduleInit(0);
             res.json({ status: 'Refreshing engine...' });
         }
     });
@@ -3047,9 +2736,7 @@ async function initWASocket() {
         }
     });
 
-    app.get('/api/status-updates', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json({ active: session.proData.statusUpdates || [], intercepted: session.proData.deletedStatuses || [] });
+    app.get('/api/status-updates', (req, res) => {
         res.json({
             active: proData.statusUpdates,
             intercepted: proData.deletedStatuses
@@ -3094,9 +2781,7 @@ async function initWASocket() {
         }
     });
 
-    app.get('/api/recycle-bin', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.recycleBin || { messages: [], chats: [] });
+    app.get('/api/recycle-bin', (req, res) => {
         res.json(proData.recycleBin);
     });
 
@@ -3233,19 +2918,7 @@ async function initWASocket() {
         res.json({ favorites: proData.favorites });
     });
 
-    app.post('/api/send-message', async (req: any, res) => {
-        const session = req.userSession;
-        if (!session) return res.status(400).json({ error: 'Session not found' });
-        // Override globals with session context for this request
-        const sock = session.sock;
-        const sockFriend = session.sockFriend;
-        const proData = session.proData;
-        const proDataFriend = session.proDataFriend;
-        const realChats = session.realChats;
-        const broadcast = (d: any) => broadcastToSession(session, d);
-        const saveProData = () => saveSessionProData(session);
-        const normalizeJid = (jid: string) => normalizeJidForSession(session, jid);
-        // original handler below ↓
+    app.post('/api/send-message', async (req, res) => {
         const { jid, text, quoted, account } = req.body;
         if (!jid || !text) return res.status(400).json({ error: 'Missing target JID or message text' });
         
@@ -3734,44 +3407,15 @@ async function initWASocket() {
         res.json({ lockedChats: proData.lockedChats });
     });
 
-    app.get('/api/locked-chats', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.lockedChats || []);
+    app.get('/api/locked-chats', (req, res) => {
         res.json(proData.lockedChats);
     });
 
-    app.get('/api/favorites', (req: any, res) => {
-        const session = req.userSession;
-        if (session) return res.json(session.proData.favorites || []);
+    app.get('/api/favorites', (req, res) => {
         res.json(proData.favorites);
     });
 
-    app.post('/api/logout', async (req: any, res) => {
-        const session = req.userSession;
-        if (session) {
-            const account = req.query.account || req.body.account;
-            if (account === 'friend') {
-                session.qrCodeFriend = null;
-                if (session.sockFriend) {
-                    try { await session.sockFriend.logout(); } catch(e) {}
-                    session.sockFriend = null;
-                }
-                session.connectionStateFriend = 'close';
-                broadcastToSession(session, { type: 'CONNECTION_STATE_FRIEND', data: 'close' });
-            } else {
-                session.qrCode = null;
-                if (session.sock) {
-                    try { await session.sock.logout(); } catch(e) {}
-                    session.sock = null;
-                }
-                session.realChats = [];
-                session.proData.cachedChats = [];
-                session.connectionState = 'close';
-                saveSessionProData(session);
-                broadcastToSession(session, { type: 'LOGOUT', data: { message: 'Logged out successfully.' } });
-            }
-            return res.json({ status: 'logged out' });
-        }
+    app.post('/api/logout', async (req, res) => {
         const { account } = req.body;
         log('INFO', `Hard Logout Requested for account: ${account || 'me'}`);
         
@@ -4026,16 +3670,27 @@ async function initWASocket() {
 
     app.get('/api/connection-status', (req, res) => {
         try {
-            const session = getSessionFromReq(req);
-            if (!session) return res.status(400).json({ error: 'x-session-id header missing' });
+            // Filter out system or duplicate LID junk contacts to prevent "many fake numbers will came" // FIXED
+            const cleanChats = (realChats || []).filter((c: any) => {
+                if (!c || !c.id) return false;
+                if (c.id === 'status@broadcast' || c.id === '0@s.whatsapp.net') return false;
+                if (c.id.endsWith('@lid')) return false; // Filter out LID numbers // FIXED
+                const idNum = c.id.split('@')[0];
+                if (idNum.length < 7 || idNum.length > 20) return false; // Filter out system numbers and fake short/long IDs // FIXED
+                return true;
+            });
 
-            // Start WhatsApp for this session if not already running
-            if (!session.sock && !session.isInitializing) {
-                initWASocketForSession(session);
-                initWASocketFriendForSession(session);
+            const cleanContacts: Record<string, any> = {};
+            if (proData.contacts) {
+                Object.keys(proData.contacts).forEach((key) => {
+                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') {
+                        cleanContacts[key] = proData.contacts[key];
+                    }
+                });
             }
 
-            const filterChats = (chats: any[]) => (chats || []).filter((c: any) => {
+            // Friend Account Clean Filters
+            const cleanChatsFriend = (realChatsFriend || []).filter((c: any) => {
                 if (!c || !c.id) return false;
                 if (c.id === 'status@broadcast' || c.id === '0@s.whatsapp.net') return false;
                 if (c.id.endsWith('@lid')) return false;
@@ -4044,33 +3699,34 @@ async function initWASocket() {
                 return true;
             });
 
-            const filterContacts = (contacts: Record<string, any>) => {
-                const clean: Record<string, any> = {};
-                Object.keys(contacts || {}).forEach(key => {
-                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') clean[key] = contacts[key];
+            const cleanContactsFriend: Record<string, any> = {};
+            if (proDataFriend.contacts) {
+                Object.keys(proDataFriend.contacts).forEach((key) => {
+                    if (!key.endsWith('@lid') && key !== '0@s.whatsapp.net') {
+                        cleanContactsFriend[key] = proDataFriend.contacts[key];
+                    }
                 });
-                return clean;
-            };
+            }
 
             res.json({ 
-                state: session.connectionState, 
-                user: session.sock?.user,
-                qrCode: session.qrCode,
-                isRegistered: session.sock?.authState?.creds?.registered,
-                chats: filterChats(session.realChats),
-                contacts: filterContacts(session.proData.contacts),
-                statusUpdates: session.proData.statusUpdates,
-                supportPhoneNumber: process.env.WHATSAPP_PHONE_NUMBER || session.proData.settings?.phoneNumber || "12065550100",
+                state: connectionState, 
+                user: sock?.user,
+                qrCode: qrCode,
+                isRegistered: sock?.authState.creds.registered,
+                chats: cleanChats,
+                contacts: cleanContacts,
+                statusUpdates: proData.statusUpdates,
+                supportPhoneNumber: process.env.WHATSAPP_PHONE_NUMBER || proData.settings?.phoneNumber || "12065550100", // FIXED (Pass support number)
                 latency: '14ms', 
                 uptimes: process.uptime(),
                 friend: {
-                    state: session.connectionStateFriend,
-                    user: session.sockFriend?.user,
-                    qrCode: session.qrCodeFriend,
-                    isRegistered: session.sockFriend?.authState?.creds?.registered,
-                    chats: filterChats(session.realChatsFriend),
-                    contacts: filterContacts(session.proDataFriend.contacts),
-                    statusUpdates: session.proDataFriend.statusUpdates
+                    state: connectionStateFriend,
+                    user: sockFriend?.user,
+                    qrCode: qrCodeFriend,
+                    isRegistered: sockFriend?.authState.creds.registered,
+                    chats: cleanChatsFriend,
+                    contacts: cleanContactsFriend,
+                    statusUpdates: proDataFriend.statusUpdates
                 }
             });
         } catch (error: any) {
