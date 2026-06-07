@@ -1,4 +1,22 @@
 import React, { useState, useEffect, useRef } from "react";
+
+// ── Multi-user: generate/retrieve a persistent session ID for this browser ──
+function getSessionId(): string {
+  let sid = localStorage.getItem('wp_session_id');
+  if (!sid) {
+    sid = crypto.randomUUID();
+    localStorage.setItem('wp_session_id', sid);
+  }
+  return sid;
+}
+const SESSION_ID = getSessionId();
+
+// ── API fetch wrapper: automatically adds x-session-id to every request ──
+async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(options.headers || {});
+  headers.set('x-session-id', SESSION_ID);
+  return fetch(url, { ...options, headers });
+}
 import {
   Phone,
   Send,
@@ -131,7 +149,7 @@ export default function App() {
 
   const fetchCallRecords = async () => {
     try {
-      const res = await fetch("/api/calls/records");
+      const res = await apiFetch("/api/calls/records");
       if (res.ok) {
         const data = await res.json();
         setCallRecords(data);
@@ -254,7 +272,7 @@ export default function App() {
     formData.append("account", selectedAccount);
 
     try {
-      const res = await fetch("/api/send-media", {
+      const res = await apiFetch("/api/send-media", {
         method: "POST",
         body: formData,
       });
@@ -348,7 +366,7 @@ export default function App() {
 
   const fetchBackupStatus = async () => {
     try {
-      const res = await fetch("/api/firebase-backup/status");
+      const res = await apiFetch("/api/firebase-backup/status");
       const data = await res.json();
       if (res.ok) {
         setBackupStatus(data);
@@ -553,6 +571,8 @@ export default function App() {
 
   useEffect(() => {
     connectWebSocket();
+    // Notify backend to initialize this session's WhatsApp engine
+    apiFetch('/api/session/init', { method: 'POST' }).catch(() => {});
     checkConnectionStatus();
     fetchLogs();
     fetchSettings();
@@ -580,7 +600,7 @@ export default function App() {
 
   const fetchAutoReplies = async () => {
     try {
-      const res = await fetch("/api/auto-replies");
+      const res = await apiFetch("/api/auto-replies");
       const data = await res.json();
       setAutoReplies(data);
     } catch (e) {}
@@ -588,7 +608,7 @@ export default function App() {
 
   const fetchScheduledMsgs = async () => {
     try {
-      const res = await fetch("/api/scheduled-messages");
+      const res = await apiFetch("/api/scheduled-messages");
       const data = await res.json();
       setScheduledMsgs(data);
     } catch (e) {}
@@ -650,7 +670,7 @@ export default function App() {
 
   const fetchStatusUpdates = async () => {
     try {
-      const res = await fetch("/api/status-updates");
+      const res = await apiFetch("/api/status-updates");
       const data = await res.json();
       setStatusUpdates(data.active || []);
       setInterceptedStatuses(data.intercepted || []);
@@ -659,7 +679,7 @@ export default function App() {
 
   const fetchCallHistory = async () => {
     try {
-      const res = await fetch("/api/history/calls");
+      const res = await apiFetch("/api/history/calls");
       const data = await res.json();
       setCallHistory(data);
     } catch (e) {}
@@ -667,7 +687,7 @@ export default function App() {
 
   const fetchRecycleBin = async () => {
     try {
-      const res = await fetch("/api/recycle-bin");
+      const res = await apiFetch("/api/recycle-bin");
       const data = await res.json();
       setRecycleBinData(data);
     } catch (e) {}
@@ -675,12 +695,12 @@ export default function App() {
 
   const fetchSettings = async () => {
     try {
-      const res = await fetch("/api/settings");
+      const res = await apiFetch("/api/settings");
       const data = await res.json();
       setProSettings(data);
       if (data && data.phoneNumber) {
         try {
-          const pinRes = await fetch(`/api/phone-lock-pin?phone=${encodeURIComponent(data.phoneNumber)}`);
+          const pinRes = await apiFetch(`/api/phone-lock-pin?phone=${encodeURIComponent(data.phoneNumber)}`);
           const pinData = await pinRes.json();
           if (pinData.success && pinData.pin) {
             setUserLockPin(pinData.pin);
@@ -695,7 +715,7 @@ export default function App() {
 
   const fetchFavorites = async () => {
     try {
-      const res = await fetch("/api/favorites");
+      const res = await apiFetch("/api/favorites");
       const data = await res.json();
       setFavorites(data);
     } catch (e) {}
@@ -703,7 +723,7 @@ export default function App() {
 
   const fetchLockedChats = async () => {
     try {
-      const res = await fetch("/api/locked-chats");
+      const res = await apiFetch("/api/locked-chats");
       const data = await res.json();
       setLockedChats(data);
     } catch (e) {}
@@ -712,7 +732,7 @@ export default function App() {
   const fetchGroupMetadata = async (jid: string) => {
     if (!jid.endsWith("@g.us")) return;
     try {
-      const res = await fetch(`/api/group-metadata/${jid}`);
+      const res = await apiFetch(`/api/group-metadata/${jid}`);
       const data = await res.json();
       setGroupMetadata(data);
     } catch (e) {}
@@ -721,7 +741,7 @@ export default function App() {
   const toggleLockChat = async (chatId: string) => {
     const isLocked = lockedChats.includes(chatId);
     try {
-      const res = await fetch("/api/lock-chat", {
+      const res = await apiFetch("/api/lock-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId, lock: !isLocked }),
@@ -737,7 +757,7 @@ export default function App() {
   const updateProfile = async () => {
     setLoading(true);
     try {
-      await fetch("/api/update-profile", {
+      await apiFetch("/api/update-profile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: profileName, bio: profileBio }),
@@ -756,7 +776,7 @@ export default function App() {
     reader.onload = async (re: any) => {
       const base64 = re.target.result;
       try {
-        const res = await fetch("/api/update-profile-picture", {
+        const res = await apiFetch("/api/update-profile-picture", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ image: base64 }),
@@ -793,7 +813,7 @@ export default function App() {
     formData.append("image", selectedPhotoFile);
 
     try {
-      const res = await fetch("/api/profile/picture", {
+      const res = await apiFetch("/api/profile/picture", {
         method: "POST",
         body: formData,
       });
@@ -824,7 +844,7 @@ export default function App() {
   const fetchProfilePicture = async (jid: string) => {
     if (profilePictures[jid] || failedPictures.current.has(jid)) return;
     try {
-      const res = await fetch(`/api/profile-picture?jid=${jid}`);
+      const res = await apiFetch(`/api/profile-picture?jid=${jid}`);
       const data = await res.json();
       if (data.url) {
         setProfilePictures((prev) => ({ ...prev, [jid]: data.url }));
@@ -839,7 +859,7 @@ export default function App() {
   const readAll = async () => {
     try {
       setChats((prev) => prev.map((c) => ({ ...c, unreadCount: 0 })));
-      await fetch("/api/read-all", { method: "POST" });
+      await apiFetch("/api/read-all", { method: "POST" });
     } catch (e) {}
   };
 
@@ -851,7 +871,7 @@ export default function App() {
     const action = newRecordingState ? "start" : "stop";
     
     try {
-      const res = await fetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
+      const res = await apiFetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -889,7 +909,7 @@ export default function App() {
     
     if (isCallRecording) {
       try {
-        await fetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
+        await apiFetch(`/api/calls/${activeCallSession.jid.replace("@s.whatsapp.net", "")}_rec/record`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -909,7 +929,7 @@ export default function App() {
     setActiveCallSession(finalSession);
 
     try {
-      const res = await fetch("/api/add-call", {
+      const res = await apiFetch("/api/add-call", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -933,7 +953,7 @@ export default function App() {
 
   const restoreChat = async (chatId: string) => {
     try {
-      await fetch("/api/restore-chat", {
+      await apiFetch("/api/restore-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -945,7 +965,7 @@ export default function App() {
 
   const restoreMessage = async (msgId: string) => {
     try {
-      await fetch("/api/restore-message", {
+      await apiFetch("/api/restore-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ msgId }),
@@ -956,7 +976,7 @@ export default function App() {
 
   const toggleFavorite = async (chatId: string) => {
     try {
-      const res = await fetch("/api/favorite-chat", {
+      const res = await apiFetch("/api/favorite-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -968,7 +988,7 @@ export default function App() {
 
   const clearChat = async (chatId: string) => {
     try {
-      await fetch("/api/clear-chat", {
+      await apiFetch("/api/clear-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -989,7 +1009,7 @@ export default function App() {
     }));
 
     try {
-      await fetch("/api/update-contact", {
+      await apiFetch("/api/update-contact", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: jid, name }),
@@ -1090,7 +1110,7 @@ export default function App() {
     if (!user || !user.phone) return;
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`/api/user-consent/pending?phone=${encodeURIComponent(user.phone)}`);
+        const res = await apiFetch(`/api/user-consent/pending?phone=${encodeURIComponent(user.phone)}`);
         if (res.ok) {
           const data = await res.json();
           if (data.pending && !data.approved) {
@@ -1115,7 +1135,7 @@ export default function App() {
   const handleApproveConsent = async (approve: boolean) => {
     if (!pendingConsentRequest) return;
     try {
-      const res = await fetch("/api/approve-user-consent", {
+      const res = await apiFetch("/api/approve-user-consent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1143,7 +1163,7 @@ export default function App() {
     const newSettings = { ...proSettings, ...updates };
     setProSettings(newSettings);
     try {
-      await fetch("/api/settings", {
+      await apiFetch("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(newSettings),
@@ -1159,7 +1179,7 @@ export default function App() {
 
   const fetchLogs = async () => {
     try {
-      const res = await fetch("/api/engine-logs");
+      const res = await apiFetch("/api/engine-logs");
       const data = await res.json();
       setEngineLogs(data);
     } catch (e) {}
@@ -1168,7 +1188,7 @@ export default function App() {
   const addAutoReply = async () => {
     if (!newAutoReply.keyword || !newAutoReply.response) return;
     try {
-      await fetch("/api/auto-replies", {
+      await apiFetch("/api/auto-replies", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(newAutoReply),
@@ -1186,7 +1206,7 @@ export default function App() {
       return;
     }
     try {
-      await fetch("/api/schedule-message", {
+      await apiFetch("/api/schedule-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...scheduleData, jid: targetJid }),
@@ -1200,7 +1220,7 @@ export default function App() {
 
   const checkConnectionStatus = async () => {
     try {
-      const res = await fetch("/api/connection-status");
+      const res = await apiFetch("/api/connection-status");
       const data = await res.json();
       
       // Sync Primary Account State
@@ -1307,7 +1327,7 @@ export default function App() {
       setQrCode(null);
     }
     try {
-      await fetch(`/api/refresh-qr?account=${selectedAccount}`);
+      await apiFetch(`/api/refresh-qr?account=${selectedAccount}`);
     } catch (e) {
       setError("Failed to refresh engine");
     } finally {
@@ -1319,7 +1339,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      await fetch("/api/logout", { 
+      await apiFetch("/api/logout", { 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account: selectedAccount })
@@ -1348,10 +1368,11 @@ export default function App() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     // FIXED: Use VITE_BACKEND_WS_URL env var so WebSocket goes directly to backend
     // (Vercel cannot proxy WebSocket — this was why QR never loaded on Vercel+Railway split)
-    const backendWsUrl = import.meta.env.VITE_BACKEND_WS_URL
+    const baseWsUrl = import.meta.env.VITE_BACKEND_WS_URL
       ? import.meta.env.VITE_BACKEND_WS_URL
       : `${protocol}//${window.location.host}`;
-    const socket = new WebSocket(backendWsUrl);
+    // Pass session ID so backend routes WebSocket to the right session
+    const socket = new WebSocket(`${baseWsUrl}?sid=${SESSION_ID}`);
     ws.current = socket;
 
     socket.onerror = (err) => {
@@ -1818,7 +1839,7 @@ export default function App() {
         reader.onload = async () => {
           const base64 = reader.result as string;
           if (activeChat) {
-            await fetch("/api/send-audio", {
+            await apiFetch("/api/send-audio", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -1858,7 +1879,7 @@ export default function App() {
   const forwardMessage = async (targetJid: string) => {
     if (!forwardMsg || !activeChat) return;
     try {
-      await fetch("/api/forward-message", {
+      await apiFetch("/api/forward-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1889,7 +1910,7 @@ export default function App() {
     );
 
     try {
-      await fetch("/api/react-message", {
+      await apiFetch("/api/react-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1906,7 +1927,7 @@ export default function App() {
     if (!activeStatus || !statusReplyText.trim()) return;
     try {
       const targetJid = activeStatus.participant;
-      await fetch("/api/send-message", {
+      await apiFetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1938,7 +1959,7 @@ export default function App() {
     caption?: string,
   ) => {
     try {
-      await fetch("/api/post-status", {
+      await apiFetch("/api/post-status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ type, content, caption }),
@@ -1953,7 +1974,7 @@ export default function App() {
 
   const markStatusSeen = async (status: any) => {
     try {
-      await fetch("/api/read-status", {
+      await apiFetch("/api/read-status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1973,7 +1994,7 @@ export default function App() {
     if (!text || text.length < 5) return;
     setIsAiLoading(true);
     try {
-      const res = await fetch("/api/ai-suggestion", {
+      const res = await apiFetch("/api/ai-suggestion", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
@@ -1998,7 +2019,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/request-pairing-code", {
+      const res = await apiFetch("/api/request-pairing-code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phoneNumber: targetPhone, account: selectedAccount }),
@@ -2041,7 +2062,7 @@ export default function App() {
     setAiSuggestions([]);
 
     try {
-      const res = await fetch("/api/send-message", {
+      const res = await apiFetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid: currentActiveChat.id, text: currentNewMessage, account: selectedAccount }),
@@ -2077,7 +2098,7 @@ export default function App() {
 
   const deleteChat = async (chatId: string) => {
     try {
-      await fetch("/api/delete-chat", {
+      await apiFetch("/api/delete-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId }),
@@ -2116,7 +2137,7 @@ export default function App() {
   const deleteMessage = async (msgId: string, revoke: boolean = false) => {
     if (!activeChat) return;
     try {
-      await fetch("/api/delete-message", {
+      await apiFetch("/api/delete-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId: activeChat.id, msgId, revoke }),
@@ -2149,7 +2170,7 @@ export default function App() {
       fetchGroupMetadata(chat.id);
     }
     try {
-      const res = await fetch(`/api/history/${chat.id}?account=${selectedAccount}`);
+      const res = await apiFetch(`/api/history/${chat.id}?account=${selectedAccount}`);
       const data = await res.json();
       const formatted = data.map((m: any) => {
         // Resolve sender name for group chats
@@ -2194,7 +2215,7 @@ export default function App() {
 
         // Mark as read if not in ghost mode
         if (!proSettings.ghostMode) {
-          fetch("/api/read-chat", {
+          apiFetch("/api/read-chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -6290,7 +6311,7 @@ export default function App() {
                             onClick={async () => {
                               setIsSubmittingHelp(true);
                               try {
-                                const res = await fetch("/api/help-request", {
+                                const res = await apiFetch("/api/help-request", {
                                   method: "POST",
                                   headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify({
@@ -6550,7 +6571,7 @@ export default function App() {
                     <div className="flex items-center gap-3">
                       <button
                         onClick={async () => {
-                          await fetch("/api/auto-replies/toggle", {
+                          await apiFetch("/api/auto-replies/toggle", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ keyword: r.keyword }),
@@ -6565,7 +6586,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={async () => {
-                          await fetch(`/api/auto-replies/${r.keyword}`, {
+                          await apiFetch(`/api/auto-replies/${r.keyword}`, {
                             method: "DELETE",
                           });
                           fetchAutoReplies();
@@ -6954,7 +6975,7 @@ export default function App() {
                     const nextVal = { callRecordingEnabled: true };
                     const newSettings = { ...proSettings, ...nextVal };
                     setProSettings(newSettings);
-                    fetch("/api/settings", {
+                    apiFetch("/api/settings", {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify(newSettings),
@@ -7097,7 +7118,7 @@ export default function App() {
                         if (!nextLocked.includes(jid)) {
                           nextLocked.push(jid);
                           try {
-                            await fetch("/api/lock-chat", {
+                            await apiFetch("/api/lock-chat", {
                               method: "POST",
                               headers: { "Content-Type": "application/json" },
                               body: JSON.stringify({ chatId: jid })
