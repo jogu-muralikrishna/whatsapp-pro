@@ -24,6 +24,14 @@ export default defineConfig(({mode}) => {
       } : false,
       allowedHosts: true,
       cors: true,
+      // FIXED: Proxy /api calls to backend in local dev so QR polling works
+      proxy: {
+        '/api': {
+          target: env.VITE_BACKEND_HTTP_URL || 'http://localhost:3000',
+          changeOrigin: true,
+          secure: false,
+        },
+      },
     },
   };
 });
