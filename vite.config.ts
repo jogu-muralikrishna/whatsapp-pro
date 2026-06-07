@@ -16,7 +16,12 @@ export default defineConfig(({mode}) => {
       },
     },
     server: {
-      hmr: false,
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      hmr: process.env.DISABLE_HMR !== 'true' ? {
+        host: 'ais-dev-aspgvb74inlzpp5qkugtcf-869893615825.asia-southeast1.run.app',
+        protocol: 'wss',
+        clientPort: 443
+      } : false,
       allowedHosts: true,
       cors: true,
     },

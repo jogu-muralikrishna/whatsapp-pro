@@ -50,8 +50,9 @@ const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fil
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 const logger = pino({ level: 'silent' });
-const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(process.cwd(), 'pro_data.json');
+const BASE_DATA_DIR = process.env.DATA_DIR || process.cwd();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DATA_FILE = path.join(BASE_DATA_DIR, 'pro_data.json');
 
 const app = express(); // FIXED (Move globally)
 
@@ -255,7 +256,7 @@ let proDataFriend = {
 
 (global as any).proDataFriend = proDataFriend;
 
-const DATA_FILE_FRIEND = path.join(process.cwd(), 'pro_data_friend.json');
+const DATA_FILE_FRIEND = path.join(BASE_DATA_DIR, 'pro_data_friend.json');
 if (fs.existsSync(DATA_FILE_FRIEND)) {
     try {
         const savedFriend = JSON.parse(fs.readFileSync(DATA_FILE_FRIEND, 'utf-8'));
@@ -750,7 +751,7 @@ async function startServer() {
         }
 
         // Check if creds.json exists and read it to memory to allow automatic re-authentication without QR rebuild
-        const authDir = path.join(process.cwd(), 'auth_info_baileys');
+        const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
         const oldCredsFile = path.join(authDir, 'creds.json');
         let credsBuffer: Buffer | null = null;
         if (fs.existsSync(oldCredsFile)) {
@@ -769,7 +770,7 @@ async function startServer() {
         // b. Rename the corrupt session folder
         if (fs.existsSync(authDir)) {
             try {
-                const corruptDir = path.join(process.cwd(), `auth_info_baileys_corrupt_${Date.now()}`);
+                const corruptDir = path.join(BASE_DATA_DIR, `auth_info_baileys_corrupt_${Date.now()}`);
                 fs.renameSync(authDir, corruptDir);
                 log('WARN', `Engine: Corrupt auth directory backed up and renamed to: ${path.basename(corruptDir)}`);
             } catch (e: any) {
@@ -1005,7 +1006,7 @@ async function initWASocket() {
     }
     isInitializing = true;
     qrCode = null; // Reset QR state on start
-    const authDir = path.join(process.cwd(), 'auth_info_baileys');
+    const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
     let state: any;
     let saveCreds: any;
 
@@ -1114,7 +1115,12 @@ async function initWASocket() {
                 const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
                 const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
                 
-                const isQrTimeout = fullErrorString.includes('qr refs attempts ended') || (statusCode === 408 && fullErrorString.includes('qr'));
+                const isQrTimeout = 
+                    fullErrorString.includes('qr refs attempts ended') || 
+                    fullErrorString.includes('qr refs') ||
+                    errMessage.toLowerCase().includes('qr refs') ||
+                    errMessage.toLowerCase().includes('attempts ended') ||
+                    (statusCode === 408 && (fullErrorString.includes('qr') || fullErrorString.includes('attempt') || fullErrorString.includes('timeout') || errMessage.toLowerCase().includes('qr') || errMessage.toLowerCase().includes('attempts ended') || fullErrorString.trim() === ''));
                 
                 const isLoggedOut = 
                     statusCode === DisconnectReason.loggedOut ||
@@ -1167,7 +1173,7 @@ async function initWASocket() {
                         } catch (e) {}
                         sock = null;
                     }
-                    const authDir = path.join(process.cwd(), 'auth_info_baileys');
+                    const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
                     cleanAuthDir(authDir);
                     
                     broadcast({ type: 'QR_TIMEOUT', data: { message: 'QR code pairing timed out. Re-generating fresh pairing reference...' } });
@@ -1203,7 +1209,7 @@ async function initWASocket() {
 
                     // Introduce a critical delay to let all file descriptor locks release and socket to fully dispose
                     setTimeout(() => {
-                        const authDir = path.join(process.cwd(), 'auth_info_baileys');
+                        const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
                         cleanAuthDir(authDir);
                         scheduleInit(1000);
                     }, 1500);
@@ -1691,7 +1697,7 @@ async function initWASocket() {
         qrCodeFriend = null;
         log('INFO', 'Initializing WhatsApp Pro Engine for FRIEND profile...');
         
-        const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+        const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
         let state: any;
         let saveCreds: any;
 
@@ -1794,9 +1800,18 @@ async function initWASocket() {
                 const errOutputPayloadMsg = (error?.output?.payload as any)?.message || '';
                 const fullErrorString = `${errMessage} ${errStack} ${errOutputPayloadMsg}`.toLowerCase();
                 
-                log('WARN', `Friend Connection link severed. statusCode: ${statusCode || 'none'}, error: ${errMessage}`);
+                const isQrTimeout = 
+                    fullErrorString.includes('qr refs attempts ended') || 
+                    fullErrorString.includes('qr refs') ||
+                    errMessage.toLowerCase().includes('qr refs') ||
+                    errMessage.toLowerCase().includes('attempts ended') ||
+                    (statusCode === 408 && (fullErrorString.includes('qr') || fullErrorString.includes('attempt') || fullErrorString.includes('timeout') || errMessage.toLowerCase().includes('qr') || errMessage.toLowerCase().includes('attempts ended') || fullErrorString.trim() === ''));
 
-                const isQrTimeout = fullErrorString.includes('qr refs attempts ended') || (statusCode === 408 && fullErrorString.includes('qr'));
+                if (isQrTimeout) {
+                    log('INFO', 'Friend WhatsApp QR code pairing reference expired safely. Ready for fresh scan request.');
+                } else {
+                    log('WARN', `Friend Connection link severed. statusCode: ${statusCode || 'none'}, error: ${errMessage}`);
+                }
                 const isLoggedOut = 
                     statusCode === DisconnectReason.loggedOut ||
                     fullErrorString.includes('logged out') ||
@@ -1831,7 +1846,7 @@ async function initWASocket() {
                         } catch (e) {}
                         sockFriend = null;
                     }
-                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
                     cleanAuthDir(authDirFriend);
                     
                     broadcast({ type: 'QR_TIMEOUT_FRIEND', data: { message: 'Friend QR code pairing timed out. Re-generating fresh pairing reference...' } });
@@ -1854,7 +1869,7 @@ async function initWASocket() {
                         } catch (e) {}
                         sockFriend = null;
                     }
-                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
                     cleanAuthDir(authDirFriend);
                     
                     connectionStateFriend = 'close';
@@ -1875,7 +1890,7 @@ async function initWASocket() {
                         } catch (e) {}
                         sockFriend = null;
                     }
-                    const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+                    const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
                     cleanAuthDir(authDirFriend);
                     
                     setTimeout(() => {
@@ -2539,7 +2554,7 @@ async function initWASocket() {
     });
 
     // Static service for uploaded files like profile pictures
-    const uploadsDir = path.join(process.cwd(), 'uploads');
+    const uploadsDir = path.join(BASE_DATA_DIR, 'uploads');
     fs.mkdirSync(uploadsDir, { recursive: true });
     app.use('/uploads', express.static(uploadsDir));
 
@@ -3415,7 +3430,7 @@ async function initWASocket() {
                 }
             } catch (e) {}
 
-            const authDirFriend = path.join(process.cwd(), 'auth_info_friend');
+            const authDirFriend = path.join(BASE_DATA_DIR, 'auth_info_friend');
             cleanAuthDir(authDirFriend);
 
             qrCodeFriend = null;
@@ -3438,7 +3453,7 @@ async function initWASocket() {
                 }
             } catch (e) {}
 
-            const authDir = path.join(process.cwd(), 'auth_info_baileys');
+            const authDir = path.join(BASE_DATA_DIR, 'auth_info_baileys');
             cleanAuthDir(authDir);
 
             qrCode = null;

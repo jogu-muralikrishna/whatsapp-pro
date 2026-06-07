@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
 
-const filePath = path.join(process.cwd(), 'pro_data.db.json');
+const filePath = path.join(process.env.DATA_DIR || process.cwd(), 'pro_data.db.json');
 
 function readDB(): any {
   if (!fs.existsSync(filePath)) {

@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: whatsapp-pro-terminal
+    env: node
+    plan: starter # Starter plan is required to attach persistent disks on Render
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    disk:
+      name: whatsapp-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: DATA_DIR
+        value: /data
+      - key: GEMINI_API_KEY
+        placeholder: "Your Google AI Studio Gemini API Key"
+      - key: ADMIN_EMAIL
+        value: admin@pro.com
+      - key: ADMIN_PASSWORD
+        placeholder: "Choose administrative console fallback password"
+      - key: ADMIN_JWT_SECRET
+        generateValue: true
+      - key: WHATSAPP_PHONE_NUMBER
+        value: "12065550100"
