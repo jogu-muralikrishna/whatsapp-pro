@@ -1,4 +1,4 @@
-// whatsapp-pro-main/server.ts
+// server.ts
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
@@ -10,7 +10,6 @@ import pino from 'pino';
 import cors from 'cors';
 import { DatabaseService } from './DatabaseService.js';
 
-// ESM __dirname fix
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -18,29 +17,27 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-app.use(cors({ origin: '*' }));
+app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const BASE_DATA_DIR = process.env.DATA_DIR || process.cwd();
 
-const userSockets = new Map<string, any>(); // phone -> Baileys socket
+const userSockets = new Map();
 
-// ====================== HELPER ======================
-function getCleanPhone(phone: string): string {
+// Helper
+function getCleanPhone(phone: string) {
   return phone.replace(/[^0-9]/g, '') || 'default';
 }
 
-// ====================== CONNECT USER ======================
+// Connect User
 async function connectUser(phone: string) {
-  const cleanPhone = getCleanPhone(phone);
-  if (userSockets.has(cleanPhone)) return userSockets.get(cleanPhone);
+  const clean = getCleanPhone(phone);
+  if (userSockets.has(clean)) return userSockets.get(clean);
 
-  const userDir = path.join(BASE_DATA_DIR, 'users', cleanPhone);
+  const userDir = path.join(BASE_DATA_DIR, 'users', clean);
   const authFolder = path.join(userDir, 'auth_info_baileys');
-
-  if (!fs.existsSync(authFolder)) fs.mkdirSync(authFolder, { recursive: true });
+  fs.mkdirSync(authFolder, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
@@ -51,80 +48,54 @@ async function connectUser(phone: string) {
     browser: ['WhatsApp Pro', 'Chrome', '1.0'],
   });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on('connection.update', (update) => {
+    const { qr, connection, lastDisconnect } = update;
 
     if (qr) {
       wss.clients.forEach(client => {
-        if (client.readyState === 1) {
-          client.send(JSON.stringify({ type: 'QR_CODE', phone: cleanPhone, qr }));
-        }
+        client.send(JSON.stringify({ type: 'QR_CODE', phone: clean, qr }));
       });
     }
 
     if (connection === 'open') {
-      console.log(`✅ Connected: ${cleanPhone}`);
-      wss.clients.forEach(client => client.send(JSON.stringify({ type: 'LOGGED_IN', phone: cleanPhone })));
+      console.log(`✅ ${clean} Connected`);
+      wss.clients.forEach(client => client.send(JSON.stringify({ type: 'LOGGED_IN', phone: clean })));
     }
 
     if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) {
-        setTimeout(() => connectUser(phone), 3000);
+      if ((lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut) {
+        setTimeout(() => connectUser(phone), 2000);
       }
     }
   });
 
-  sock.ev.on('messages.upsert', async (m) => {
-    try {
-      for (const msg of m.messages) {
-        await DatabaseService.insertMessage(cleanPhone, msg);
-      }
-    } catch (e) {
-      console.error('Message save error:', e);
-    }
-  });
-
-  userSockets.set(cleanPhone, sock);
+  userSockets.set(clean, sock);
   return sock;
 }
 
-// ====================== API ROUTES ======================
+// ====================== API ======================
 app.post('/api/connect', async (req, res) => {
   const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
 
-  try {
-    await DatabaseService.initDatabase(phone);
-    await connectUser(phone);
-    res.json({ success: true, message: 'Connection started' });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
+  await DatabaseService.initDatabase(phone);
+  await connectUser(phone);
+  res.json({ success: true });
 });
 
 app.get('/api/connection-status', (req, res) => {
   const { phone } = req.query;
   const clean = getCleanPhone(phone as string);
-  res.json({
-    connected: userSockets.has(clean),
-    phone: clean
-  });
+  res.json({ connected: userSockets.has(clean), phone: clean });
 });
 
-// Admin Routes (you can expand later)
-app.use('/api/admin', (req, res) => {
-  res.json({ message: "Admin API ready - multi-user supported" });
-});
-
-// Serve Frontend
+// Catch-all for frontend
 app.use(express.static(path.join(__dirname, 'dist')));
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-// ====================== START SERVER ======================
 server.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Pro Multi-User Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
