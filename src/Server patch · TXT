@@ -1,0 +1,45 @@
+=== CHANGE 1: Add after existing imports (after line 46 in original server.ts) ===
+
+// ─── MULTI-USER SUPPORT ───────────────────────────────────────────────────────
+import { initSessionManager } from './src/UserSessionManager.js';
+import { initUserEngine } from './src/MultiUserEngine.js';
+import { multiUserRouter } from './src/multiUserRouter.js';
+import { patchWSSForMultiUser } from './src/multiUserWS.js';
+import cors from 'cors';
+
+
+
+=== CHANGE 2: Inside startServer(), after app.use('/api/admin', adminRouter) ===
+
+    // ─── MULTI-USER: Init session manager + mount per-user API router ──────────
+    const { sessionManager } = await import('./src/UserSessionManager.js');
+    initSessionManager(BASE_DATA_DIR);
+    patchWSSForMultiUser(wss);
+    app.use('/api/u/:userId', multiUserRouter);
+
+    // Auto-start a "default" isolated session for backwards compatibility
+    const defaultSession = sessionManager.getOrCreate('default');
+    initUserEngine(defaultSession);
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
+
+
+=== CHANGE 3: Admin endpoint - add after /api/admin/registered-numbers handler ===
+
+    // ─── MULTI-USER: List all active isolated sessions ─────────────────────────
+    app.get('/api/admin/multi-user-sessions', adminAuthMiddleware, (req, res) => {
+        const { sessionManager: sm } = require('./src/UserSessionManager.js');
+        const sessions = sm.listUserIds().map((uid: string) => {
+            const s = sm.get(uid);
+            return {
+                userId: uid,
+                connectionState: s?.connectionState || 'unknown',
+                phone: s?.sock?.user?.id?.split(':')[0] || null,
+                hasQr: !!s?.qrCode,
+                wsClients: s?.wsClients?.size || 0,
+            };
+        });
+        res.json({ sessions });
+    });
+    // ──────────────────────────────────────────────────────────────────────────
