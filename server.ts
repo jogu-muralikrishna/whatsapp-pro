@@ -642,7 +642,7 @@ async function startServer() {
     app.use('/api/admin', adminRouter);
 
     // ─── MULTI-USER: Init session manager + mount per-user API router ──────────
-    initSessionManager(BASE_DATA_DIR);
+    const sessionManager = initSessionManager(BASE_DATA_DIR);
     patchWSSForMultiUser(wss);
     app.use('/api/u/:userId', multiUserRouter);
 
