@@ -1720,7 +1720,6 @@ export default function App() {
           }
 
           let incomingJid = msgData.key?.remoteJid;
-          if (!incomingJid) break;
           if (incomingJid.endsWith("@c.us"))
             incomingJid = incomingJid.replace("@c.us", "@s.whatsapp.net");
 
@@ -1728,57 +1727,26 @@ export default function App() {
           if (activeJid.endsWith("@c.us"))
             activeJid = activeJid.replace("@c.us", "@s.whatsapp.net");
 
-          // Build the message object for ALL incoming messages
-          const newMsg: Message = {
-            id: msgData.key.id,
-            sender:
-              msgData.pushName ||
-              getDisplayName(
-                msgData.participant || msgData.key.participant || incomingJid,
-              ),
-            text: getMsgText(msgData),
-            timestamp: msgData.messageTimestamp * 1000,
-            fromMe: !!msgData.key.fromMe,
-            status: "sent",
-            rawMessage: msgData.message,
-          };
-
           if (incomingJid === activeJid) {
-            // ── Active chat: append message directly to the message list ──
+            const newMsg: Message = {
+              id: msgData.key.id,
+              sender:
+                msgData.pushName ||
+                getDisplayName(
+                  msgData.participant || msgData.key.participant || incomingJid,
+                ),
+              text: getMsgText(msgData),
+              timestamp: msgData.messageTimestamp * 1000,
+              fromMe: msgData.key.fromMe,
+              status: "sent",
+              rawMessage: msgData.message,
+            };
             setMessages((prev) => {
               const exists = prev.some((m) => m.id === newMsg.id);
               if (exists) return prev;
               return [...prev, newMsg];
             });
             if (!newMsg.fromMe && newMsg.text) getAiSuggestions(newMsg.text);
-          } else {
-            // ── Background chat: update chat list with last message + unread badge ──
-            if (!newMsg.fromMe) {
-              setChats((prev) => {
-                const idx = prev.findIndex((c) => c.id === incomingJid);
-                if (idx !== -1) {
-                  const updated = [...prev];
-                  updated[idx] = {
-                    ...updated[idx],
-                    lastMessage: msgData,
-                    timestamp: msgData.messageTimestamp,
-                    unreadCount: (updated[idx].unreadCount || 0) + 1,
-                  };
-                  // Re-sort so this chat bubbles to the top
-                  return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-                } else {
-                  // New chat not yet in list — add it
-                  const newChat = {
-                    id: incomingJid,
-                    name: msgData.pushName || incomingJid.split("@")[0],
-                    lastMessage: msgData,
-                    timestamp: msgData.messageTimestamp,
-                    unreadCount: 1,
-                  };
-                  return [newChat, ...prev];
-                }
-              });
-            }
           }
           break;
       }
