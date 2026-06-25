@@ -1,0 +1,124 @@
+# Multi-User WhatsApp Pro — Integration Guide
+
+## What was added
+
+Three new source files live in `src/`:
+
+| File | Purpose |
+|------|---------|
+| `src/UserSessionManager.ts` | Per-user session store (proData, sock, qrCode, WS clients) |
+| `src/MultiUserEngine.ts` | Baileys socket lifecycle — one engine per user |
+| `src/multiUserRouter.ts` | Express router for all user-scoped `/api/u/:userId/*` endpoints |
+| `src/multiUserWS.ts` | WebSocket patch so each client is identified by userId |
+
+---
+
+## Minimal changes required in `server.ts`
+
+Add these lines to `server.ts` (after the existing imports):
+
+```ts
+// ─── MULTI-USER ADDITIONS ─────────────────────────────────────────────────────
+import { initSessionManager } from './src/UserSessionManager.js';
+import { initUserEngine } from './src/MultiUserEngine.js';
+import { multiUserRouter } from './src/multiUserRouter.js';
+import { patchWSSForMultiUser } from './src/multiUserWS.js';
+```
+
+Inside `startServer()`, **before** any route registrations, add:
+
+```ts
+// Init the multi-user session manager
+const sessionMgr = initSessionManager(BASE_DATA_DIR);
+
+// Patch WebSocket server for per-user routing
+patchWSSForMultiUser(wss);
+
+// Mount the multi-user API router
+// All per-user endpoints are under /api/u/:userId/...
+app.use('/api/u/:userId', multiUserRouter);
+
+// Auto-start the "default" session to keep backwards compatibility
+const defaultSession = sessionMgr.getOrCreate('default');
+initUserEngine(defaultSession);
+```
+
+---
+
+## Frontend changes
+
+### 1. WebSocket identification
+
+After opening the WebSocket, send an IDENTIFY message:
+
+```js
+const ws = new WebSocket(`ws://localhost:3000?userId=${userId}`);
+// OR after open:
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'IDENTIFY', userId: currentUserId }));
+};
+
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.userId && msg.userId !== currentUserId) return; // ignore other users' events
+  // handle msg.type: 'QR_CODE', 'CONNECTION_STATE', 'NEW_MESSAGE', etc.
+};
+```
+
+### 2. API requests
+
+Change all API calls to include the userId:
+
+**Before:**
+```js
+fetch('/api/connection-status')
+fetch('/api/send-message', { method: 'POST', body: JSON.stringify({ jid, text }) })
+```
+
+**After:**
+```js
+const uid = getCurrentUserId(); // e.g. stored in localStorage after login
+fetch(`/api/u/${uid}/connection-status`)
+fetch(`/api/u/${uid}/send-message`, { method: 'POST', body: JSON.stringify({ jid, text }) })
+```
+
+### 3. User login flow
+
+To create/start a session, call:
+```js
+// Start session and get QR
+const res = await fetch(`/api/u/${userId}/refresh-qr`);
+
+// Poll connection status
+const status = await fetch(`/api/u/${userId}/connection-status`).then(r => r.json());
+// status.qrCode contains the QR (base64 or raw string)
+// status.state: 'close' | 'connecting' | 'open'
+```
+
+---
+
+## How sessions are isolated
+
+| Resource | Isolation |
+|----------|-----------|
+| Baileys socket | One per userId |
+| Auth credentials | `auth_info_baileys_<userId>/` |
+| Message history / settings | `pro_data_<userId>.json` |
+| QR code / connection state | In-memory per session |
+| WebSocket events | Only sent to clients that IDENTIFY'd with the same userId |
+
+---
+
+## Backwards compatibility
+
+- The old `/api/*` endpoints still work and use the **global** `sock`/`proData` from the original code.
+- The new `/api/u/:userId/*` endpoints use isolated sessions.
+- You can gradually migrate frontend calls from `/api/...` to `/api/u/${userId}/...` without a big-bang rewrite.
+
+---
+
+## Scaling notes
+
+- All sessions are in-memory (Map). A server restart requires users to re-scan QR.
+- For production with many users, consider persisting session tokens to Redis so sessions survive restarts.
+- Each Baileys socket maintains a persistent WhatsApp connection; monitor RAM for large deployments (~30–50MB per session).
