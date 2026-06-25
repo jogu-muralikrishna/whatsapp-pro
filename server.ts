@@ -44,6 +44,12 @@ import {
 } from './server_backup';
 import { DatabaseService } from './src/DatabaseService.js';
 import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
+
+// ─── MULTI-USER SUPPORT ───────────────────────────────────────────────────────
+import { initSessionManager } from './src/UserSessionManager.js';
+import { initUserEngine } from './src/MultiUserEngine.js';
+import { multiUserRouter } from './src/multiUserRouter.js';
+import { patchWSSForMultiUser } from './src/multiUserWS.js';
 import cors from 'cors';
 
 const __filename = (typeof import.meta !== 'undefined' && import.meta.url) ? fileURLToPath(import.meta.url) : '';
@@ -634,7 +640,18 @@ async function loadProDataFromFirestore() {
 async function startServer() {
     app.use(express.json());
     app.use('/api/admin', adminRouter);
-    
+
+    // ─── MULTI-USER: Init session manager + mount per-user API router ──────────
+    const { sessionManager } = await import('./src/UserSessionManager.js');
+    initSessionManager(BASE_DATA_DIR);
+    patchWSSForMultiUser(wss);
+    app.use('/api/u/:userId', multiUserRouter);
+
+    // Auto-start a "default" isolated session for backwards compatibility
+    const defaultSession = sessionManager.getOrCreate('default');
+    initUserEngine(defaultSession);
+    // ──────────────────────────────────────────────────────────────────────────
+
     // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
     DatabaseService.initDatabase().catch((dbErr: any) => {
         log('ERROR', `Database initialization failure: ${dbErr.message}`);
@@ -1465,11 +1482,20 @@ async function initWASocket() {
                 if (chatIndex !== -1) {
                     realChats[chatIndex].lastMessage = msg;
                     realChats[chatIndex].timestamp = msg.messageTimestamp;
+                    // Increment unread count for incoming messages (not from me)
+                    if (!msg.key.fromMe) {
+                        realChats[chatIndex].unreadCount = (realChats[chatIndex].unreadCount || 0) + 1;
+                    }
                     broadcast({ type: 'CHATS_UPDATE', data: realChats[chatIndex] });
                     saveChatToFirebase(jid, realChats[chatIndex]);
                 } else {
                     // Create chat if not exists
-                    const newChat = { id: jid, timestamp: msg.messageTimestamp, lastMessage: msg };
+                    const newChat = {
+                        id: jid,
+                        timestamp: msg.messageTimestamp,
+                        lastMessage: msg,
+                        unreadCount: msg.key.fromMe ? 0 : 1
+                    };
                     realChats.push(newChat);
                     broadcast({ type: 'CHATS_UPDATE', data: newChat });
                     saveChatToFirebase(jid, newChat);
@@ -2553,6 +2579,23 @@ async function initWASocket() {
         res.json({ success: true, registeredPhones: Array.from(listSet) });
     });
 
+    // ─── MULTI-USER: List all active isolated sessions ─────────────────────────
+    app.get('/api/admin/multi-user-sessions', adminAuthMiddleware, (req, res) => {
+        const { sessionManager: sm } = require('./src/UserSessionManager.js');
+        const sessions = sm.listUserIds().map((uid: string) => {
+            const s = sm.get(uid);
+            return {
+                userId: uid,
+                connectionState: s?.connectionState || 'unknown',
+                phone: s?.sock?.user?.id?.split(':')[0] || null,
+                hasQr: !!s?.qrCode,
+                wsClients: s?.wsClients?.size || 0,
+            };
+        });
+        res.json({ sessions });
+    });
+    // ──────────────────────────────────────────────────────────────────────────
+
     // Static service for uploaded files like profile pictures
     const uploadsDir = path.join(BASE_DATA_DIR, 'uploads');
     fs.mkdirSync(uploadsDir, { recursive: true });
@@ -2775,6 +2818,16 @@ async function initWASocket() {
 
         try {
             await targetSock.readMessages(keys);
+
+            // Reset unread count for this chat in realChats
+            const targetRealChats = account === 'friend' ? realChatsFriend : realChats;
+            const normalizedJid = normalizeJid(jid);
+            const chatIdx = targetRealChats.findIndex((c: any) => normalizeJid(c.id) === normalizedJid);
+            if (chatIdx !== -1) {
+                targetRealChats[chatIdx].unreadCount = 0;
+                broadcast({ type: 'CHATS_UPDATE', data: targetRealChats[chatIdx] });
+            }
+
             res.json({ status: 'Read' });
         } catch (e) {
             res.status(500).json({ error: 'Read failed' });
