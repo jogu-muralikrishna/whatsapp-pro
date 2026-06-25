@@ -20,13 +20,14 @@ const wss = new WebSocketServer({ server });
 app.use(cors());
 app.use(express.json());
 
-// ====================== API ROUTES FIRST ======================
-const userSockets = new Map();
+// ====================== MULTI-USER STATE ======================
+const userSockets = new Map<string, any>();
 
-function getCleanPhone(phone: string) {
+function getCleanPhone(phone: string): string {
   return phone.replace(/[^0-9]/g, '') || 'default';
 }
 
+// ====================== BAILEYS CONNECT ======================
 async function connectUser(phone: string) {
   const clean = getCleanPhone(phone);
   if (userSockets.has(clean)) return userSockets.get(clean);
@@ -41,15 +42,22 @@ async function connectUser(phone: string) {
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
+    browser: ['WhatsApp Pro', 'Chrome', '1.0'],
   });
 
   sock.ev.on('connection.update', (update) => {
-    const { qr, connection } = update;
+    const { qr, connection, lastDisconnect } = update;
     if (qr) {
-      wss.clients.forEach(c => c.send(JSON.stringify({ type: 'QR_CODE', phone: clean, qr })));
+      wss.clients.forEach(client => {
+        if (client.readyState === 1) client.send(JSON.stringify({ type: 'QR_CODE', phone: clean, qr }));
+      });
     }
     if (connection === 'open') {
-      wss.clients.forEach(c => c.send(JSON.stringify({ type: 'LOGGED_IN', phone: clean })));
+      console.log(`✅ ${clean} Connected`);
+      wss.clients.forEach(client => client.send(JSON.stringify({ type: 'LOGGED_IN', phone: clean })));
+    }
+    if (connection === 'close' && (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut) {
+      setTimeout(() => connectUser(phone), 2000);
     }
   });
 
@@ -57,28 +65,46 @@ async function connectUser(phone: string) {
   return sock;
 }
 
+// ====================== API ROUTES ======================
 app.post('/api/connect', async (req, res) => {
   try {
     const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: "Phone number is required" });
-
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
     await DatabaseService.initDatabase(phone);
     await connectUser(phone);
-
-    res.json({ success: true, message: "Connection initiated" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to connect" });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
   }
 });
 
 app.get('/api/connection-status', (req, res) => {
-  const { phone } = req.query;
-  const clean = getCleanPhone(phone as string);
-  res.json({ connected: userSockets.has(clean) });
+  try {
+    const { phone } = req.query;
+    const clean = getCleanPhone(phone as string);
+    res.json({ connected: userSockets.has(clean), phone: clean });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// ====================== STATIC FILES AFTER API ======================
+app.post('/api/request-pairing-code', async (req, res) => {
+  // Placeholder - Baileys pairing code logic can be added later
+  res.json({ success: true, code: "123-456-78" });
+});
+
+app.post('/api/logout', (req, res) => {
+  const { phone } = req.body;
+  const clean = getCleanPhone(phone);
+  userSockets.delete(clean);
+  res.json({ success: true });
+});
+
+app.get('/api/session/init', (req, res) => {
+  res.json({ success: true });
+});
+
+// ====================== STATIC + FALLBACK ======================
 app.use(express.static(path.join(__dirname, 'dist')));
 
 app.get('*', (req, res) => {
@@ -87,5 +113,5 @@ app.get('*', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Pro Multi-User Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Multi-User WhatsApp Pro Server on port ${PORT}`);
 });
