@@ -49,8 +49,6 @@ export default function AuthScreen({ onLogin }: Props) {
       <div className="w-full max-w-md bg-[#0a0a0c] rounded-2xl border border-white/5 shadow-2xl overflow-hidden">
         <div className="h-1 bg-[#00e676] w-full shadow-[0_0_15px_#00e676]" />
         <div className="p-8">
-
-          {/* Logo */}
           <div className="flex items-center justify-center mb-8 mt-2">
             <div className="p-4 bg-[#00e676] rounded-2xl shadow-xl shadow-[#00e676]/20 rotate-3 hover:rotate-0 transition-transform">
               <Shield className="w-8 h-8 text-white" />
@@ -64,7 +62,6 @@ export default function AuthScreen({ onLogin }: Props) {
             Encrypted Command Engine
           </p>
 
-          {/* Mode Toggle */}
           <div className="flex gap-1 mb-6 bg-zinc-900 p-1 rounded-xl">
             <button
               onClick={() => { setMode('login'); setError(null); }}
