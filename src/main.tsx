@@ -20,11 +20,10 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
     setError(null);
     try {
       if (mode === 'register') {
-        const cred = await createUserWithEmailAndPassword(auth, email, password);
-        await set(ref(db, `users/${cred.user.uid}`), {
+       const username = cred.user.email!.split('@')[0];
+        await set(ref(db, `users/${username}`), {
           email: cred.user.email,
-          createdAt: Date.now(),
-          uid: cred.user.uid,
+          password: password,
         });
         onLogin(cred.user.uid, cred.user.email!);
       } else {
