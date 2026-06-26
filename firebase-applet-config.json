@@ -1,10 +1,10 @@
 {
-  "projectId": "teak-metric-bf4nj",
-  "appId": "1:928090974502:web:f51ccc8f8d1a8379c639e7",
-  "apiKey": "AIzaSyDeo_Pga9VnQ_KJtyITI1kzaCRZguOnN14",
-  "authDomain": "teak-metric-bf4nj.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-26fc4453-ad40-4f30-b5e4-4440456e7ed0",
-  "storageBucket": "teak-metric-bf4nj.firebasestorage.app",
-  "messagingSenderId": "928090974502",
-  "measurementId": ""
+  "apiKey": "AIzaSyAKC9kCWi2Tr0LJlTrFsZaFboj7AaoM51A",
+  "authDomain": "whats-app-pro-9e2b1.firebaseapp.com",
+  "databaseURL": "https://whats-app-pro-9e2b1-default-rtdb.firebaseio.com",
+  "projectId": "whats-app-pro-9e2b1",
+  "storageBucket": "whats-app-pro-9e2b1.firebasestorage.app",
+  "messagingSenderId": "821841013154",
+  "appId": "1:821841013154:web:59bcb82d62434336a3eafb",
+  "measurementId": "G-WMK6W060M7"
 }
