@@ -2904,6 +2904,10 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     <div className="h-px bg-white/5 my-1" />
                     <button
                       onClick={() => { hardLogout(); onLogout(); }}
+                      className="w-full px-4 py-3 flex items-center gap-3 text-red-500 hover:bg-white/5 text-[11px] font-bold italic transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      Deactivate System
                     </button>
                   </div>
                 </>
