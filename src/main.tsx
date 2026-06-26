@@ -4,7 +4,6 @@ import App from './App.tsx';
 import { auth, db } from './lib/firebaseClient';
 import { onAuthStateChanged, signOut, createUserWithEmailAndPassword, signInWithEmailAndPassword } from 'firebase/auth';
 import { ref, set } from 'firebase/database';
-import { Shield, RefreshCw, X } from 'lucide-react';
 import './index.css';
 
 function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void }) {
@@ -15,19 +14,20 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
-    if (!email || !password) return;
+    if (!email.trim() || !password.trim()) return;
     setLoading(true);
     setError(null);
     try {
       if (mode === 'register') {
-       const username = cred.user.email!.split('@')[0];
+        const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        const username = cred.user.email!.split('@')[0];
         await set(ref(db, `users/${username}`), {
           email: cred.user.email,
           password: password,
         });
         onLogin(cred.user.uid, cred.user.email!);
       } else {
-        const cred = await signInWithEmailAndPassword(auth, email, password);
+        const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
         onLogin(cred.user.uid, cred.user.email!);
       }
     } catch (e: any) {
@@ -43,35 +43,65 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
   };
 
   return (
-    <div className="min-h-screen bg-black flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-[#0a0a0c] rounded-2xl border border-white/5 shadow-2xl overflow-hidden">
-        <div className="h-1 bg-[#00e676] w-full" />
-        <div className="p-8">
-          <div className="flex items-center justify-center mb-8 mt-2">
-            <div className="p-4 bg-[#00e676] rounded-2xl rotate-3 hover:rotate-0 transition-transform">
-              <Shield className="w-8 h-8 text-white" />
+    <div style={{ minHeight: '100vh', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
+      <div style={{ width: '100%', maxWidth: '400px', background: '#0a0a0c', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.05)', overflow: 'hidden' }}>
+        <div style={{ height: '4px', background: '#00e676' }} />
+        <div style={{ padding: '32px' }}>
+          <h1 style={{ color: '#fff', fontWeight: 900, fontSize: '24px', textAlign: 'center', marginBottom: '4px' }}>WHATSAPP PRO</h1>
+          <p style={{ color: '#00e676', textAlign: 'center', fontSize: '10px', fontWeight: 700, letterSpacing: '3px', textTransform: 'uppercase', marginBottom: '24px' }}>Encrypted Command Engine</p>
+
+          {/* Toggle */}
+          <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', background: '#111', padding: '4px', borderRadius: '10px' }}>
+            <button onClick={() => { setMode('login'); setError(null); }} style={{ flex: 1, padding: '10px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: 900, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '2px', background: mode === 'login' ? '#00e676' : 'transparent', color: mode === 'login' ? '#000' : '#aaa' }}>Login</button>
+            <button onClick={() => { setMode('register'); setError(null); }} style={{ flex: 1, padding: '10px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: 900, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '2px', background: mode === 'register' ? '#00e676' : 'transparent', color: mode === 'register' ? '#000' : '#aaa' }}>Register</button>
+          </div>
+
+          {/* Email */}
+          <div style={{ marginBottom: '12px' }}>
+            <label style={{ display: 'block', color: 'rgba(0,230,118,0.5)', fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '6px' }}>Email Address</label>
+            <input
+              type="email"
+              placeholder="your@email.com"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              disabled={loading}
+              style={{ width: '100%', padding: '14px 16px', background: '#121214', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '10px', color: '#fff', fontSize: '14px', outline: 'none', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          {/* Password */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ display: 'block', color: 'rgba(0,230,118,0.5)', fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '6px' }}>Password {mode === 'register' && <span style={{ color: 'rgba(255,255,255,0.2)' }}>(min 6 chars)</span>}</label>
+            <input
+              type="password"
+              placeholder="••••••••"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+              disabled={loading}
+              style={{ width: '100%', padding: '14px 16px', background: '#121214', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '10px', color: '#fff', fontSize: '14px', outline: 'none', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div style={{ padding: '12px 16px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: '10px', color: '#f87171', fontSize: '11px', fontWeight: 700, marginBottom: '16px' }}>
+              {error}
             </div>
-          </div>
-          <h1 className="text-3xl font-black text-white tracking-tight italic text-center mb-1">WHATSAPP PRO</h1>
-          <p className="text-[#00e676]/60 text-center mb-8 text-[10px] font-black uppercase tracking-[0.3em]">Encrypted Command Engine</p>
-          <div className="flex gap-1 mb-6 bg-zinc-900 p-1 rounded-xl">
-            <button onClick={() => { setMode('login'); setError(null); }} className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${mode === 'login' ? 'bg-[#00e676] text-black' : 'text-slate-400 hover:text-white'}`}>Login</button>
-            <button onClick={() => { setMode('register'); setError(null); }} className={`flex-1 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${mode === 'register' ? 'bg-[#00e676] text-black' : 'text-slate-400 hover:text-white'}`}>Register</button>
-          </div>
-          <div className="space-y-4">
-            <input type="email" placeholder="your@email.com" className="w-full px-4 py-4 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-[#00e676] transition-all text-sm" value={email} onChange={e => setEmail(e.target.value)} disabled={loading} />
-            <input type="password" placeholder="••••••••" className="w-full px-4 py-4 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-[#00e676] transition-all text-sm" value={password} onChange={e => setPassword(e.target.value)} onKeyPress={e => e.key === 'Enter' && handleSubmit()} disabled={loading} />
-            {error && (
-              <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3">
-                <X className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-                <p className="text-red-500 text-[10px] font-bold leading-tight">{error}</p>
-              </div>
-            )}
-            <button onClick={handleSubmit} disabled={loading || !email || !password} className="w-full bg-[#00e676] text-black font-black py-4 rounded-xl hover:opacity-90 disabled:opacity-20 transition-all text-xs uppercase tracking-widest flex items-center justify-center gap-3">
-              {loading && <RefreshCw className="w-4 h-4 animate-spin text-black" />}
-              {loading ? 'Processing...' : mode === 'login' ? 'Login to System 🔐' : 'Create Account 💎'}
-            </button>
-          </div>
+          )}
+
+          {/* Submit */}
+          <button
+            onClick={handleSubmit}
+            disabled={loading || !email.trim() || !password.trim()}
+            style={{ width: '100%', padding: '16px', background: '#00e676', border: 'none', borderRadius: '10px', color: '#000', fontWeight: 900, fontSize: '12px', textTransform: 'uppercase', letterSpacing: '2px', cursor: loading || !email.trim() || !password.trim() ? 'not-allowed' : 'pointer', opacity: loading || !email.trim() || !password.trim() ? 0.3 : 1 }}
+          >
+            {loading ? 'Processing...' : mode === 'login' ? 'Login to System 🔐' : 'Create Account 💎'}
+          </button>
+
+          <p style={{ textAlign: 'center', color: 'rgba(255,255,255,0.2)', fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '2px', marginTop: '16px' }}>
+            {mode === 'login' ? "No account? Switch to Register above." : 'Already registered? Switch to Login above.'}
+          </p>
         </div>
       </div>
     </div>
@@ -94,8 +124,8 @@ function Root() {
 
   if (checking) {
     return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
-        <div className="w-8 h-8 border-2 border-[#00e676] border-t-transparent rounded-full animate-spin" />
+      <div style={{ minHeight: '100vh', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ width: '32px', height: '32px', border: '2px solid #00e676', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
       </div>
     );
   }
@@ -104,7 +134,13 @@ function Root() {
     return <AuthScreen onLogin={(id, em) => { setUid(id); setEmail(em); }} />;
   }
 
-  return <App userId={uid} userEmail={email} onLogout={() => { signOut(auth); setUid(null); setEmail(null); }} />;
+  return (
+    <App
+      userId={uid}
+      userEmail={email}
+      onLogout={() => { signOut(auth); setUid(null); setEmail(null); }}
+    />
+  );
 }
 
 createRoot(document.getElementById('root')!).render(<Root />);
