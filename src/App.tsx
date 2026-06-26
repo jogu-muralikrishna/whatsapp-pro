@@ -124,6 +124,159 @@ interface Message {
 
 type Tab = "CHATS" | "STATUS" | "CALLS" | "RECORDS" | "SETTINGS";
 
+// ── Ghost Message Panel Component ──
+function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: string; apiFetch: Function }) {
+  const [targetPhone, setTargetPhone] = useState('');
+  const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [sentLog, setSentLog] = useState<{ phone: string; msg: string; time: string }[]>([]);
+
+  const sendGhostMessage = async () => {
+    if (!targetPhone || !message.trim()) return;
+    if (connectionState !== 'open') {
+      setStatus({ type: 'error', text: 'Your WhatsApp must be connected first (My Session tab).' });
+      return;
+    }
+    setSending(true);
+    setStatus(null);
+    try {
+      const jid = `91${targetPhone.replace(/\D/g, '')}@s.whatsapp.net`;
+      const res = await apiFetch('/api/send-message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid, text: message }),
+      });
+      if (res.ok) {
+        setStatus({ type: 'success', text: `Message sent! Recipient sees the server number — your identity is hidden.` });
+        setSentLog(prev => [{ phone: targetPhone, msg: message, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 10));
+        setMessage('');
+        setTargetPhone('');
+      } else {
+        const err = await res.json();
+        setStatus({ type: 'error', text: err.error || 'Failed to send message.' });
+      }
+    } catch (e: any) {
+      setStatus({ type: 'error', text: 'Connection error. Try again.' });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-start z-10 p-6 bg-[#0c1317] overflow-y-auto">
+      <div className="w-full max-w-md space-y-4">
+
+        {/* Header */}
+        <div className="text-center py-4">
+          <div className="flex items-center justify-center mb-4">
+            <div className="p-4 bg-purple-500/10 rounded-2xl border border-purple-500/20">
+              <Shield className="w-8 h-8 text-purple-400" />
+            </div>
+          </div>
+          <h2 className="text-2xl font-black text-white italic tracking-tight">GHOST MESSAGE</h2>
+          <p className="text-[10px] text-purple-400 uppercase font-black tracking-widest mt-1">
+            Send anonymously — your number stays hidden
+          </p>
+        </div>
+
+        {/* Info Banner */}
+        <div className="p-4 bg-purple-500/5 border border-purple-500/20 rounded-2xl flex items-start gap-3">
+          <ShieldCheck className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
+          <p className="text-[10px] text-purple-300/70 font-bold leading-relaxed">
+            Message is sent through the server's WhatsApp number. The recipient will NOT see your real number.
+          </p>
+        </div>
+
+        {/* Connection check */}
+        {connectionState !== 'open' && (
+          <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl flex items-start gap-3">
+            <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <p className="text-[10px] text-red-400 font-bold leading-relaxed">
+              Go to "My Session" tab first and connect your WhatsApp. Ghost messages use your session as relay.
+            </p>
+          </div>
+        )}
+
+        {/* Target Number */}
+        <div>
+          <label className="block text-[10px] font-black text-purple-400/60 uppercase tracking-widest mb-2 ml-1">
+            Recipient's WhatsApp Number
+          </label>
+          <div className="flex gap-2">
+            <div className="bg-[#202c33] px-3 py-3.5 rounded-xl border border-white/10 text-xs font-mono text-white/70 select-none">
+              +91
+            </div>
+            <input
+              type="text"
+              placeholder="10-digit mobile number"
+              className="flex-1 px-4 py-3.5 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-purple-500/40 transition-all font-mono text-sm"
+              value={targetPhone}
+              onChange={e => setTargetPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
+              disabled={sending}
+            />
+          </div>
+        </div>
+
+        {/* Message */}
+        <div>
+          <label className="block text-[10px] font-black text-purple-400/60 uppercase tracking-widest mb-2 ml-1">
+            Your Message
+          </label>
+          <textarea
+            rows={4}
+            placeholder="Type your anonymous message here..."
+            className="w-full px-4 py-3.5 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-purple-500/40 transition-all text-sm resize-none"
+            value={message}
+            onChange={e => setMessage(e.target.value)}
+            disabled={sending}
+          />
+          <p className="text-[9px] text-white/20 font-bold mt-1 ml-1">{message.length} characters</p>
+        </div>
+
+        {/* Status */}
+        {status && (
+          <div className={`p-4 rounded-2xl flex items-start gap-3 border ${status.type === 'success' ? 'bg-green-500/10 border-green-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
+            {status.type === 'success'
+              ? <ShieldCheck className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
+              : <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />}
+            <p className={`text-[10px] font-bold leading-relaxed ${status.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+              {status.text}
+            </p>
+          </div>
+        )}
+
+        {/* Send Button */}
+        <button
+          onClick={sendGhostMessage}
+          disabled={sending || !targetPhone || !message.trim() || targetPhone.length !== 10}
+          className="w-full bg-purple-600 hover:bg-purple-500 text-white font-black py-4 rounded-xl disabled:opacity-30 transition-all text-xs uppercase tracking-widest flex items-center justify-center gap-3 shadow-xl shadow-purple-500/20"
+        >
+          {sending
+            ? <><RefreshCw className="w-4 h-4 animate-spin" /> Sending...</>
+            : <><Send className="w-4 h-4" /> Send Ghost Message</>}
+        </button>
+
+        {/* Sent Log */}
+        {sentLog.length > 0 && (
+          <div className="space-y-2 pt-2">
+            <p className="text-[10px] font-black text-white/30 uppercase tracking-widest ml-1">Sent This Session</p>
+            {sentLog.map((log, i) => (
+              <div key={i} className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[10px] font-black text-purple-400">+91 {log.phone}</p>
+                  <p className="text-[9px] text-white/40 truncate">{log.msg}</p>
+                </div>
+                <span className="text-[8px] text-white/20 font-mono shrink-0">{log.time}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface AppProps {
   userId: string;
   userEmail: string;
@@ -2751,10 +2904,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     <div className="h-px bg-white/5 my-1" />
                     <button
                       onClick={() => { hardLogout(); onLogout(); }}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-red-500 hover:bg-white/5 text-[11px] font-bold italic transition-colors"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                      Deactivate System
                     </button>
                   </div>
                 </>
@@ -2763,7 +2912,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </div>
         </div>
 
-        {/* Dual Session Account Selector */}
+        {/* Session + Ghost Message Selector */}
         <div className="flex border-b border-white/5 bg-[#111b21] p-1.5 gap-1.5 backdrop-blur-md">
           <button
             onClick={() => {
@@ -2780,18 +2929,15 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             My Session {connectionState === "open" ? "●" : "○"}
           </button>
           <button
-            onClick={() => {
-              setSelectedAccount("friend");
-              setActiveChatFriend(null);
-            }}
+            onClick={() => setSelectedAccount("friend")}
             className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
               selectedAccount === "friend"
-                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)] font-bold"
+                ? "bg-purple-500/20 text-purple-400 border border-purple-500/30 shadow-[0_0_15px_rgba(168,85,247,0.1)]"
                 : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
             }`}
           >
-            <Plus className="w-3.5 h-3.5" />
-            Login Friend {connectionStateFriend === "open" ? "●" : "○"}
+            <Shield className="w-3.5 h-3.5" />
+            Ghost Message
           </button>
         </div>
 
@@ -4750,121 +4896,8 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </>
           );
         })() : (
-          selectedAccount === "friend" && connectionStateFriend !== "open" ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-8 text-center bg-[#0c1317]">
-              <div className="max-w-md w-full bg-[#111b21] rounded-3xl border border-white/5 shadow-2xl p-8 relative overflow-hidden animate-in fade-in zoom-in duration-300">
-                <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#00a884]/40 to-transparent" />
-                
-                <div className="flex items-center justify-center mb-6">
-                  <div className="p-4 bg-[#00a884]/10 rounded-2xl border border-[#00a884]/20 animate-pulse">
-                    <User className="w-8 h-8 text-[#00a884]" />
-                  </div>
-                </div>
-
-                <h2 className="text-2xl font-black text-white italic tracking-tight mb-2">
-                  LOGIN YOUR FRIEND
-                </h2>
-                <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
-                  Setup Companion WhatsApp Node
-                </p>
-
-                <div className="flex gap-1 mb-6 bg-[#202c33]/50 p-1 rounded-xl border border-white/5">
-                  <button
-                    onClick={() => setLoginMethodFriend("pairing")}
-                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "pairing" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
-                  >
-                    OTP Pairing
-                  </button>
-                  <button
-                    onClick={() => setLoginMethodFriend("qr")}
-                    className={`flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${loginMethodFriend === "qr" ? "bg-[#00a884] text-white shadow-lg" : "text-slate-400 hover:text-slate-200"}`}
-                  >
-                    Scan QR
-                  </button>
-                </div>
-
-                {loginMethodFriend === "pairing" ? (
-                  <div className="space-y-4">
-                    <p className="text-xs text-white/60 leading-relaxed text-left">
-                      Enter your friend's 10-digit WhatsApp number (including country code) to generate a secure pairing code:
-                    </p>
-                    <div className="flex gap-2">
-                      <div className="bg-[#202c33] px-3 py-3 rounded-xl border border-white/10 text-xs font-mono text-white/70 select-none">
-                        +91
-                      </div>
-                      <input
-                        type="text"
-                        placeholder="Friend's WhatsApp Number (e.g. 9876543210)"
-                        value={phoneNumberFriend}
-                        onChange={(e) => setPhoneNumberFriend(e.target.value.replace(/\D/g, "").slice(0, 10))}
-                        className="flex-1 bg-[#202c33] px-4 py-3 rounded-xl border border-white/5 outline-none text-xs text-white focus:border-[#00a884]/30 placeholder:text-white/20"
-                      />
-                    </div>
-
-                    <button
-                      onClick={() => requestPairingCode()}
-                      className="w-full bg-[#00a884] text-white font-black text-xs uppercase tracking-widest py-3.5 rounded-xl hover:bg-[#00a884]/90 transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-[#00a884]/15 flex items-center justify-center gap-2"
-                    >
-                      <span>Generate Companion Code</span>
-                    </button>
-
-                    {pairingCodeFriend && (
-                      <div className="mt-6 p-6 bg-[#202c33] rounded-2xl border border-[#00a884]/20 animate-in fade-in zoom-in duration-200">
-                        <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest mb-3">
-                          Enter this on your friend's phone:
-                        </p>
-                        <div className="font-mono text-3xl font-black tracking-[0.2em] text-white select-all text-center uppercase py-2 bg-black/20 rounded-lg">
-                          {pairingCodeFriend}
-                        </div>
-                        <p className="text-[9px] text-white/40 uppercase font-bold mt-3 leading-relaxed">
-                          Menu &gt; Linked Devices &gt; Link with Phone Number
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center py-4 space-y-4">
-                    <p className="text-xs text-white/60 leading-relaxed">
-                      Scan this QR code using WhatsApp on your friend's logged-in device:
-                    </p>
-                    {qrCodeFriend ? (
-                      <div className="p-4 bg-white rounded-2xl select-none animate-in fade-in duration-300">
-                        <QRCode value={qrCodeFriend} size={180} />
-                      </div>
-                    ) : (
-                      <div className="w-[180px] h-[180px] bg-[#202c33] rounded-2xl border border-white/5 flex flex-col items-center justify-center text-center opacity-60 animate-pulse">
-                        <RefreshCw className="w-8 h-8 text-[#00a884] animate-spin mb-2" />
-                        <span className="text-[9px] font-black uppercase tracking-widest">Generating QR...</span>
-                      </div>
-                    )}
-                    <button
-                      onClick={() => refreshQr()}
-                      className="text-[10px] font-black uppercase tracking-widest text-[#00a884] hover:underline flex items-center gap-1 mt-2 font-black"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin-slow" /> Refresh QR
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : selectedAccount === "friend" && connectionStateFriend === "open" && !activeChatFriend ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center bg-[#0c1317]">
-              <div className="relative mb-8">
-                <div className="absolute inset-0 bg-[#00a884]/15 blur-[60px]" />
-                <div className="p-8 rounded-full bg-white/[0.02] border border-white/5 relative">
-                  <ShieldCheck className="w-16 h-16 text-[#00a884]/30" />
-                </div>
-              </div>
-              <h2 className="text-2xl font-black text-white mb-2 tracking-tight italic">
-                FRIEND SESSION SECURED
-              </h2>
-              <p className="text-[10px] text-[#00a884] uppercase font-black tracking-widest mb-6 leading-none">
-                Connected to WhatsApp companion node
-              </p>
-              <p className="text-xs max-w-xs leading-relaxed opacity-50 font-medium pb-2">
-                Select a conversation from your friend's chat index on the left sidebar to inspect messages.
-              </p>
-            </div>
+          selectedAccount === "friend" ? (
+            <GhostMessagePanel connectionState={connectionState} apiFetch={apiFetch} />
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] z-10 p-12 text-center">
               <div className="relative mb-12">
