@@ -1,15 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
 
-// ── Multi-user: generate/retrieve a persistent session ID for this browser ──
-function getSessionId(): string {
-  let sid = localStorage.getItem('wp_session_id');
-  if (!sid) {
-    sid = crypto.randomUUID();
-    localStorage.setItem('wp_session_id', sid);
-  }
-  return sid;
+// ── Multi-user: Firebase UID is the session ID — unique per user, never mixed ──
+let SESSION_ID = '';
+
+function setSessionId(uid: string) {
+  SESSION_ID = uid;
 }
-const SESSION_ID = getSessionId();
 
 // ── API fetch wrapper: automatically adds x-session-id to every request ──
 async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
@@ -128,7 +124,14 @@ interface Message {
 
 type Tab = "CHATS" | "STATUS" | "CALLS" | "RECORDS" | "SETTINGS";
 
-export default function App() {
+interface AppProps {
+  userId: string;
+  userEmail: string;
+  onLogout: () => void;
+}
+
+export default function App({ userId, userEmail, onLogout }: AppProps) {
+  setSessionId(userId);
   const [phoneNumber, setPhoneNumber] = useState("");
   const [pairingCode, setPairingCode] = useState("");
   const [qrCode, setQrCode] = useState<string | null>(null);
@@ -2747,11 +2750,7 @@ export default function App() {
                     </button>
                     <div className="h-px bg-white/5 my-1" />
                     <button
-                      onClick={hardLogout}
-                      className="w-full px-4 py-3 flex items-center gap-3 text-red-500 hover:bg-white/5 text-[11px] font-bold italic transition-colors"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                      Deactivate System
+                      onClick={() => { hardLogout(); onLogout(); }}
                     </button>
                   </div>
                 </>
