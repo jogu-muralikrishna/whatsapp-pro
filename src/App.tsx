@@ -853,10 +853,16 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduleData, setScheduleData] = useState({ text: "", time: "" });
-  const [newAutoReply, setNewAutoReply] = useState({
-    keyword: "",
-    response: "",
-  });
+  const [newAutoReply, setNewAutoReply] = useState({ keyword: "", response: "" });
+
+  // ── Presence: online/typing state ──
+  const [presenceMap, setPresenceMap] = useState<Record<string, { status: string; lastSeen?: number }>>({});
+  const [isTyping, setIsTyping] = useState(false);
+  const typingTimerRef = useRef<any>(null);
+
+  // ── Block confirm dialog ──
+  const [blockConfirm, setBlockConfirm] = useState<{ jid: string; name: string } | null>(null);
+  const [blockedContacts, setBlockedContacts] = useState<string[]>([]);
 
   const ws = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -867,6 +873,15 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   useEffect(() => {
     activeChatRef.current = activeChat;
+    // Subscribe to presence updates when opening a chat
+    if (activeChat && !activeChat.isGroup) {
+      apiFetch('/api/subscribe-presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid: activeChat.id }),
+      }).catch(() => {});
+    }
+    setIsTyping(false);
   }, [activeChat]);
 
   useEffect(() => {
@@ -1930,6 +1945,25 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
               data.participant.split(":")[0] + "@s.whatsapp.net",
             );
           break;
+        case "PRESENCE_UPDATE": {
+          const presJid = data.id;
+          const presences = data.presences || {};
+          const participant = presJid;
+          const info = presences[participant] || Object.values(presences)[0] as any;
+          if (!info) break;
+          const presStatus = info.lastKnownPresence || 'unavailable';
+          const lastSeen = info.lastSeen ? info.lastSeen * 1000 : undefined;
+          setPresenceMap(prev => ({ ...prev, [presJid]: { status: presStatus, lastSeen } }));
+          // Handle typing indicator
+          if (presStatus === 'composing') {
+            setIsTyping(true);
+            clearTimeout(typingTimerRef.current);
+            typingTimerRef.current = setTimeout(() => setIsTyping(false), 5000);
+          } else {
+            setIsTyping(false);
+          }
+          break;
+        }
         case "STATUS_DELETED_INTERCEPT":
           setInterceptedStatuses((prev) => [data, ...prev].slice(0, 50));
           break;
@@ -2485,16 +2519,21 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     } catch (e) {}
   };
 
-  const blockContact = async (jid: string) => {
+  const blockContact = async (jid: string, block: boolean = true) => {
     try {
-      await fetch(`${API_BASE}/api/block-contact`, {
+      await apiFetch(`/api/block-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid, block: true }),
+        body: JSON.stringify({ jid, block }),
       });
-      setError("Neural block active. Signal terminated.");
+      if (block) {
+        setBlockedContacts(prev => [...prev.filter(j => j !== jid), jid]);
+      } else {
+        setBlockedContacts(prev => prev.filter(j => j !== jid));
+      }
+      setBlockConfirm(null);
     } catch (e: any) {
-      setError(`Failed to block: ${e.message}`);
+      setError(`Failed to ${block ? 'block' : 'unblock'}: ${e.message}`);
     }
   };
 
@@ -4225,10 +4264,23 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                   {lockedChats.includes(activeChat.id) && (
                     <Lock className="w-3.5 h-3.5 text-yellow-500 shrink-0 animate-pulse" />
                   )}
-                  <p className="text-[9px] text-primary font-black uppercase tracking-widest mt-0.5">
-                    {showContactInfo
-                      ? activeChat.id.split("@")[0]
-                      : "Encrypted Pulse Active"}
+                  <p className="text-[9px] font-black uppercase tracking-widest mt-0.5">
+                    {(() => {
+                      if (isTyping && activeChat && !activeChat.isGroup) {
+                        return <span className="text-[#00e676] animate-pulse">✍ typing...</span>;
+                      }
+                      const presence = presenceMap[activeChat.id];
+                      if (presence?.status === 'available') {
+                        return <span className="text-[#00e676]">● Online</span>;
+                      }
+                      if (presence?.lastSeen) {
+                        return <span className="text-white/30">Last seen {smartMsgTime(presence.lastSeen)}</span>;
+                      }
+                      if (blockedContacts.includes(activeChat.id)) {
+                        return <span className="text-red-400">🚫 Blocked</span>;
+                      }
+                      return <span className="text-white/30">{showContactInfo ? activeChat.id.split("@")[0] : "Encrypted Pulse Active"}</span>;
+                    })()}
                   </p>
                 </div>
               </div>
@@ -4387,12 +4439,16 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-500 hover:bg-white/5 text-xs font-bold transition-colors italic"
                           onClick={() => {
-                            blockContact(activeChat.id);
+                            if (blockedContacts.includes(activeChat.id)) {
+                              blockContact(activeChat.id, false);
+                            } else {
+                              setBlockConfirm({ jid: activeChat.id, name: getDisplayName(activeChat) });
+                            }
                             setIsChatMenuOpen(false);
                           }}
                         >
                           <Lock className="w-4 h-4" />
-                          Terminate Signal (Block)
+                          {blockedContacts.includes(activeChat.id) ? 'Unblock Contact' : 'Block Contact'}
                         </button>
                         <button
                           className="w-full px-4 py-2.5 flex items-center gap-3 text-red-400 hover:bg-white/5 text-xs font-bold transition-colors italic"
@@ -4662,9 +4718,24 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                           {smartMsgTime(msg.timestamp)}
                         </span>
                         {msg.fromMe && (
-                          <Check
-                            className={`w-3 h-3 ${msg.status === "read" ? "text-sky-400" : "opacity-30"}`}
-                          />
+                          <span className="flex items-center">
+                            {msg.status === 'read' ? (
+                              // Blue double tick — read
+                              <span className="flex" title="Read">
+                                <Check className="w-3 h-3 text-sky-400 -mr-1.5" />
+                                <Check className="w-3 h-3 text-sky-400" />
+                              </span>
+                            ) : msg.status === 'delivered' ? (
+                              // Grey double tick — delivered
+                              <span className="flex" title="Delivered">
+                                <Check className="w-3 h-3 opacity-40 -mr-1.5" />
+                                <Check className="w-3 h-3 opacity-40" />
+                              </span>
+                            ) : (
+                              // Single grey tick — sent
+                              <Check className="w-3 h-3 opacity-30" title="Sent" />
+                            )}
+                          </span>
                         )}
                         <button
                           onClick={() =>
@@ -7169,6 +7240,40 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       </AnimatePresence>
 
       <AnimatePresence>
+        {/* Block Confirm Dialog */}
+        {blockConfirm && (
+          <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setBlockConfirm(null)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center gap-3 mb-4">
+                <div className="p-3 bg-red-500/10 rounded-xl">
+                  <Lock className="w-5 h-5 text-red-500" />
+                </div>
+                <div>
+                  <h3 className="text-white font-black text-sm">Block Contact</h3>
+                  <p className="text-white/40 text-[10px]">This cannot be undone easily</p>
+                </div>
+              </div>
+              <p className="text-white/60 text-xs mb-6 leading-relaxed">
+                Block <span className="text-white font-bold">{blockConfirm.name}</span>? They won't be able to call you or send you messages.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setBlockConfirm(null)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white/60 font-black text-xs uppercase tracking-widest rounded-xl transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => blockContact(blockConfirm.jid, true)}
+                  className="flex-1 py-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 font-black text-xs uppercase tracking-widest rounded-xl transition-all border border-red-500/20"
+                >
+                  Block
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {showCallRecordingConfirmation && (
           <motion.div
             key="call-rec-modal"
