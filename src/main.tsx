@@ -144,3 +144,38 @@ function Root() {
 }
 
 createRoot(document.getElementById('root')!).render(<Root />);
+
+// ── PWA Install Banner ──
+(function () {
+  let deferredPrompt: any = null;
+
+  window.addEventListener('beforeinstallprompt', (e: any) => {
+    e.preventDefault();
+    deferredPrompt = e;
+
+    // Show banner if not already installed
+    if (window.matchMedia('(display-mode: standalone)').matches) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'pwa-install-banner';
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;gap:12px;flex:1">
+        <img src="/icon-72x72.png" style="width:40px;height:40px;border-radius:10px" />
+        <div>
+          <div style="color:#fff;font-weight:900;font-size:13px">Install WhatsApp Pro</div>
+          <div style="color:rgba(255,255,255,0.4);font-size:11px">Add to home screen for app experience</div>
+        </div>
+      </div>
+      <button id="pwa-install-btn" style="background:#00e676;color:#000;border:none;padding:10px 18px;border-radius:10px;font-weight:900;font-size:11px;text-transform:uppercase;cursor:pointer;white-space:nowrap">Install</button>
+      <button id="pwa-dismiss-btn" style="background:transparent;color:rgba(255,255,255,0.3);border:none;padding:8px;cursor:pointer;font-size:18px">✕</button>
+    `;
+    document.body.appendChild(banner);
+
+    document.getElementById('pwa-install-btn')?.addEventListener('click', () => {
+      deferredPrompt?.prompt();
+      deferredPrompt?.userChoice.then(() => { banner.remove(); deferredPrompt = null; });
+    });
+
+    document.getElementById('pwa-dismiss-btn')?.addEventListener('click', () => banner.remove());
+  });
+})();
