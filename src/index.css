@@ -32,3 +32,33 @@
     opacity: 0.5;
   }
 }
+
+/* ── PWA Mobile Fixes ── */
+* { -webkit-tap-highlight-color: transparent; }
+html, body { overscroll-behavior: none; }
+input, textarea, select { font-size: 16px !important; } /* Prevent iOS zoom on focus */
+
+/* Safe area for notch phones */
+.safe-top { padding-top: env(safe-area-inset-top); }
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+
+/* Install banner */
+#pwa-install-banner {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: #111b21;
+  border-top: 1px solid rgba(0,230,118,0.2);
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  z-index: 9999;
+  animation: slideUp 0.3s ease;
+}
+@keyframes slideUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
