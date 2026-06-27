@@ -646,11 +646,7 @@ async function startServer() {
     patchWSSForMultiUser(wss);
     app.use('/api/u/:userId', multiUserRouter);
 
-    // Auto-start a "default" isolated session for backwards compatibility
-    // sessionManager is the singleton exported from UserSessionManager.ts
-    const defaultSession = sessionManager.getOrCreate('default');
-    initUserEngine(defaultSession);
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── Multi-user: sessions are created on-demand when each user connects ──────
 
     // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
     DatabaseService.initDatabase().catch((dbErr: any) => {
