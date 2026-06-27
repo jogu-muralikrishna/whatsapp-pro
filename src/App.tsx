@@ -7,11 +7,15 @@ function setSessionId(uid: string) {
   SESSION_ID = uid;
 }
 
-// ── API fetch wrapper: automatically adds x-session-id to every request ──
+// ── API fetch wrapper: routes every /api/ call to the user's isolated session ──
 async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers || {});
-  headers.set('x-session-id', SESSION_ID);
-  return fetch(url, { ...options, headers });
+  headers.set('x-user-id', SESSION_ID);
+  // Rewrite /api/... → /api/u/<userId>/... so each user hits their own session
+  const routedUrl = SESSION_ID && url.startsWith('/api/')
+    ? url.replace('/api/', `/api/u/${SESSION_ID}/`)
+    : url;
+  return fetch(routedUrl, { ...options, headers });
 }
 import {
   Phone,
@@ -1231,7 +1235,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   ) => {
     try {
       const res = await fetch(
-        `/api/media?msgId=${msgId}&chatId=${chatId}&download=true`,
+        `/api/u/${SESSION_ID}/media?msgId=${msgId}&chatId=${chatId}&download=true`,
       );
       if (!res.ok) {
         const errorData = await res.text();
@@ -1285,7 +1289,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   ) => {
     try {
       const formatParam = format === "original" ? "" : `&format=${format}`;
-      const url = `/api/media/download?msgId=${msgId}&chatId=${chatId}${formatParam}`;
+      const url = `/api/u/${SESSION_ID}/media/download?msgId=${msgId}&chatId=${chatId}${formatParam}`;
       const res = await fetch(url);
       if (!res.ok) {
         throw new Error("Download conversion failed.");
@@ -1954,63 +1958,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             });
             if (!newMsg.fromMe && newMsg.text) getAiSuggestions(newMsg.text);
           }
-
-          // FIX: Bump the chat to the top of the list when a new message arrives
-          {
-            const chatJid = incomingJid;
-            const msgTimestamp = (msgData.messageTimestamp || 0) * 1000;
-            const lastMsgText = getMsgText(msgData);
-            setChats((prev) => {
-              const idx = prev.findIndex((c) => c.id === chatJid);
-              let updated;
-              if (idx !== -1) {
-                updated = [...prev];
-                updated[idx] = {
-                  ...updated[idx],
-                  timestamp: msgData.messageTimestamp || Date.now() / 1000,
-                  lastMessage: lastMsgText,
-                  unreadCount: msgData.key?.fromMe
-                    ? updated[idx].unreadCount || 0
-                    : (updated[idx].unreadCount || 0) + 1,
-                };
-              } else {
-                updated = [
-                  ...prev,
-                  {
-                    id: chatJid,
-                    name: msgData.pushName || chatJid.split("@")[0],
-                    timestamp: msgData.messageTimestamp || Date.now() / 1000,
-                    lastMessage: lastMsgText,
-                    unreadCount: msgData.key?.fromMe ? 0 : 1,
-                  },
-                ];
-              }
-              return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-            });
-          }
-          break;
-
-        case "MESSAGES_UPDATE":
-          // FIX: Handle read receipts — turn ticks blue when recipient reads the message
-          if (Array.isArray(data)) {
-            data.forEach((update: any) => {
-              const { key, update: msgUpdate } = update;
-              if (!key || !msgUpdate) return;
-              // status 3 = read in Baileys
-              if (msgUpdate.status === 3 || msgUpdate.status === "READ") {
-                let jid = key.remoteJid || "";
-                if (jid.endsWith("@c.us")) jid = jid.replace("@c.us", "@s.whatsapp.net");
-                const activeJid = activeChatRef.current?.id || "";
-                if (jid === activeJid || jid === activeJid.replace("@s.whatsapp.net", "@c.us")) {
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === key.id ? { ...m, status: "read" } : m
-                    )
-                  );
-                }
-              }
-            });
-          }
           break;
       }
     };
@@ -2373,7 +2320,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   const blockContact = async (jid: string) => {
     try {
-      await fetch(`${API_BASE}/api/block-contact`, {
+      await fetch(`${API_BASE}/api/u/${SESSION_ID}/block-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid, block: true }),
@@ -2386,7 +2333,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   const reportContact = async (jid: string) => {
     try {
-      await fetch(`${API_BASE}/api/report-contact`, {
+      await fetch(`${API_BASE}/api/u/${SESSION_ID}/report-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid }),
@@ -3550,7 +3497,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       {activeStatus.message?.videoMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <video
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             onError={(e) => { e.currentTarget.style.display='none'; }}
                             controls
                             autoPlay
@@ -3600,7 +3547,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         <div className="bg-white/10 p-8 rounded-3xl backdrop-blur-xl flex flex-col items-center gap-4">
                           <Mic className="w-12 h-12 text-[#00a884] animate-pulse" />
                           <audio
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             controls
                             autoPlay
                             onPlay={() => setIsStatusPaused(false)}
@@ -3621,7 +3568,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       {activeStatus.message?.imageMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <img
-                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             alt="Status"
                             onError={(e) => {
                               e.currentTarget.style.display = 'none';
@@ -4408,7 +4355,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     {msg.rawMessage?.imageMessage && (
                       <div className="mb-2 rounded-lg overflow-hidden border border-white/5 relative group/img">
                         <img
-                          src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
+                          src={`/api/u/${SESSION_ID}/media?msgId=${msg.id}&chatId=${activeChat.id}`}
                           alt="Media"
                           onError={(e) => {
                             e.currentTarget.style.display = 'none';
@@ -4528,7 +4475,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                           <button
                             onClick={async () => {
                               const res = await fetch(
-                                `/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
+                                `/api/u/${SESSION_ID}/media?msgId=${msg.id}&chatId=${activeChat.id}`,
                               );
                               const blob = await res.blob();
                               const url = URL.createObjectURL(blob);
@@ -5480,7 +5427,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         >
                           {s.message?.imageMessage ? (
                             <img
-                              src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
+                              src={`/api/u/${SESSION_ID}/media?msgId=${s.id}&chatId=status@broadcast`}
                               onError={(e) => {
                                 e.currentTarget.style.display = 'none';
                               }}
@@ -6327,7 +6274,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            "/api/firebase-backup/backup",
+                                            `/api/u/${SESSION_ID}/firebase-backup/backup`,
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
@@ -6355,7 +6302,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            "/api/firebase-backup/restore",
+                                            `/api/u/${SESSION_ID}/firebase-backup/restore`,
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
