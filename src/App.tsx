@@ -7,15 +7,11 @@ function setSessionId(uid: string) {
   SESSION_ID = uid;
 }
 
-// ── API fetch wrapper: routes every /api/ call to the user's isolated session ──
+// ── API fetch wrapper: automatically adds x-session-id to every request ──
 async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers || {});
-  headers.set('x-user-id', SESSION_ID);
-  // Rewrite /api/... → /api/u/<userId>/... so each user hits their own session
-  const routedUrl = SESSION_ID && url.startsWith('/api/')
-    ? url.replace('/api/', `/api/u/${SESSION_ID}/`)
-    : url;
-  return fetch(routedUrl, { ...options, headers });
+  headers.set('x-session-id', SESSION_ID);
+  return fetch(url, { ...options, headers });
 }
 import {
   Phone,
@@ -1235,7 +1231,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   ) => {
     try {
       const res = await fetch(
-        `/api/u/${SESSION_ID}/media?msgId=${msgId}&chatId=${chatId}&download=true`,
+        `/api/media?msgId=${msgId}&chatId=${chatId}&download=true`,
       );
       if (!res.ok) {
         const errorData = await res.text();
@@ -1289,7 +1285,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   ) => {
     try {
       const formatParam = format === "original" ? "" : `&format=${format}`;
-      const url = `/api/u/${SESSION_ID}/media/download?msgId=${msgId}&chatId=${chatId}${formatParam}`;
+      const url = `/api/media/download?msgId=${msgId}&chatId=${chatId}${formatParam}`;
       const res = await fetch(url);
       if (!res.ok) {
         throw new Error("Download conversion failed.");
@@ -2320,7 +2316,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   const blockContact = async (jid: string) => {
     try {
-      await fetch(`${API_BASE}/api/u/${SESSION_ID}/block-contact`, {
+      await fetch(`${API_BASE}/api/block-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid, block: true }),
@@ -2333,7 +2329,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   const reportContact = async (jid: string) => {
     try {
-      await fetch(`${API_BASE}/api/u/${SESSION_ID}/report-contact`, {
+      await fetch(`${API_BASE}/api/report-contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jid }),
@@ -3354,6 +3350,20 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         {safeFormat(status.timestamp, "MMM dd, HH:mm")}
                       </p>
                     </div>
+                    {/* Download status button */}
+                    {(status.message?.imageMessage || status.message?.videoMessage) && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const ext = status.message?.videoMessage ? 'mp4' : 'jpg';
+                          downloadMedia(status.id, 'status@broadcast', `status_${status.id}.${ext}`);
+                        }}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity p-2 rounded-lg hover:bg-white/10 shrink-0"
+                        title="Download status"
+                      >
+                        <Download className="w-3.5 h-3.5 text-[#00a884]" />
+                      </button>
+                    )}
                   </div>
                 ))}
                 {statusUpdates.length === 0 && (
@@ -3497,7 +3507,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       {activeStatus.message?.videoMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <video
-                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             onError={(e) => { e.currentTarget.style.display='none'; }}
                             controls
                             autoPlay
@@ -3547,7 +3557,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         <div className="bg-white/10 p-8 rounded-3xl backdrop-blur-xl flex flex-col items-center gap-4">
                           <Mic className="w-12 h-12 text-[#00a884] animate-pulse" />
                           <audio
-                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             controls
                             autoPlay
                             onPlay={() => setIsStatusPaused(false)}
@@ -3568,7 +3578,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       {activeStatus.message?.imageMessage && (
                         <div className="flex flex-col items-center gap-4">
                           <img
-                            src={`/api/u/${SESSION_ID}/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
+                            src={`/api/media?msgId=${activeStatus.id}&chatId=status@broadcast`}
                             alt="Status"
                             onError={(e) => {
                               e.currentTarget.style.display = 'none';
@@ -4062,17 +4072,32 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 >
                   <ChevronLeft />
                 </button>
-                <div className="w-10 h-10 rounded-xl bg-surface flex items-center justify-center border border-white/5 font-black text-primary overflow-hidden">
-                  {profilePictures[activeChat.id] ? (
-                    <img
-                      src={profilePictures[activeChat.id]}
-                      alt=""
-                      className="w-full h-full object-cover"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                    />
-                  ) : (
-                    getDisplayName(activeChat)[0]
+                <div className="relative w-10 h-10 group">
+                  <div className="w-10 h-10 rounded-xl bg-surface flex items-center justify-center border border-white/5 font-black text-primary overflow-hidden">
+                    {profilePictures[activeChat.id] ? (
+                      <img
+                        src={profilePictures[activeChat.id]}
+                        alt=""
+                        className="w-full h-full object-cover"
+                        referrerPolicy="no-referrer"
+                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                      />
+                    ) : (
+                      getDisplayName(activeChat)[0]
+                    )}
+                  </div>
+                  {profilePictures[activeChat.id] && (
+                    <a
+                      href={profilePictures[activeChat.id]}
+                      download={`profile_${activeChat.id}.jpg`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="absolute inset-0 bg-black/60 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                      title="Download profile picture"
+                      onClick={e => e.stopPropagation()}
+                    >
+                      <Download className="w-4 h-4 text-[#00e676]" />
+                    </a>
                   )}
                 </div>
                 <div
@@ -4308,7 +4333,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             {/* Messages Area */}
             <div
               ref={scrollRef}
-              className="flex-1 overflow-y-auto p-6 md:p-10 space-y-6 z-10 scroll-smooth custom-scrollbar"
+              className="flex-1 overflow-y-auto p-6 md:p-10 space-y-6 z-10 scroll-smooth custom-scrollbar flex flex-col"
             >
               <div className="flex justify-center mb-10">
                 <div className="bg-[#1b2831] px-4 py-2 rounded-lg border border-white/5 flex items-center gap-3 shadow-xl">
@@ -4355,7 +4380,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     {msg.rawMessage?.imageMessage && (
                       <div className="mb-2 rounded-lg overflow-hidden border border-white/5 relative group/img">
                         <img
-                          src={`/api/u/${SESSION_ID}/media?msgId=${msg.id}&chatId=${activeChat.id}`}
+                          src={`/api/media?msgId=${msg.id}&chatId=${activeChat.id}`}
                           alt="Media"
                           onError={(e) => {
                             e.currentTarget.style.display = 'none';
@@ -4475,7 +4500,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                           <button
                             onClick={async () => {
                               const res = await fetch(
-                                `/api/u/${SESSION_ID}/media?msgId=${msg.id}&chatId=${activeChat.id}`,
+                                `/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
                               );
                               const blob = await res.blob();
                               const url = URL.createObjectURL(blob);
@@ -5427,7 +5452,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         >
                           {s.message?.imageMessage ? (
                             <img
-                              src={`/api/u/${SESSION_ID}/media?msgId=${s.id}&chatId=status@broadcast`}
+                              src={`/api/media?msgId=${s.id}&chatId=status@broadcast`}
                               onError={(e) => {
                                 e.currentTarget.style.display = 'none';
                               }}
@@ -6274,7 +6299,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            `/api/u/${SESSION_ID}/firebase-backup/backup`,
+                                            "/api/firebase-backup/backup",
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
@@ -6302,7 +6327,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                                         setBackupError(null);
                                         try {
                                           const res = await fetch(
-                                            `/api/u/${SESSION_ID}/firebase-backup/restore`,
+                                            "/api/firebase-backup/restore",
                                             { method: "POST" },
                                           );
                                           if (!res.ok)
