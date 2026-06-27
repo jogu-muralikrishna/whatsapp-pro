@@ -1954,6 +1954,63 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             });
             if (!newMsg.fromMe && newMsg.text) getAiSuggestions(newMsg.text);
           }
+
+          // FIX: Bump the chat to the top of the list when a new message arrives
+          {
+            const chatJid = incomingJid;
+            const msgTimestamp = (msgData.messageTimestamp || 0) * 1000;
+            const lastMsgText = getMsgText(msgData);
+            setChats((prev) => {
+              const idx = prev.findIndex((c) => c.id === chatJid);
+              let updated;
+              if (idx !== -1) {
+                updated = [...prev];
+                updated[idx] = {
+                  ...updated[idx],
+                  timestamp: msgData.messageTimestamp || Date.now() / 1000,
+                  lastMessage: lastMsgText,
+                  unreadCount: msgData.key?.fromMe
+                    ? updated[idx].unreadCount || 0
+                    : (updated[idx].unreadCount || 0) + 1,
+                };
+              } else {
+                updated = [
+                  ...prev,
+                  {
+                    id: chatJid,
+                    name: msgData.pushName || chatJid.split("@")[0],
+                    timestamp: msgData.messageTimestamp || Date.now() / 1000,
+                    lastMessage: lastMsgText,
+                    unreadCount: msgData.key?.fromMe ? 0 : 1,
+                  },
+                ];
+              }
+              return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            });
+          }
+          break;
+
+        case "MESSAGES_UPDATE":
+          // FIX: Handle read receipts — turn ticks blue when recipient reads the message
+          if (Array.isArray(data)) {
+            data.forEach((update: any) => {
+              const { key, update: msgUpdate } = update;
+              if (!key || !msgUpdate) return;
+              // status 3 = read in Baileys
+              if (msgUpdate.status === 3 || msgUpdate.status === "READ") {
+                let jid = key.remoteJid || "";
+                if (jid.endsWith("@c.us")) jid = jid.replace("@c.us", "@s.whatsapp.net");
+                const activeJid = activeChatRef.current?.id || "";
+                if (jid === activeJid || jid === activeJid.replace("@s.whatsapp.net", "@c.us")) {
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === key.id ? { ...m, status: "read" } : m
+                    )
+                  );
+                }
+              }
+            });
+          }
           break;
       }
     };
