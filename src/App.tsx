@@ -103,6 +103,56 @@ function safeFormat(
   }
 }
 
+// Smart date: shows "HH:mm" for today, "Yesterday" for yesterday, "dd/MM/yy" for older
+function smartChatDate(dateVal: any): string {
+  if (dateVal === undefined || dateVal === null) return "";
+  try {
+    let d: Date;
+    if (typeof dateVal === "number") {
+      const val = dateVal < 100000000000 ? dateVal * 1000 : dateVal;
+      d = new Date(val);
+    } else {
+      d = new Date(dateVal);
+    }
+    if (isNaN(d.getTime())) return "";
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const isYesterday = d.toDateString() === yesterday.toDateString();
+    if (isToday) return format(d, "HH:mm");
+    if (isYesterday) return "Yesterday";
+    return format(d, "dd/MM/yy");
+  } catch (e) {
+    return "";
+  }
+}
+
+// Full datetime for message bubbles: "dd MMM yyyy, HH:mm"
+function smartMsgTime(dateVal: any): string {
+  if (dateVal === undefined || dateVal === null) return "";
+  try {
+    let d: Date;
+    if (typeof dateVal === "number") {
+      const val = dateVal < 100000000000 ? dateVal * 1000 : dateVal;
+      d = new Date(val);
+    } else {
+      d = new Date(dateVal);
+    }
+    if (isNaN(d.getTime())) return "";
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const isYesterday = d.toDateString() === yesterday.toDateString();
+    if (isToday) return `Today, ${format(d, "HH:mm")}`;
+    if (isYesterday) return `Yesterday, ${format(d, "HH:mm")}`;
+    return format(d, "dd MMM yyyy, HH:mm");
+  } catch (e) {
+    return "";
+  }
+}
+
 interface Chat {
   id: string;
   name: string;
@@ -3124,7 +3174,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                             </button>
                           )}
                           <span className="text-[9px] text-[#8696a0] font-black mr-1">
-                            {safeFormat(chat.timestamp, "HH:mm")}
+                            {smartChatDate(chat.timestamp)}
                           </span>
                         </div>
                       </div>
@@ -4468,7 +4518,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     <div className="flex items-center justify-between gap-2 mt-2 pt-1 border-t border-white/5">
                       <div className="flex items-center gap-2">
                         <span className="text-[8px] opacity-40 font-black">
-                          {safeFormat(msg.timestamp, "HH:mm")}
+                          {smartMsgTime(msg.timestamp)}
                         </span>
                         {msg.fromMe && (
                           <Check
