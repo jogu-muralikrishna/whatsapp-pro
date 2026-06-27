@@ -174,6 +174,177 @@ interface Message {
 
 type Tab = "CHATS" | "STATUS" | "CALLS" | "RECORDS" | "SETTINGS";
 
+// ── Chat Statistics Component ──
+function ChatStatistics({ chats, messages, activeChat, apiFetch }: { chats: any[]; messages: any[]; activeChat: any; apiFetch: Function }) {
+  const [allMessages, setAllMessages] = React.useState<any[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [fetched, setFetched] = React.useState(false);
+
+  // Use messages already loaded in current chat + chat metadata
+  React.useEffect(() => {
+    if (messages && messages.length > 0) {
+      setAllMessages(messages);
+      setFetched(true);
+    }
+  }, [messages]);
+
+  // ── Compute stats from chats list + current messages ──
+  const totalChats = chats.length;
+  const groupChats = chats.filter(c => c.isGroup).length;
+  const privateChats = totalChats - groupChats;
+
+  // From current chat messages
+  const sent = allMessages.filter(m => m.fromMe).length;
+  const received = allMessages.filter(m => !m.fromMe).length;
+  const total = allMessages.length;
+
+  // Most active contacts from chats list (by unread + activity)
+  const topContacts = [...chats]
+    .filter(c => !c.isGroup && c.id)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+    .slice(0, 5);
+
+  // Messages per day (last 7 days from current chat)
+  const last7Days = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() - (6 - i));
+    const key = d.toDateString();
+    const label = d.toLocaleDateString('en', { weekday: 'short' });
+    const count = allMessages.filter(m => {
+      const md = new Date(m.timestamp);
+      return md.toDateString() === key;
+    }).length;
+    return { label, count };
+  });
+  const maxDay = Math.max(...last7Days.map(d => d.count), 1);
+
+  // Peak hours (0-23) from current chat
+  const hourCounts = Array(24).fill(0);
+  allMessages.forEach(m => {
+    const h = new Date(m.timestamp).getHours();
+    hourCounts[h]++;
+  });
+  const maxHour = Math.max(...hourCounts, 1);
+  const peakHour = hourCounts.indexOf(Math.max(...hourCounts));
+
+  const statCard = (label: string, value: string | number, color: string, sub?: string) => (
+    <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px', flex: 1, minWidth: '0' }}>
+      <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '6px' }}>{label}</p>
+      <p style={{ color, fontSize: '24px', fontWeight: 900, lineHeight: 1 }}>{value}</p>
+      {sub && <p style={{ color: 'rgba(255,255,255,0.2)', fontSize: '9px', marginTop: '4px' }}>{sub}</p>}
+    </div>
+  );
+
+  return (
+    <div style={{ width: '100%', overflowY: 'auto', maxHeight: '70vh', display: 'flex', flexDirection: 'column', gap: '16px', paddingBottom: '8px' }}>
+
+      {/* Header */}
+      <div style={{ textAlign: 'center', paddingBottom: '4px' }}>
+        <p style={{ color: '#00e676', fontSize: '9px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '3px' }}>
+          {activeChat ? `Stats — ${activeChat.name || activeChat.id?.split('@')[0]}` : 'Overall Statistics'}
+        </p>
+        {!activeChat && <p style={{ color: 'rgba(255,255,255,0.2)', fontSize: '9px', marginTop: '4px' }}>Open a chat to see per-chat stats</p>}
+      </div>
+
+      {/* Top stat cards */}
+      <div style={{ display: 'flex', gap: '8px' }}>
+        {statCard('Total Chats', totalChats, '#00e676')}
+        {statCard('Groups', groupChats, '#a78bfa')}
+        {statCard('Private', privateChats, '#38bdf8')}
+      </div>
+
+      {activeChat && (
+        <div style={{ display: 'flex', gap: '8px' }}>
+          {statCard('Sent', sent, '#00e676', 'by you')}
+          {statCard('Received', received, '#38bdf8', 'from them')}
+          {statCard('Total', total, '#f59e0b', 'in this chat')}
+        </div>
+      )}
+
+      {/* Messages per day — bar chart */}
+      {activeChat && (
+        <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
+          <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '12px' }}>Messages — Last 7 Days</p>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '6px', height: '80px' }}>
+            {last7Days.map((d, i) => (
+              <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', height: '100%', justifyContent: 'flex-end' }}>
+                <span style={{ color: 'rgba(255,255,255,0.4)', fontSize: '8px', fontWeight: 700 }}>{d.count || ''}</span>
+                <div style={{ width: '100%', background: d.count > 0 ? '#00e676' : 'rgba(255,255,255,0.05)', borderRadius: '4px 4px 0 0', height: `${Math.max((d.count / maxDay) * 60, d.count > 0 ? 4 : 2)}px`, transition: 'height 0.5s ease' }} />
+                <span style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 700 }}>{d.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Peak hours chart */}
+      {activeChat && total > 0 && (
+        <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px' }}>Peak Hours</p>
+            <span style={{ color: '#00e676', fontSize: '9px', fontWeight: 900 }}>🔥 {peakHour}:00 – {peakHour + 1}:00</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '50px' }}>
+            {hourCounts.map((count, h) => (
+              <div
+                key={h}
+                title={`${h}:00 — ${count} msgs`}
+                style={{
+                  flex: 1,
+                  background: h === peakHour ? '#00e676' : count > 0 ? `rgba(0,230,118,${0.15 + (count / maxHour) * 0.6})` : 'rgba(255,255,255,0.03)',
+                  borderRadius: '2px 2px 0 0',
+                  height: `${Math.max((count / maxHour) * 50, count > 0 ? 3 : 1)}px`,
+                  transition: 'height 0.3s ease',
+                  cursor: 'default',
+                }}
+              />
+            ))}
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px' }}>
+            <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '7px' }}>12AM</span>
+            <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '7px' }}>6AM</span>
+            <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '7px' }}>12PM</span>
+            <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '7px' }}>6PM</span>
+            <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '7px' }}>11PM</span>
+          </div>
+        </div>
+      )}
+
+      {/* Most active contacts */}
+      <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
+        <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '12px' }}>Most Recent Contacts</p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {topContacts.length === 0 && (
+            <p style={{ color: 'rgba(255,255,255,0.2)', fontSize: '10px', textAlign: 'center', padding: '12px' }}>No chats yet</p>
+          )}
+          {topContacts.map((c, i) => (
+            <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <span style={{ color: '#00e676', fontSize: '10px', fontWeight: 900, width: '16px', textAlign: 'center' }}>#{i + 1}</span>
+              <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: '#1f2c34', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#00e676', fontWeight: 900, fontSize: '11px', flexShrink: 0 }}>
+                {(c.name || c.id || '?')[0].toUpperCase()}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <p style={{ color: '#fff', fontSize: '11px', fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {c.name || c.id?.split('@')[0] || 'Unknown'}
+                </p>
+                <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '9px' }}>
+                  {c.timestamp ? new Date(c.timestamp).toLocaleDateString() : '—'}
+                </p>
+              </div>
+              {c.unreadCount > 0 && (
+                <span style={{ background: '#00e676', color: '#000', fontSize: '8px', fontWeight: 900, borderRadius: '99px', padding: '2px 6px' }}>
+                  {c.unreadCount}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
 // ── Ghost Message Panel Component ──
 function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: string; apiFetch: Function }) {
   const [targetPhone, setTargetPhone] = useState('');
@@ -2540,72 +2711,13 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       onClick={() => setWaConnectMode("direct")}
                       className={`flex-1 py-2 rounded-lg text-[8.5px] font-black uppercase tracking-widest transition-all ${waConnectMode === "direct" ? "bg-primary text-black" : "text-slate-400 hover:text-slate-200"}`}
                     >
-                      Chat QR Link
+                      📊 Statistics
                     </button>
                   </div>
 
                   {waConnectMode === "direct" ? (
-                    /* Direct WA.me Link Generator QR // FIXED */
-                    <div className="w-full flex flex-col items-center space-y-4">
-                      <div className="p-4 bg-white rounded-2xl shadow-2xl relative group">
-                        <div className="relative bg-white p-1 rounded-lg">
-                          <QRCode 
-                            id="direct-wa-qr"
-                            value={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`} 
-                            size={180} 
-                          />
-                          <div className="absolute inset-0 border-4 border-[#00a884]/20 rounded-lg pointer-events-none animate-pulse" />
-                        </div>
-                        <div className="absolute inset-0 bg-primary/5 pointer-events-none group-hover:opacity-0 transition-opacity" />
-                      </div>
-
-                      <div className="text-center">
-                        <p className="text-[10px] text-primary font-black uppercase tracking-widest mb-1">
-                          Scan to Chat Now
-                        </p>
-                        <p className="text-[8px] text-slate-400 font-medium">
-                          Opens real WhatsApp instantly
-                        </p>
-                      </div>
-
-                      {/* Inputs to customize target link */}
-                      <div className="w-full space-y-3 pt-2">
-                        <div className="space-y-1">
-                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
-                            Target Phone Number
-                          </label>
-                          <input
-                            type="text"
-                            placeholder="e.g. 12065550100"
-                            className="w-full px-3 py-2.5 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all font-mono"
-                            value={waLinkPhone}
-                            onChange={(e) => setWaLinkPhone(e.target.value.replace(/[^\d+]/g, ""))}
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider">
-                            Preset Message content
-                          </label>
-                          <textarea
-                            rows={2}
-                            placeholder="Type greeting message..."
-                            className="w-full px-3 py-2 bg-[#121214] border border-white/5 rounded-xl text-xs text-white placeholder-white/20 outline-none focus:border-[#00a884] transition-all"
-                            value={waLinkMessage}
-                            onChange={(e) => setWaLinkMessage(e.target.value)}
-                          />
-                        </div>
-
-                        <a
-                          href={`https://wa.me/${waLinkPhone.replace(/\D/g, "")}${waLinkMessage ? `?text=${encodeURIComponent(waLinkMessage)}` : ""}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="w-full bg-[#00a884] text-white font-black py-3 rounded-xl hover:opacity-90 transition-all text-[9px] uppercase tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-[#00a884]/15"
-                        >
-                          Send Message / Open Link 🚀
-                        </a>
-                      </div>
-                    </div>
+                    /* Chat Statistics Panel */
+                    <ChatStatistics chats={chats} messages={messages} activeChat={activeChat} apiFetch={apiFetch} />
                   ) : (
                     /* Default Baileys Authenticator Token QR */
                     <div className="flex flex-col items-center w-full">
