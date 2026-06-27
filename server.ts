@@ -646,7 +646,11 @@ async function startServer() {
     patchWSSForMultiUser(wss);
     app.use('/api/u/:userId', multiUserRouter);
 
-    // ── Multi-user: sessions are created on-demand when each user connects ──────
+    // Auto-start a "default" isolated session for backwards compatibility
+    // sessionManager is the singleton exported from UserSessionManager.ts
+    const defaultSession = sessionManager.getOrCreate('default');
+    initUserEngine(defaultSession);
+    // ──────────────────────────────────────────────────────────────────────────
 
     // Seed and initialize DB asynchronously to avoid blocking handler import // FIXED
     DatabaseService.initDatabase().catch((dbErr: any) => {
@@ -2876,6 +2880,19 @@ async function initWASocket() {
             return res.json({ status: 'success' });
         }
         res.status(404).json({ error: 'Chat not found' });
+    });
+
+    app.post('/api/subscribe-presence', async (req: any, res: any) => {
+        const { jid } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (sock) {
+                await sock.presenceSubscribe(jid);
+            }
+            return res.json({ status: 'subscribed' });
+        } catch (e: any) {
+            return res.status(500).json({ error: e.message });
+        }
     });
 
     app.post('/api/block-contact', async (req, res) => {
