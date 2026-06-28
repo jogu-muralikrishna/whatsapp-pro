@@ -2667,6 +2667,8 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       setPlayingAudio(prev => ({ ...prev, [msgId]: { playing: true, progress: 0, duration: audio.duration || 0 } }));
     } catch (e) {}
   };
+
+  const reportContact = async (jid: string) => {
     try {
       await fetch(`${API_BASE}/api/report-contact`, {
         method: "POST",
