@@ -3380,6 +3380,80 @@ async function initWASocket() {
 
     const ppCache = new Map<string, string | null>();
 
+    // ── Batch 2: Status Viewers ──
+    app.get('/api/status-viewers', async (req: any, res: any) => {
+        const { msgId } = req.query;
+        if (!msgId) return res.json({ viewers: [] });
+        try {
+            // WhatsApp Business API only — fallback to empty for regular accounts
+            const viewers = proData.statusViewers?.[msgId as string] || [];
+            return res.json({ viewers });
+        } catch (e: any) { return res.json({ viewers: [] }); }
+    });
+
+    // ── Batch 2: Poll ──
+    app.post('/api/send-poll', async (req: any, res: any) => {
+        const { jid, question, options } = req.body;
+        if (!jid || !question || !options?.length) return res.status(400).json({ error: 'Missing fields' });
+        try {
+            if (!sock) return res.status(503).json({ error: 'Not connected' });
+            await sock.sendMessage(jid, {
+                poll: { name: question, values: options, selectableCount: 1 }
+            });
+            return res.json({ status: 'sent' });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    app.post('/api/vote-poll', async (req: any, res: any) => {
+        const { jid, msgId, option } = req.body;
+        if (!jid || !msgId || !option) return res.status(400).json({ error: 'Missing fields' });
+        try {
+            // Poll votes handled client-side; server just acknowledges
+            return res.json({ status: 'voted', option });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    // ── Batch 2: Group Admin ──
+    app.post('/api/group-remove', async (req: any, res: any) => {
+        const { jid, participant } = req.body;
+        if (!jid || !participant) return res.status(400).json({ error: 'Missing fields' });
+        try {
+            if (!sock) return res.status(503).json({ error: 'Not connected' });
+            await sock.groupParticipantsUpdate(jid, [participant], 'remove');
+            return res.json({ status: 'removed' });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    app.post('/api/group-admin', async (req: any, res: any) => {
+        const { jid, participant, action } = req.body;
+        if (!jid || !participant || !action) return res.status(400).json({ error: 'Missing fields' });
+        try {
+            if (!sock) return res.status(503).json({ error: 'Not connected' });
+            await sock.groupParticipantsUpdate(jid, [participant], action === 'promote' ? 'promote' : 'demote');
+            return res.json({ status: action });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    app.get('/api/group-invite/:jid', async (req: any, res: any) => {
+        const { jid } = req.params;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (!sock) return res.status(503).json({ error: 'Not connected' });
+            const code = await sock.groupInviteCode(jid);
+            return res.json({ code });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    app.post('/api/group-revoke-invite', async (req: any, res: any) => {
+        const { jid } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (!sock) return res.status(503).json({ error: 'Not connected' });
+            await sock.groupRevokeInvite(jid);
+            return res.json({ status: 'revoked' });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
     app.get('/api/profile-picture', async (req, res) => {
         const jid = req.query.jid as string;
         if (!jid) return res.json({ url: null });
