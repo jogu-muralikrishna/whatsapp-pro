@@ -2886,10 +2886,44 @@ async function initWASocket() {
         const { jid } = req.body;
         if (!jid) return res.status(400).json({ error: 'Missing jid' });
         try {
-            if (sock) {
-                await sock.presenceSubscribe(jid);
-            }
+            if (sock) await sock.presenceSubscribe(jid);
             return res.json({ status: 'subscribed' });
+        } catch (e: any) {
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.post('/api/disappearing-messages', async (req: any, res: any) => {
+        const { jid, duration } = req.body;
+        if (!jid) return res.status(400).json({ error: 'Missing jid' });
+        try {
+            if (sock) await sock.sendMessage(jid, { disappearingMessagesInChat: duration });
+            return res.json({ status: 'success', duration });
+        } catch (e: any) {
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.get('/api/search-messages', async (req: any, res: any) => {
+        const q = (req.query.q || '').toLowerCase();
+        if (!q) return res.json({ results: [] });
+        try {
+            const results: any[] = [];
+            if (proData.cachedChats) {
+                for (const chat of proData.cachedChats.slice(0, 20)) {
+                    if (chat.lastMessage?.message) {
+                        const text = chat.lastMessage.message.conversation ||
+                            chat.lastMessage.message.extendedTextMessage?.text || '';
+                        if (text.toLowerCase().includes(q)) {
+                            results.push({
+                                chat: { id: chat.id, name: chat.name },
+                                msg: { id: chat.lastMessage.key?.id, text, timestamp: chat.lastMessage.messageTimestamp * 1000 }
+                            });
+                        }
+                    }
+                }
+            }
+            return res.json({ results });
         } catch (e: any) {
             return res.status(500).json({ error: e.message });
         }
