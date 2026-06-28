@@ -518,6 +518,29 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
+  // ── Reply to message ──
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  // ── Pinned messages per chat ──
+  const [pinnedMessages, setPinnedMessages] = useState<Record<string, Message[]>>({});
+  const [showPinned, setShowPinned] = useState(false);
+
+  // ── Global Search ──
+  const [showGlobalSearch, setShowGlobalSearch] = useState(false);
+  const [globalSearchQuery, setGlobalSearchQuery] = useState('');
+  const [globalSearchResults, setGlobalSearchResults] = useState<{chat: any; msg: any}[]>([]);
+  const [globalSearching, setGlobalSearching] = useState(false);
+
+  // ── Disappearing Messages ──
+  const [disappearingSettings, setDisappearingSettings] = useState<Record<string, number>>({}); // chatId -> seconds (0 = off)
+  const [showDisappearingModal, setShowDisappearingModal] = useState(false);
+
+  // ── View Once ──
+  const [viewedOnce, setViewedOnce] = useState<Set<string>>(new Set());
+  // ── Multi-forward ──
+  const [forwardTargets, setForwardTargets] = useState<string[]>([]);
+  // ── Audio waveform playback ──
+  const [playingAudio, setPlayingAudio] = useState<Record<string, { playing: boolean; progress: number; duration: number }>>({});
+  const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("CHATS");
@@ -2462,7 +2485,8 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       timestamp: Date.now(),
       fromMe: true,
       status: "sent",
-    };
+      replyTo: replyingTo ? { id: replyingTo.id, text: replyingTo.text, sender: replyingTo.sender } : undefined,
+    } as any;
 
     if (selectedAccount === "friend") {
       setMessagesFriend((prev) => [...prev, msg]);
@@ -2470,23 +2494,25 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       setMessages((prev) => [...prev, msg]);
     }
     setNewMessage("");
+    setReplyingTo(null);
     setAiSuggestions([]);
 
     try {
       const res = await apiFetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jid: currentActiveChat.id, text: currentNewMessage, account: selectedAccount }),
+        body: JSON.stringify({
+          jid: currentActiveChat.id,
+          text: currentNewMessage,
+          account: selectedAccount,
+          quoted: replyingTo?.rawMessage || undefined,
+        }),
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(
-          errData.error || `Server returned status code ${res.status}`,
-        );
+        throw new Error(errData.error || `Server returned status code ${res.status}`);
       }
-      
       const setChatsFunc = selectedAccount === "friend" ? setChatsFriend : setChats;
-      // Update local chat timestamp/last message for immediate feedback
       setChatsFunc((prev) => {
         const index = prev.findIndex((c) => c.id === currentActiveChat.id);
         if (index === -1) return prev;
@@ -2537,7 +2563,110 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     }
   };
 
-  const reportContact = async (jid: string) => {
+  const pinMessage = (msg: Message) => {
+    if (!activeChat) return;
+    setPinnedMessages(prev => {
+      const current = prev[activeChat.id] || [];
+      const already = current.some(m => m.id === msg.id);
+      return {
+        ...prev,
+        [activeChat.id]: already
+          ? current.filter(m => m.id !== msg.id)
+          : [...current, msg].slice(-3), // max 3 pinned
+      };
+    });
+  };
+
+  // ── Global Search across all chats ──
+  const runGlobalSearch = async (query: string) => {
+    if (!query.trim()) { setGlobalSearchResults([]); return; }
+    setGlobalSearching(true);
+    try {
+      const res = await apiFetch(`/api/search-messages?q=${encodeURIComponent(query)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setGlobalSearchResults(data.results || []);
+      } else {
+        // Fallback: search through loaded messages locally
+        const results: {chat: any; msg: any}[] = [];
+        chats.forEach(chat => {
+          // We only have current chat's messages loaded
+          if (activeChat?.id === chat.id) {
+            messages.forEach(msg => {
+              if (msg.text?.toLowerCase().includes(query.toLowerCase())) {
+                results.push({ chat, msg });
+              }
+            });
+          }
+        });
+        setGlobalSearchResults(results);
+      }
+    } catch {
+      // Local fallback
+      const results: {chat: any; msg: any}[] = [];
+      messages.forEach(msg => {
+        if (msg.text?.toLowerCase().includes(query.toLowerCase()) && activeChat) {
+          results.push({ chat: activeChat, msg });
+        }
+      });
+      setGlobalSearchResults(results);
+    } finally {
+      setGlobalSearching(false);
+    }
+  };
+
+  // ── Set disappearing messages for a chat ──
+  const setDisappearing = async (seconds: number) => {
+    if (!activeChat) return;
+    try {
+      await apiFetch('/api/disappearing-messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid: activeChat.id, duration: seconds }),
+      });
+      setDisappearingSettings(prev => ({ ...prev, [activeChat.id]: seconds }));
+      setShowDisappearingModal(false);
+    } catch (e: any) {
+      setError(`Failed to set disappearing messages: ${e.message}`);
+    }
+  };
+
+  const playAudioMsg = async (msgId: string, chatId: string) => {
+    // Stop any currently playing
+    Object.entries(audioRefs.current).forEach(([id, audio]) => {
+      if (id !== msgId) { audio.pause(); audio.currentTime = 0; }
+    });
+    if (audioRefs.current[msgId]) {
+      const audio = audioRefs.current[msgId];
+      if (playingAudio[msgId]?.playing) {
+        audio.pause();
+        setPlayingAudio(prev => ({ ...prev, [msgId]: { ...prev[msgId], playing: false } }));
+      } else {
+        audio.play();
+        setPlayingAudio(prev => ({ ...prev, [msgId]: { ...prev[msgId], playing: true } }));
+      }
+      return;
+    }
+    // Load and play
+    try {
+      const res = await apiFetch(`/api/media?msgId=${msgId}&chatId=${chatId}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRefs.current[msgId] = audio;
+      audio.addEventListener('loadedmetadata', () => {
+        setPlayingAudio(prev => ({ ...prev, [msgId]: { playing: false, progress: 0, duration: audio.duration } }));
+      });
+      audio.addEventListener('timeupdate', () => {
+        setPlayingAudio(prev => ({ ...prev, [msgId]: { ...prev[msgId], progress: (audio.currentTime / audio.duration) * 100 } }));
+      });
+      audio.addEventListener('ended', () => {
+        setPlayingAudio(prev => ({ ...prev, [msgId]: { ...prev[msgId], playing: false, progress: 0 } }));
+      });
+      await audio.play();
+      setPlayingAudio(prev => ({ ...prev, [msgId]: { playing: true, progress: 0, duration: audio.duration || 0 } }));
+    } catch (e) {}
+  };
     try {
       await fetch(`${API_BASE}/api/report-contact`, {
         method: "POST",
@@ -4285,10 +4414,19 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 </div>
               </div>
               <div className="flex items-center gap-5 text-[#aebac1]">
+                {/* Global Search */}
                 <button
-                  onClick={() => setShowScheduleModal(true)}
+                  onClick={() => { setShowGlobalSearch(true); setGlobalSearchQuery(''); setGlobalSearchResults([]); }}
                   className="hover:text-primary transition-colors p-1"
-                  title="Schedule Protocol"
+                  title="Search All Chats"
+                >
+                  <Search className="w-5 h-5" />
+                </button>
+                {/* Disappearing Messages */}
+                <button
+                  onClick={() => setShowDisappearingModal(true)}
+                  className={`hover:text-primary transition-colors p-1 ${disappearingSettings[activeChat.id] ? 'text-[#00a884]' : ''}`}
+                  title="Disappearing Messages"
                 >
                   <Clock className="w-5 h-5" />
                 </button>
@@ -4498,6 +4636,34 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
               </div>
             )}
 
+            {/* Pinned Messages Bar */}
+            {activeChat && pinnedMessages[activeChat.id]?.length > 0 && (
+              <div className="border-b border-white/5 bg-[#1f2c34]">
+                <button
+                  onClick={() => setShowPinned(!showPinned)}
+                  className="w-full flex items-center gap-3 px-4 py-2 hover:bg-white/5 transition-colors"
+                >
+                  <div className="w-1 h-6 bg-[#00a884] rounded-full" />
+                  <div className="flex-1 text-left">
+                    <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest">📌 {pinnedMessages[activeChat.id].length} Pinned Message{pinnedMessages[activeChat.id].length > 1 ? 's' : ''}</p>
+                    <p className="text-[10px] text-white/60 truncate">{pinnedMessages[activeChat.id][pinnedMessages[activeChat.id].length - 1]?.text}</p>
+                  </div>
+                  <ChevronRight className={`w-4 h-4 text-white/30 transition-transform ${showPinned ? 'rotate-90' : ''}`} />
+                </button>
+                {showPinned && (
+                  <div className="px-4 pb-3 space-y-2">
+                    {pinnedMessages[activeChat.id].map((pm, i) => (
+                      <div key={pm.id} className="flex items-center gap-3 p-2 bg-white/5 rounded-xl">
+                        <span className="text-[9px] text-[#00a884] font-black">#{i + 1}</span>
+                        <p className="text-xs text-white/70 flex-1 truncate">{pm.text}</p>
+                        <button onClick={() => pinMessage(pm)} className="text-white/20 hover:text-red-400 transition-colors"><X className="w-3 h-3" /></button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Messages Area */}
             <div
               ref={scrollRef}
@@ -4663,25 +4829,33 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     )}
 
                     {msg.rawMessage?.audioMessage && (
-                      <div className="mb-2 rounded-xl p-3 bg-white/5 border border-white/5 flex flex-col gap-2 min-w-[200px]">
-                        <div className="flex items-center gap-4">
+                      <div className="mb-2 rounded-xl p-3 bg-white/5 border border-white/5 flex flex-col gap-2 min-w-[220px]">
+                        <div className="flex items-center gap-3">
                           <button
-                            onClick={async () => {
-                              const res = await fetch(
-                                `/api/media?msgId=${msg.id}&chatId=${activeChat.id}`,
-                              );
-                              const blob = await res.blob();
-                              const url = URL.createObjectURL(blob);
-                              new Audio(url).play().catch(() => {});
-                            }}
-                            className="w-10 h-10 bg-[#00a884] rounded-full flex items-center justify-center hover:bg-[#00bc95] transition-colors shadow-lg"
+                            onClick={() => playAudioMsg(msg.id, activeChat.id)}
+                            className="w-10 h-10 bg-[#00a884] rounded-full flex items-center justify-center hover:bg-[#00bc95] transition-colors shadow-lg shrink-0"
                           >
-                            <Play className="w-5 h-5 text-white" />
+                            {playingAudio[msg.id]?.playing
+                              ? <span className="flex gap-0.5"><span className="w-1 h-3 bg-white rounded-full"/><span className="w-1 h-3 bg-white rounded-full"/></span>
+                              : <Play className="w-4 h-4 text-white ml-0.5" />}
                           </button>
-                          <div className="flex-1 h-1.5 bg-white/10 rounded-full relative overflow-hidden">
-                            <div className="absolute inset-0 bg-[#00a884] w-[40%] animate-pulse" />
+                          {/* Animated waveform */}
+                          <div className="flex-1 flex items-center gap-[2px] h-8">
+                            {[3,5,8,12,7,10,14,9,6,11,8,13,5,9,12,7,10,6,14,8,11,5,9,13,7,10,6,8,12,4].map((h, i) => (
+                              <div
+                                key={i}
+                                className="rounded-full"
+                                style={{
+                                  width: '3px',
+                                  height: `${h}px`,
+                                  background: playingAudio[msg.id]?.playing ? '#00a884' : 'rgba(255,255,255,0.2)',
+                                  animation: playingAudio[msg.id]?.playing ? `pulse ${0.5 + (i % 5) * 0.1}s ease-in-out infinite alternate` : 'none',
+                                  transition: 'background 0.2s',
+                                }}
+                              />
+                            ))}
                           </div>
-                          <span className="text-[10px] font-bold opacity-40 font-mono">
+                          <span className="text-[10px] font-bold opacity-40 font-mono shrink-0">
                             {msg.rawMessage.audioMessage.seconds
                               ? `${Math.floor(msg.rawMessage.audioMessage.seconds / 60)}:${(msg.rawMessage.audioMessage.seconds % 60).toString().padStart(2, "0")}`
                               : "0:00"}
@@ -4689,16 +4863,10 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         </div>
                         <div className="flex justify-between items-center px-1">
                           <p className="text-[9px] font-black uppercase text-[#00a884] tracking-widest">
-                            Sonic Signal
+                            {msg.rawMessage.audioMessage.ptt ? '🎤 Voice Message' : '🎵 Audio'}
                           </p>
                           <button
-                            onClick={() =>
-                              downloadMediaWithFormat(
-                                msg.id,
-                                activeChat.id,
-                                "mp3"
-                              )
-                            }
+                            onClick={() => downloadMediaWithFormat(msg.id, activeChat.id, "mp3")}
                             className="p-1 hover:bg-white/10 rounded-full cursor-pointer"
                           >
                             <Download className="w-3 h-3" />
@@ -4812,6 +4980,14 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                               {emoji}
                             </button>
                           ))}
+                          {/* Reply button */}
+                          <button
+                            onClick={() => setReplyingTo(msg)}
+                            className="opacity-0 group-hover:opacity-100 transition-opacity ml-1 text-white/30 hover:text-[#00a884]"
+                            title="Reply"
+                          >
+                            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 17l-5-5 5-5M4 12h12a4 4 0 0 1 0 8h-1"/></svg>
+                          </button>
                         </div>
                       </div>
                       <button
@@ -4824,6 +5000,22 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         <Trash2 className="w-3 h-3" />
                       </button>
                     </div>
+                    {/* Reaction display on bubble */}
+                    {(msg as any).reaction && (
+                      <div className={`absolute -bottom-3 ${msg.fromMe ? 'right-2' : 'left-2'} bg-[#233138] border border-white/10 rounded-full px-2 py-0.5 text-sm shadow-lg`}>
+                        {(msg as any).reaction}
+                      </div>
+                    )}
+                    {/* View once indicator */}
+                    {msg.rawMessage?.viewOnceMessage && !viewedOnce.has(msg.id) && (
+                      <div
+                        className="absolute inset-0 bg-black/80 rounded-2xl flex flex-col items-center justify-center cursor-pointer gap-2"
+                        onClick={() => setViewedOnce(prev => new Set([...prev, msg.id]))}
+                      >
+                        <span className="text-2xl">👁️</span>
+                        <p className="text-[9px] font-black uppercase text-white/60 tracking-widest">Tap to view once</p>
+                      </div>
+                    )}
                     {/* Visual Chat bubble tail */}
                     <div
                       className={`absolute top-0 w-3 h-4 ${msg.fromMe ? "-right-2" : "-left-2"}`}
@@ -5112,7 +5304,23 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 </AnimatePresence>
               </div>
 
-              <div className="flex-1 bg-[#2a3942] rounded-xl flex items-center px-4 py-1.5 border border-white/[0.02]">
+              <div className="flex-1 bg-[#2a3942] rounded-xl flex flex-col border border-white/[0.02] overflow-hidden">
+                {/* Reply preview bar */}
+                {replyingTo && (
+                  <div className="flex items-center gap-3 px-4 py-2 bg-[#1f2c34] border-b border-white/10">
+                    <div className="w-1 h-8 bg-[#00a884] rounded-full shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest">
+                        {replyingTo.fromMe ? 'You' : replyingTo.sender || 'Them'}
+                      </p>
+                      <p className="text-[10px] text-white/50 truncate">{replyingTo.text || 'Media'}</p>
+                    </div>
+                    <button onClick={() => setReplyingTo(null)} className="text-white/30 hover:text-white shrink-0">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-center px-4 py-1.5">
                 <input
                   type="text"
                   value={newMessage}
@@ -5121,6 +5329,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                   placeholder={
                     isRecording
                       ? "RECORDING SONIC SIGNAL..."
+                      : replyingTo ? `Reply to ${replyingTo.fromMe ? 'yourself' : (replyingTo.sender || 'message')}...`
                       : "EXECUTE MESSAGE..."
                   }
                   className="bg-transparent border-none outline-none text-sm text-white px-3 py-3 w-full placeholder:text-[#8696a0]/40 font-bold tracking-tight"
@@ -5136,6 +5345,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       </span>
                     </div>
                   )}
+                </div>
                 </div>
               </div>
 
@@ -5856,76 +6066,42 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
       <AnimatePresence>
         {showForwardModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="bg-[#111b21] w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden flex flex-col max-h-[70vh]"
-            >
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+            <motion.div initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} className="bg-[#111b21] w-full max-w-md rounded-3xl border border-white/5 shadow-2xl overflow-hidden flex flex-col max-h-[70vh]">
               <div className="p-6 bg-[#202c33] flex items-center justify-between border-b border-white/5">
                 <div className="flex items-center gap-3">
                   <Forward className="w-5 h-5 text-[#00a884]" />
                   <h2 className="text-sm font-black uppercase italic tracking-widest text-[#00a884]">
-                    Forward Signal
+                    Forward {forwardTargets.length > 0 ? `to ${forwardTargets.length} chats` : 'Message'}
                   </h2>
                 </div>
-                <button
-                  onClick={() => {
-                    setShowForwardModal(false);
-                    setForwardMsg(null);
-                  }}
-                  className="text-[#aebac1]"
-                >
-                  <X />
-                </button>
+                <button onClick={() => { setShowForwardModal(false); setForwardMsg(null); setForwardTargets([]); }} className="text-[#aebac1]"><X /></button>
               </div>
               <div className="p-4 bg-[#0b141a] border-b border-white/5">
-                <p className="text-[10px] font-black uppercase text-[#8696af] mb-2 tracking-widest">
-                  Selected Payload
-                </p>
-                <p className="text-xs italic opacity-60 truncate">
-                  "{forwardMsg?.text || "Media Payload"}"
-                </p>
+                <p className="text-[10px] font-black uppercase text-[#8696af] mb-1 tracking-widest">Message</p>
+                <p className="text-xs italic opacity-60 truncate">"{forwardMsg?.text || "Media"}"</p>
               </div>
               <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
-                <p className="text-[10px] font-black uppercase text-[#8696af] mb-3 tracking-widest">
-                  Select Target Node
-                </p>
+                <p className="text-[10px] font-black uppercase text-[#8696af] mb-3 tracking-widest">Tap to select multiple contacts</p>
                 {chats.map((chat) => (
-                  <button
-                    key={chat.id}
-                    onClick={() => forwardMessage(chat.id)}
-                    className="w-full flex items-center gap-4 p-3 rounded-2xl bg-[#202c33] hover:bg-[#2a3942] border border-white/5 transition-all text-left group"
-                  >
-                    <div className="w-10 h-10 rounded-xl bg-[#374248] flex items-center justify-center font-black text-[#00a884] overflow-hidden border border-white/5">
-                      {profilePictures[chat.id] ? (
-                        <img
-                          src={profilePictures[chat.id]}
-                          alt=""
-                          className="w-full h-full object-cover"
-                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                        />
-                      ) : (
-                        getDisplayName(chat)[0]
-                      )}
+                  <button key={chat.id} onClick={() => setForwardTargets(prev => prev.includes(chat.id) ? prev.filter(id => id !== chat.id) : [...prev, chat.id])}
+                    className={`w-full flex items-center gap-4 p-3 rounded-2xl border transition-all text-left ${forwardTargets.includes(chat.id) ? "bg-[#00a884]/10 border-[#00a884]/40" : "bg-[#202c33] border-white/5 hover:bg-[#2a3942]"}`}>
+                    <div className="w-10 h-10 rounded-xl bg-[#374248] flex items-center justify-center font-black text-[#00a884] overflow-hidden border border-white/5 shrink-0">
+                      {profilePictures[chat.id] ? <img src={profilePictures[chat.id]} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = "none"; }} /> : getDisplayName(chat)[0]}
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-black uppercase tracking-tight truncate group-hover:text-[#00a884] transition-colors">
-                        {getDisplayName(chat)}
-                      </p>
-                      <p className="text-[9px] opacity-40 font-mono">
-                        {chat.id.split("@")[0]}
-                      </p>
-                    </div>
-                    <Send className="w-4 h-4 text-[#00a884] opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <p className="text-xs font-black uppercase tracking-tight truncate flex-1">{getDisplayName(chat)}</p>
+                    {forwardTargets.includes(chat.id) && <div className="w-5 h-5 rounded-full bg-[#00a884] flex items-center justify-center shrink-0"><Check className="w-3 h-3 text-black" /></div>}
                   </button>
                 ))}
               </div>
+              {forwardTargets.length > 0 && (
+                <div className="p-4 border-t border-white/5">
+                  <button onClick={async () => { for (const jid of forwardTargets) { await forwardMessage(jid); } setForwardTargets([]); setShowForwardModal(false); setForwardMsg(null); }}
+                    className="w-full bg-[#00a884] text-white font-black py-3 rounded-xl text-xs uppercase tracking-widest flex items-center justify-center gap-2">
+                    <Forward className="w-4 h-4" /> Send to {forwardTargets.length} {forwardTargets.length === 1 ? "chat" : "chats"}
+                  </button>
+                </div>
+              )}
             </motion.div>
           </motion.div>
         )}
@@ -7240,6 +7416,104 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       </AnimatePresence>
 
       <AnimatePresence>
+        {/* Global Search Modal */}
+        {showGlobalSearch && (
+          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-start justify-center pt-16 p-4" onClick={() => setShowGlobalSearch(false)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-lg shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="p-4 border-b border-white/5 flex items-center gap-3">
+                <Search className="w-5 h-5 text-[#00a884] shrink-0" />
+                <input
+                  autoFocus
+                  type="text"
+                  placeholder="Search messages across all chats..."
+                  className="flex-1 bg-transparent text-white outline-none text-sm placeholder:text-white/30"
+                  value={globalSearchQuery}
+                  onChange={e => {
+                    setGlobalSearchQuery(e.target.value);
+                    runGlobalSearch(e.target.value);
+                  }}
+                />
+                <button onClick={() => setShowGlobalSearch(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+              </div>
+              <div className="max-h-96 overflow-y-auto custom-scrollbar">
+                {globalSearching && (
+                  <div className="flex items-center justify-center py-10 gap-3 text-white/30">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span className="text-xs font-bold uppercase tracking-widest">Searching...</span>
+                  </div>
+                )}
+                {!globalSearching && globalSearchQuery && globalSearchResults.length === 0 && (
+                  <div className="flex flex-col items-center justify-center py-10 text-white/20">
+                    <Search className="w-8 h-8 mb-2 opacity-30" />
+                    <p className="text-xs font-bold uppercase tracking-widest">No results found</p>
+                  </div>
+                )}
+                {globalSearchResults.map((r, i) => (
+                  <button
+                    key={i}
+                    onClick={() => {
+                      setActiveChat(r.chat);
+                      setShowGlobalSearch(false);
+                    }}
+                    className="w-full flex items-start gap-3 p-4 hover:bg-white/5 transition-colors border-b border-white/[0.03] text-left"
+                  >
+                    <div className="w-8 h-8 rounded-full bg-[#00a884]/20 flex items-center justify-center shrink-0 text-[#00a884] font-black text-xs">
+                      {(r.chat.name || r.chat.id || '?')[0].toUpperCase()}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[10px] font-black text-[#00a884] uppercase tracking-widest mb-0.5">{r.chat.name || r.chat.id?.split('@')[0]}</p>
+                      <p className="text-xs text-white/60 truncate">{r.msg.text}</p>
+                      <p className="text-[9px] text-white/20 mt-0.5">{smartMsgTime(r.msg.timestamp)}</p>
+                    </div>
+                  </button>
+                ))}
+                {!globalSearchQuery && (
+                  <div className="flex flex-col items-center justify-center py-10 text-white/20">
+                    <Search className="w-8 h-8 mb-2 opacity-30" />
+                    <p className="text-xs font-bold uppercase tracking-widest">Type to search</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Disappearing Messages Modal */}
+        {showDisappearingModal && activeChat && (
+          <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowDisappearingModal(false)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center gap-3 mb-6">
+                <div className="p-3 bg-[#00a884]/10 rounded-xl"><Clock className="w-5 h-5 text-[#00a884]" /></div>
+                <div>
+                  <h3 className="text-white font-black text-sm">Disappearing Messages</h3>
+                  <p className="text-white/40 text-[10px]">Messages will auto-delete after set time</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {[
+                  { label: 'Off', seconds: 0 },
+                  { label: '24 Hours', seconds: 86400 },
+                  { label: '7 Days', seconds: 604800 },
+                  { label: '90 Days', seconds: 7776000 },
+                ].map(opt => (
+                  <button
+                    key={opt.seconds}
+                    onClick={() => setDisappearing(opt.seconds)}
+                    className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all border ${
+                      disappearingSettings[activeChat.id] === opt.seconds
+                        ? 'bg-[#00a884]/10 border-[#00a884]/30 text-[#00a884]'
+                        : 'bg-white/5 border-white/5 text-white/60 hover:bg-white/10'
+                    }`}
+                  >
+                    <span className="text-sm font-bold">{opt.label}</span>
+                    {disappearingSettings[activeChat.id] === opt.seconds && <Check className="w-4 h-4" />}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Block Confirm Dialog */}
         {blockConfirm && (
           <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setBlockConfirm(null)}>
