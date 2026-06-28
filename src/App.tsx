@@ -59,6 +59,10 @@ import {
   MicOff,
   PhoneOff,
   Edit,
+  BarChart2,
+  Copy,
+  Link,
+  Eye,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { format } from "date-fns";
@@ -533,6 +537,27 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   // ── Disappearing Messages ──
   const [disappearingSettings, setDisappearingSettings] = useState<Record<string, number>>({}); // chatId -> seconds (0 = off)
   const [showDisappearingModal, setShowDisappearingModal] = useState(false);
+
+  // ── Batch 2: Poll Messages ──
+  const [showPollModal, setShowPollModal] = useState(false);
+  const [pollQuestion, setPollQuestion] = useState('');
+  const [pollOptions, setPollOptions] = useState(['', '']);
+  const [pollVotes, setPollVotes] = useState<Record<string, Record<string, string>>>({});
+
+  // ── Batch 2: Group Admin Controls ──
+  const [showGroupAdmin, setShowGroupAdmin] = useState(false);
+  const [groupAdminAction, setGroupAdminAction] = useState<{type: 'remove'|'promote'|'demote'; participant: any} | null>(null);
+  const [groupInviteLink, setGroupInviteLink] = useState<string | null>(null);
+  const [loadingInviteLink, setLoadingInviteLink] = useState(false);
+
+  // ── Batch 2: Mention Members ──
+  const [mentionSuggestions, setMentionSuggestions] = useState<any[]>([]);
+  const [showMentions, setShowMentions] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+
+  // ── Batch 2: Status Viewers ──
+  const [showStatusViewers, setShowStatusViewers] = useState(false);
+  const [statusViewers, setStatusViewers] = useState<any[]>([]);
 
   // ── View Once ──
   const [viewedOnce, setViewedOnce] = useState<Set<string>>(new Set());
@@ -2631,6 +2656,108 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     }
   };
 
+  // ── Send Poll ──
+  const sendPoll = async () => {
+    if (!activeChat || !pollQuestion.trim() || pollOptions.filter(o => o.trim()).length < 2) return;
+    try {
+      await apiFetch('/api/send-poll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jid: activeChat.id,
+          question: pollQuestion,
+          options: pollOptions.filter(o => o.trim()),
+        }),
+      });
+      setShowPollModal(false);
+      setPollQuestion('');
+      setPollOptions(['', '']);
+    } catch (e: any) {
+      setError(`Failed to send poll: ${e.message}`);
+    }
+  };
+
+  // ── Vote on Poll ──
+  const votePoll = async (msgId: string, option: string) => {
+    if (!activeChat) return;
+    setPollVotes(prev => ({ ...prev, [msgId]: { ...(prev[msgId] || {}), vote: option } }));
+    try {
+      await apiFetch('/api/vote-poll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid: activeChat.id, msgId, option }),
+      });
+    } catch (e) {}
+  };
+
+  // ── Group Admin: Remove / Promote / Demote ──
+  const groupAdminAction_exec = async () => {
+    if (!activeChat || !groupAdminAction) return;
+    const { type, participant } = groupAdminAction;
+    try {
+      if (type === 'remove') {
+        await apiFetch('/api/group-remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid: activeChat.id, participant: participant.id }),
+        });
+      } else {
+        await apiFetch('/api/group-admin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid: activeChat.id, participant: participant.id, action: type }),
+        });
+      }
+      setGroupAdminAction(null);
+      // Refresh group metadata
+      const res = await apiFetch(`/api/group-metadata/${activeChat.id}`);
+      if (res.ok) setGroupMetadata(await res.json());
+    } catch (e: any) {
+      setError(`Failed: ${e.message}`);
+    }
+  };
+
+  // ── Group Invite Link ──
+  const fetchInviteLink = async () => {
+    if (!activeChat) return;
+    setLoadingInviteLink(true);
+    try {
+      const res = await apiFetch(`/api/group-invite/${activeChat.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setGroupInviteLink(`https://chat.whatsapp.com/${data.code}`);
+      }
+    } catch (e: any) {
+      setError(`Failed to get invite link: ${e.message}`);
+    } finally {
+      setLoadingInviteLink(false);
+    }
+  };
+
+  // ── Handle @ mention in input ──
+  const handleMentionInput = (value: string) => {
+    setNewMessage(value);
+    const lastAt = value.lastIndexOf('@');
+    if (lastAt !== -1 && activeChat?.isGroup && groupMetadata?.participants) {
+      const query = value.slice(lastAt + 1).toLowerCase();
+      setMentionQuery(query);
+      const suggestions = groupMetadata.participants.filter((p: any) =>
+        getDisplayName(p.id).toLowerCase().includes(query) || p.id.includes(query)
+      ).slice(0, 5);
+      setMentionSuggestions(suggestions);
+      setShowMentions(suggestions.length > 0);
+    } else {
+      setShowMentions(false);
+    }
+  };
+
+  const insertMention = (participant: any) => {
+    const name = getDisplayName(participant.id);
+    const lastAt = newMessage.lastIndexOf('@');
+    setNewMessage(newMessage.slice(0, lastAt) + `@${name} `);
+    setShowMentions(false);
+  };
+
   const playAudioMsg = async (msgId: string, chatId: string) => {
     // Stop any currently playing
     Object.entries(audioRefs.current).forEach(([id, audio]) => {
@@ -3737,6 +3864,21 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     </div>
 
                     <button
+                      className="absolute top-6 right-14 text-white z-[120] hover:scale-110 active:scale-90 transition-transform"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowStatusViewers(true);
+                        // Try to fetch viewers from server
+                        apiFetch(`/api/status-viewers?msgId=${activeStatus.id}`)
+                          .then(r => r.ok ? r.json() : { viewers: [] })
+                          .then(d => setStatusViewers(d.viewers || []))
+                          .catch(() => setStatusViewers([]));
+                      }}
+                      title="Who viewed this status"
+                    >
+                      <Eye className="w-6 h-6 drop-shadow-md" />
+                    </button>
+                    <button
                       className="absolute top-6 right-4 text-white z-[120] hover:scale-110 active:scale-90 transition-transform"
                       onClick={() => setActiveStatus(null)}
                     >
@@ -4800,6 +4942,33 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       </div>
                     )}
 
+                    {msg.rawMessage?.pollCreationMessage && (
+                      <div className="mb-2 rounded-xl p-4 bg-white/5 border border-white/5 min-w-[200px]">
+                        <div className="flex items-center gap-2 mb-3">
+                          <BarChart2 className="w-4 h-4 text-[#00a884]" />
+                          <p className="text-xs font-black text-white">{msg.rawMessage.pollCreationMessage.name}</p>
+                        </div>
+                        <div className="space-y-2">
+                          {(msg.rawMessage.pollCreationMessage.options || []).map((opt: any, oi: number) => {
+                            const voted = pollVotes[msg.id]?.vote === opt.optionName;
+                            return (
+                              <button
+                                key={oi}
+                                onClick={() => votePoll(msg.id, opt.optionName)}
+                                className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg border transition-all text-left ${voted ? 'bg-[#00a884]/20 border-[#00a884]/40 text-[#00a884]' : 'bg-white/5 border-white/5 text-white/60 hover:bg-white/10'}`}
+                              >
+                                <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 ${voted ? 'border-[#00a884] bg-[#00a884]' : 'border-white/20'}`}>
+                                  {voted && <div className="w-2 h-2 rounded-full bg-white" />}
+                                </div>
+                                <span className="text-xs font-bold">{opt.optionName}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[8px] text-white/20 font-bold uppercase tracking-widest mt-3">Tap to vote</p>
+                      </div>
+                    )}
+
                     {msg.rawMessage?.documentMessage && (
                       <div className="mb-2 rounded-xl p-4 bg-white/5 border border-white/5 flex items-center gap-4 group/doc">
                         <div className="w-12 h-12 bg-[#00a884]/10 rounded-xl flex items-center justify-center group-hover/doc:bg-[#00a884]/20 transition-colors">
@@ -5144,6 +5313,17 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                             Document
                           </span>
                         </button>
+                        {activeChat?.isGroup && (
+                          <button
+                            onClick={() => { setShowPollModal(true); setShowAttachmentMenu(false); }}
+                            className="flex items-center gap-3 w-full px-4 py-3 hover:bg-white/5 rounded-xl text-left text-white group"
+                          >
+                            <BarChart2 className="w-4.5 h-4.5 text-[#00a884] group-hover:scale-110 transition-transform" />
+                            <span className="text-[11px] font-black uppercase tracking-wider">
+                              Poll
+                            </span>
+                          </button>
+                        )}
                       </motion.div>
                     </>
                   )}
@@ -5306,6 +5486,22 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 </AnimatePresence>
               </div>
 
+              <div className="flex-1 relative">
+                {/* Mention suggestions */}
+                {showMentions && mentionSuggestions.length > 0 && (
+                  <div className="absolute bottom-full left-0 right-0 mb-2 bg-[#233138] border border-white/10 rounded-xl overflow-hidden shadow-2xl z-50">
+                    {mentionSuggestions.map((p: any) => (
+                      <button key={p.id} onClick={() => insertMention(p)} className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-white/10 transition-colors text-left">
+                        <div className="w-7 h-7 rounded-full bg-[#00a884]/20 flex items-center justify-center text-[#00a884] text-xs font-black">{getDisplayName(p.id)[0]}</div>
+                        <div>
+                          <p className="text-xs font-bold text-white">{getDisplayName(p.id)}</p>
+                          <p className="text-[9px] text-white/30">{p.id.split('@')[0]}</p>
+                        </div>
+                        {p.admin && <span className="ml-auto text-[7px] text-yellow-400 font-black uppercase bg-yellow-400/10 px-1.5 py-0.5 rounded">Admin</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
               <div className="flex-1 bg-[#2a3942] rounded-xl flex flex-col border border-white/[0.02] overflow-hidden">
                 {/* Reply preview bar */}
                 {replyingTo && (
@@ -5326,7 +5522,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 <input
                   type="text"
                   value={newMessage}
-                  onChange={(e) => setNewMessage(e.target.value)}
+                  onChange={(e) => handleMentionInput(e.target.value)}
                   onKeyPress={(e) => e.key === "Enter" && sendMessage()}
                   placeholder={
                     isRecording
@@ -5349,6 +5545,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                   )}
                 </div>
                 </div>
+              </div>
               </div>
 
               {newMessage.trim() ? (
@@ -5530,10 +5727,28 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                             )}
                           </div>
                         </div>
-                        <div className="opacity-0 group-hover/part:opacity-100 transition-opacity">
+                        <div className="opacity-0 group-hover/part:opacity-100 transition-opacity flex gap-1">
                           <button className="p-2 hover:bg-white/5 rounded-lg text-[#00a884]">
                             <MessageSquare className="w-4 h-4" />
                           </button>
+                          {groupMetadata?.participants?.find((pp: any) => pp.admin)?.id === user?.id && (
+                            <>
+                              <button
+                                onClick={() => setGroupAdminAction({ type: p.admin ? 'demote' : 'promote', participant: p })}
+                                className="p-2 hover:bg-white/5 rounded-lg text-yellow-400"
+                                title={p.admin ? 'Remove Admin' : 'Make Admin'}
+                              >
+                                <Shield className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => setGroupAdminAction({ type: 'remove', participant: p })}
+                                className="p-2 hover:bg-red-500/10 rounded-lg text-red-400"
+                                title="Remove from group"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -5544,6 +5759,34 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                           Synchronizing Collective...
                         </span>
                       </div>
+                    )}
+                  </div>
+
+                  {/* Group Invite Link */}
+                  <div className="pt-4 border-t border-white/5">
+                    <p className="text-[9px] text-[#00a884] font-black uppercase tracking-widest mb-3">Invite Link</p>
+                    {groupInviteLink ? (
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center gap-2 p-3 bg-white/5 rounded-xl border border-white/5">
+                          <p className="text-[9px] text-white/50 font-mono flex-1 truncate">{groupInviteLink}</p>
+                          <button
+                            onClick={() => { navigator.clipboard.writeText(groupInviteLink); }}
+                            className="p-1.5 bg-[#00a884]/10 rounded-lg text-[#00a884] hover:bg-[#00a884]/20 transition-colors"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <button onClick={() => setGroupInviteLink(null)} className="text-[9px] text-red-400 font-black uppercase tracking-widest hover:underline text-left">Revoke Link</button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={fetchInviteLink}
+                        disabled={loadingInviteLink}
+                        className="w-full flex items-center justify-center gap-2 py-3 bg-[#00a884]/10 border border-[#00a884]/20 rounded-xl text-[#00a884] text-[10px] font-black uppercase tracking-widest hover:bg-[#00a884]/20 transition-colors"
+                      >
+                        {loadingInviteLink ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Link className="w-3.5 h-3.5" />}
+                        {loadingInviteLink ? 'Getting link...' : 'Get Invite Link'}
+                      </button>
                     )}
                   </div>
                 </div>
@@ -7418,6 +7661,127 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       </AnimatePresence>
 
       <AnimatePresence>
+        {/* Poll Create Modal */}
+        {showPollModal && (
+          <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowPollModal(false)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center gap-3 mb-5">
+                <div className="p-3 bg-[#00a884]/10 rounded-xl"><BarChart2 className="w-5 h-5 text-[#00a884]" /></div>
+                <div>
+                  <h3 className="text-white font-black text-sm">Create Poll</h3>
+                  <p className="text-white/40 text-[10px]">Ask your group a question</p>
+                </div>
+                <button onClick={() => setShowPollModal(false)} className="ml-auto text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+              </div>
+              <div className="space-y-3 mb-4">
+                <input
+                  autoFocus
+                  type="text"
+                  placeholder="Ask a question..."
+                  value={pollQuestion}
+                  onChange={e => setPollQuestion(e.target.value)}
+                  className="w-full px-4 py-3 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-sm outline-none focus:border-[#00a884] placeholder:text-white/20"
+                />
+                <p className="text-[9px] text-white/30 font-black uppercase tracking-widest">Options (min 2)</p>
+                {pollOptions.map((opt, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder={`Option ${i + 1}`}
+                      value={opt}
+                      onChange={e => { const o = [...pollOptions]; o[i] = e.target.value; setPollOptions(o); }}
+                      className="flex-1 px-4 py-2.5 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-sm outline-none focus:border-[#00a884] placeholder:text-white/20"
+                    />
+                    {pollOptions.length > 2 && (
+                      <button onClick={() => setPollOptions(pollOptions.filter((_, j) => j !== i))} className="p-2 text-red-400 hover:bg-red-400/10 rounded-lg">
+                        <X className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {pollOptions.length < 12 && (
+                  <button onClick={() => setPollOptions([...pollOptions, ''])} className="w-full py-2.5 border border-dashed border-white/10 rounded-xl text-white/30 text-xs font-bold hover:border-[#00a884]/40 hover:text-[#00a884] transition-colors">
+                    + Add Option
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={sendPoll}
+                disabled={!pollQuestion.trim() || pollOptions.filter(o => o.trim()).length < 2}
+                className="w-full py-3 bg-[#00a884] text-black font-black text-xs uppercase tracking-widest rounded-xl disabled:opacity-30 transition-all"
+              >
+                Send Poll
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Group Admin Action Confirm */}
+        {groupAdminAction && (
+          <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setGroupAdminAction(null)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center gap-3 mb-4">
+                <div className={`p-3 rounded-xl ${groupAdminAction.type === 'remove' ? 'bg-red-500/10' : 'bg-yellow-500/10'}`}>
+                  <Shield className={`w-5 h-5 ${groupAdminAction.type === 'remove' ? 'text-red-400' : 'text-yellow-400'}`} />
+                </div>
+                <div>
+                  <h3 className="text-white font-black text-sm capitalize">{groupAdminAction.type} Member</h3>
+                  <p className="text-white/40 text-[10px]">{getDisplayName(groupAdminAction.participant.id)}</p>
+                </div>
+              </div>
+              <p className="text-white/50 text-xs mb-5 leading-relaxed">
+                {groupAdminAction.type === 'remove' && 'Remove this member from the group?'}
+                {groupAdminAction.type === 'promote' && 'Make this member a group admin?'}
+                {groupAdminAction.type === 'demote' && 'Remove admin privileges from this member?'}
+              </p>
+              <div className="flex gap-3">
+                <button onClick={() => setGroupAdminAction(null)} className="flex-1 py-3 bg-white/5 rounded-xl text-white/40 font-black text-xs uppercase tracking-widest">Cancel</button>
+                <button
+                  onClick={groupAdminAction_exec}
+                  className={`flex-1 py-3 rounded-xl font-black text-xs uppercase tracking-widest ${groupAdminAction.type === 'remove' ? 'bg-red-500/20 text-red-400 border border-red-500/20' : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/20'}`}
+                >
+                  Confirm
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Status Viewers Modal */}
+        {showStatusViewers && (
+          <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowStatusViewers(false)}>
+            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-sm shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="p-5 border-b border-white/5 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Eye className="w-5 h-5 text-[#00a884]" />
+                  <h3 className="text-white font-black text-sm">Status Viewers</h3>
+                </div>
+                <button onClick={() => setShowStatusViewers(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+              </div>
+              <div className="max-h-80 overflow-y-auto custom-scrollbar">
+                {statusViewers.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-10 text-white/20">
+                    <Eye className="w-8 h-8 mb-2 opacity-30" />
+                    <p className="text-xs font-bold uppercase tracking-widest">No viewers yet</p>
+                  </div>
+                ) : (
+                  statusViewers.map((v: any, i: number) => (
+                    <div key={i} className="flex items-center gap-3 px-5 py-3 border-b border-white/[0.03]">
+                      <div className="w-9 h-9 rounded-full bg-[#00a884]/20 flex items-center justify-center text-[#00a884] font-black text-xs">
+                        {(v.name || v.id || '?')[0].toUpperCase()}
+                      </div>
+                      <div>
+                        <p className="text-xs font-bold text-white">{v.name || v.id?.split('@')[0]}</p>
+                        <p className="text-[9px] text-white/30">{v.time ? smartMsgTime(v.time) : 'Viewed'}</p>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Global Search Modal */}
         {showGlobalSearch && (
           <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-start justify-center pt-16 p-4" onClick={() => setShowGlobalSearch(false)}>
