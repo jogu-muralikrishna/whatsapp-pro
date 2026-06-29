@@ -592,7 +592,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
 
   // ── Batch 3: Two-step verification ──
   const [twoStepEnabled, setTwoStepEnabled] = useState(false);
-  const [showTwoStepModal, setShowTwoStepModal] = useState(false);
   const [twoStepPin, setTwoStepPin] = useState('');
   const [activeTab, setActiveTab] = useState<Tab>("CHATS");
   const [engineLogs, setEngineLogs] = useState<any[]>([]);
@@ -2835,6 +2834,8 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       setTwoStepPin('');
     } catch (e: any) { setError(`Failed: ${e.message}`); }
   };
+
+  const playAudioMsg = async (msgId: string, chatId: string) => {
     // Stop any currently playing
     Object.entries(audioRefs.current).forEach(([id, audio]) => {
       if (id !== msgId) { audio.pause(); audio.currentTime = 0; }
