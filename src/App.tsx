@@ -7898,7 +7898,9 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             </div>
           </div>
         )}
+      </AnimatePresence>
 
+      <AnimatePresence>
         {/* Global Search Modal */}
         {showGlobalSearch && (
           <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-start justify-center pt-16 p-4" onClick={() => setShowGlobalSearch(false)}>
@@ -7957,10 +7959,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                   </div>
                 )}
               </div>
-            </div>
-          </div>
-        )}
-
             </div>
           </div>
         )}
@@ -8209,8 +8207,9 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             </div>
           </div>
         )}
+      </AnimatePresence>
 
-        {/* Disappearing Messages Modal */}
+      {/* Disappearing Messages Modal */}
         {showDisappearingModal && activeChat && (
           <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowDisappearingModal(false)}>
             <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
@@ -8332,7 +8331,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             </motion.div>
           </motion.div>
         )}
-      </AnimatePresence>
 
       {/* SETUP LOCK CHATS WIZARD */}
       <AnimatePresence>
