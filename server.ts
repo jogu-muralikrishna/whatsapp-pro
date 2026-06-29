@@ -3542,6 +3542,31 @@ async function initWASocket() {
         res.json({ status: 'success' });
     });
 
+    // ── Batch 3: Privacy Settings ──
+    app.post('/api/privacy-settings', async (req: any, res: any) => {
+        const { lastSeen, profilePic, status, readReceipts } = req.body;
+        try {
+            if (sock) {
+                if (lastSeen !== undefined) await sock.updateLastSeenPrivacy(lastSeen);
+                if (profilePic !== undefined) await sock.updateProfilePicturePrivacy(profilePic);
+                if (status !== undefined) await sock.updateStatusPrivacy(status);
+                if (readReceipts !== undefined) await sock.updateReadReceiptsPrivacy(readReceipts ? 'all' : 'none');
+            }
+            return res.json({ status: 'updated' });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
+    // ── Batch 3: Two-Step Verification ──
+    app.post('/api/two-step', async (req: any, res: any) => {
+        const { pin, enabled } = req.body;
+        try {
+            if (sock && enabled && pin) {
+                await sock.register(pin);
+            }
+            return res.json({ status: 'set' });
+        } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    });
+
     app.post('/api/update-profile-picture', async (req, res) => {
         const { image } = req.body;
         if (!sock || !image) return res.status(400).json({ error: 'Missing image' });
