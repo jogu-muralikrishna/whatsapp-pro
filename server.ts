@@ -28,8 +28,6 @@ import {
   Trash2,
   Lock,
   Unlock,
-  Bell,
-  BellOff,
   Star,
   Check,
   QrCode as QrCodeIcon,
@@ -570,29 +568,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // ── Batch 3: Chat Wallpaper ──
-  const [chatWallpapers, setChatWallpapers] = useState<Record<string, string>>(() => {
-    try { return JSON.parse(localStorage.getItem('wp_wallpapers') || '{}'); } catch { return {}; }
-  });
-  const [showWallpaperPicker, setShowWallpaperPicker] = useState(false);
-
-  // ── Batch 3: Notification Settings ──
-  const [notifSettings, setNotifSettings] = useState<Record<string, { muted: boolean; sound: boolean }>>(() => {
-    try { return JSON.parse(localStorage.getItem('wp_notif_settings') || '{}'); } catch { return {}; }
-  });
-
-  // ── Batch 3: Privacy Settings (last seen, profile pic, status) ──
-  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
-  const [showTwoStepModal, setShowTwoStepModal] = useState(false);
-  const [showNotifModal, setShowNotifModal] = useState(false);
-  const [privacySettings, setPrivacySettings] = useState<{ lastSeen: string; profilePic: string; status: string; readReceipts: boolean }>(() => {
-    try { return JSON.parse(localStorage.getItem('wp_privacy') || 'null') || { lastSeen: 'everyone', profilePic: 'everyone', status: 'everyone', readReceipts: true }; } catch { return { lastSeen: 'everyone', profilePic: 'everyone', status: 'everyone', readReceipts: true }; }
-  });
-
-  // ── Batch 3: Two-step verification ──
-  const [twoStepEnabled, setTwoStepEnabled] = useState(false);
-  const [twoStepPin, setTwoStepPin] = useState('');
   const [activeTab, setActiveTab] = useState<Tab>("CHATS");
   const [engineLogs, setEngineLogs] = useState<any[]>([]);
   const [callRecords, setCallRecords] = useState<any[]>([]);
@@ -2783,58 +2758,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     setShowMentions(false);
   };
 
-  // ── Batch 3: Wallpaper ──
-  const setWallpaper = (chatId: string, wallpaper: string) => {
-    const updated = { ...chatWallpapers, [chatId]: wallpaper };
-    setChatWallpapers(updated);
-    localStorage.setItem('wp_wallpapers', JSON.stringify(updated));
-    setShowWallpaperPicker(false);
-  };
-
-  const clearWallpaper = (chatId: string) => {
-    const updated = { ...chatWallpapers };
-    delete updated[chatId];
-    setChatWallpapers(updated);
-    localStorage.setItem('wp_wallpapers', JSON.stringify(updated));
-  };
-
-  // ── Batch 3: Notification per chat ──
-  const toggleMuteChat = (chatId: string) => {
-    const curr = notifSettings[chatId] || { muted: false, sound: true };
-    const updated = { ...notifSettings, [chatId]: { ...curr, muted: !curr.muted } };
-    setNotifSettings(updated);
-    localStorage.setItem('wp_notif_settings', JSON.stringify(updated));
-  };
-
-  // ── Batch 3: Privacy settings ──
-  const updatePrivacy = async (newSettings: Partial<typeof privacySettings>) => {
-    const updated = { ...privacySettings, ...newSettings };
-    setPrivacySettings(updated);
-    localStorage.setItem('wp_privacy', JSON.stringify(updated));
-    try {
-      await apiFetch('/api/privacy-settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updated),
-      });
-    } catch (e) {}
-  };
-
-  // ── Batch 3: Two-step verification ──
-  const enableTwoStep = async () => {
-    if (twoStepPin.length !== 6) { setError('PIN must be exactly 6 digits'); return; }
-    try {
-      await apiFetch('/api/two-step', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: twoStepPin, enabled: true }),
-      });
-      setTwoStepEnabled(true);
-      setShowTwoStepModal(false);
-      setTwoStepPin('');
-    } catch (e: any) { setError(`Failed: ${e.message}`); }
-  };
-
   const playAudioMsg = async (msgId: string, chatId: string) => {
     // Stop any currently playing
     Object.entries(audioRefs.current).forEach(([id, audio]) => {
@@ -4643,24 +4566,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 >
                   <Search className="w-5 h-5" />
                 </button>
-                {/* Wallpaper Picker */}
-                <button
-                  onClick={() => setShowWallpaperPicker(true)}
-                  className={`hover:text-primary transition-colors p-1 ${activeChat && chatWallpapers[activeChat.id] ? 'text-[#00a884]' : ''}`}
-                  title="Chat Wallpaper"
-                >
-                  <Monitor className="w-5 h-5" />
-                </button>
-                {/* Mute/Unmute Chat */}
-                <button
-                  onClick={() => setShowNotifModal(true)}
-                  className={`hover:text-primary transition-colors p-1 ${activeChat && notifSettings[activeChat.id]?.muted ? 'text-red-400' : ''}`}
-                  title="Notification Settings"
-                >
-                  {activeChat && notifSettings[activeChat.id]?.muted
-                    ? <BellOff className="w-5 h-5" />
-                    : <Bell className="w-5 h-5" />}
-                </button>
                 {/* Disappearing Messages */}
                 <button
                   onClick={() => setShowDisappearingModal(true)}
@@ -4907,12 +4812,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             <div
               ref={scrollRef}
               className="flex-1 overflow-y-auto p-6 md:p-10 space-y-6 z-10 scroll-smooth custom-scrollbar flex flex-col"
-              style={activeChat && chatWallpapers[activeChat.id] ? {
-                backgroundImage: `url(${chatWallpapers[activeChat.id]})`,
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
-                backgroundAttachment: 'local',
-              } : undefined}
             >
               <div className="flex justify-center mb-10">
                 <div className="bg-[#1b2831] px-4 py-2 rounded-lg border border-white/5 flex items-center gap-3 shadow-xl">
@@ -6589,18 +6488,6 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                         desc: "Encrypted stealth settings",
                       },
                       {
-                        id: "privacy-settings",
-                        icon: Lock,
-                        label: "Privacy Settings",
-                        desc: "Last seen, profile photo, status",
-                      },
-                      {
-                        id: "two-step",
-                        icon: Shield,
-                        label: "Two-Step Verification",
-                        desc: "Extra account security",
-                      },
-                      {
                         id: "accounts",
                         icon: User,
                         label: "Accounts",
@@ -6627,11 +6514,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                     ].map((item: any) => (
                       <button
                         key={item.id}
-                        onClick={() => {
-                          if (item.id === 'privacy-settings') { setShowPrivacyModal(true); return; }
-                          if (item.id === 'two-step') { setShowTwoStepModal(true); return; }
-                          setSettingsView(item.id);
-                        }}
+                        onClick={() => setSettingsView(item.id)}
                         className="w-full p-4 bg-[#202c33] hover:bg-[#2a3942] rounded-2xl border border-white/5 flex items-center gap-4 transition-all group"
                       >
                         <div className="p-3 bg-[#00a884]/10 rounded-xl group-hover:scale-110 transition-transform">
@@ -7898,9 +7781,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             </div>
           </div>
         )}
-      </AnimatePresence>
 
-      <AnimatePresence>
         {/* Global Search Modal */}
         {showGlobalSearch && (
           <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-start justify-center pt-16 p-4" onClick={() => setShowGlobalSearch(false)}>
@@ -7963,253 +7844,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </div>
         )}
 
-        {/* ── Batch 3: Wallpaper Picker Modal ── */}
-        {showWallpaperPicker && activeChat && (
-          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowWallpaperPicker(false)}>
-            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-5 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Monitor className="w-5 h-5 text-[#00a884]" />
-                  <div>
-                    <h3 className="text-white font-black text-sm">Chat Wallpaper</h3>
-                    <p className="text-white/30 text-[9px] uppercase tracking-widest">Customize background</p>
-                  </div>
-                </div>
-                <button onClick={() => setShowWallpaperPicker(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
-              </div>
-              <div className="p-5 space-y-4">
-                {/* Gradient options */}
-                <p className="text-[9px] font-black text-white/30 uppercase tracking-widest">Gradient Themes</p>
-                <div className="grid grid-cols-4 gap-3">
-                  {[
-                    { label: 'Default', value: '', style: { background: '#0c1317' } },
-                    { label: 'Ocean', value: 'linear-gradient(135deg,#0f2027,#203a43,#2c5364)', style: { background: 'linear-gradient(135deg,#0f2027,#203a43,#2c5364)' } },
-                    { label: 'Forest', value: 'linear-gradient(135deg,#134e5e,#71b280)', style: { background: 'linear-gradient(135deg,#134e5e,#71b280)' } },
-                    { label: 'Sunset', value: 'linear-gradient(135deg,#f093fb,#f5576c)', style: { background: 'linear-gradient(135deg,#f093fb,#f5576c)' } },
-                    { label: 'Midnight', value: 'linear-gradient(135deg,#232526,#414345)', style: { background: 'linear-gradient(135deg,#232526,#414345)' } },
-                    { label: 'Purple', value: 'linear-gradient(135deg,#667eea,#764ba2)', style: { background: 'linear-gradient(135deg,#667eea,#764ba2)' } },
-                    { label: 'Gold', value: 'linear-gradient(135deg,#f7971e,#ffd200)', style: { background: 'linear-gradient(135deg,#f7971e,#ffd200)' } },
-                    { label: 'Cyber', value: 'linear-gradient(135deg,#00c6ff,#0072ff)', style: { background: 'linear-gradient(135deg,#00c6ff,#0072ff)' } },
-                  ].map(opt => (
-                    <button
-                      key={opt.label}
-                      onClick={() => opt.value ? setWallpaper(activeChat.id, opt.value) : removeWallpaper(activeChat.id)}
-                      className={`aspect-square rounded-xl border-2 transition-all ${chatWallpapers[activeChat.id] === opt.value ? 'border-[#00a884] scale-105' : 'border-white/10 hover:border-white/30'}`}
-                      style={opt.style}
-                      title={opt.label}
-                    >
-                      {chatWallpapers[activeChat.id] === opt.value && (
-                        <Check className="w-4 h-4 text-white mx-auto drop-shadow" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-                {/* Custom image URL */}
-                <p className="text-[9px] font-black text-white/30 uppercase tracking-widest pt-2">Custom Image URL</p>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="https://example.com/image.jpg"
-                    className="flex-1 px-3 py-2.5 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-xs outline-none focus:border-[#00a884] placeholder:text-white/20"
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        const val = (e.target as HTMLInputElement).value.trim();
-                        if (val) setWallpaper(activeChat.id, `url(${val})`);
-                      }
-                    }}
-                  />
-                  <button
-                    onClick={() => removeWallpaper(activeChat.id)}
-                    className="px-3 py-2.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-xl text-xs font-bold border border-red-500/10 transition-all"
-                  >
-                    Remove
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── Batch 3: Privacy Settings Modal ── */}
-        {showPrivacyModal && (
-          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowPrivacyModal(false)}>
-            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-sm shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-5 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Lock className="w-5 h-5 text-[#00a884]" />
-                  <div>
-                    <h3 className="text-white font-black text-sm">Privacy Settings</h3>
-                    <p className="text-white/30 text-[9px] uppercase tracking-widest">Who can see your info</p>
-                  </div>
-                </div>
-                <button onClick={() => setShowPrivacyModal(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
-              </div>
-              <div className="p-5 space-y-5">
-                {[
-                  { key: 'lastSeen', label: 'Last Seen', icon: '🕐' },
-                  { key: 'profilePic', label: 'Profile Photo', icon: '📷' },
-                  { key: 'status', label: 'Status', icon: '📝' },
-                ].map(item => (
-                  <div key={item.key}>
-                    <p className="text-[9px] font-black text-white/40 uppercase tracking-widest mb-2 flex items-center gap-2">
-                      <span>{item.icon}</span>{item.label}
-                    </p>
-                    <div className="flex gap-2">
-                      {['everyone', 'contacts', 'nobody'].map(opt => (
-                        <button
-                          key={opt}
-                          onClick={() => updatePrivacy({ [item.key]: opt })}
-                          className={`flex-1 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest border transition-all ${privacySettings[item.key as keyof typeof privacySettings] === opt ? 'bg-[#00a884]/20 border-[#00a884]/40 text-[#00a884]' : 'bg-white/5 border-white/5 text-white/40 hover:bg-white/10'}`}
-                        >
-                          {opt}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-                {/* Read Receipts */}
-                <div className="flex items-center justify-between pt-2 border-t border-white/5">
-                  <div>
-                    <p className="text-xs font-bold text-white">Read Receipts</p>
-                    <p className="text-[9px] text-white/30">Show blue ticks when you read messages</p>
-                  </div>
-                  <button
-                    onClick={() => updatePrivacy({ readReceipts: !privacySettings.readReceipts })}
-                    className={`w-10 h-5 rounded-full relative transition-all ${privacySettings.readReceipts ? 'bg-[#00a884]' : 'bg-white/10'}`}
-                  >
-                    <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${privacySettings.readReceipts ? 'right-1' : 'left-1'}`} />
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── Batch 3: Two-Step Verification Modal ── */}
-        {showTwoStepModal && (
-          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowTwoStepModal(false)}>
-            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-sm shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-5 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <ShieldCheck className="w-5 h-5 text-[#00a884]" />
-                  <div>
-                    <h3 className="text-white font-black text-sm">Two-Step Verification</h3>
-                    <p className="text-white/30 text-[9px] uppercase tracking-widest">Extra account security</p>
-                  </div>
-                </div>
-                <button onClick={() => setShowTwoStepModal(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
-              </div>
-              <div className="p-5 space-y-4">
-                <div className={`p-4 rounded-xl border flex items-center gap-3 ${twoStepEnabled ? 'bg-[#00a884]/10 border-[#00a884]/20' : 'bg-white/5 border-white/5'}`}>
-                  <ShieldCheck className={`w-5 h-5 ${twoStepEnabled ? 'text-[#00a884]' : 'text-white/20'}`} />
-                  <div className="flex-1">
-                    <p className="text-xs font-black text-white">{twoStepEnabled ? '✅ Enabled' : '⚠️ Disabled'}</p>
-                    <p className="text-[9px] text-white/30">{twoStepEnabled ? 'Your account is protected' : 'Your account is not protected'}</p>
-                  </div>
-                  <button
-                    onClick={() => setTwoStepEnabled(!twoStepEnabled)}
-                    className={`w-10 h-5 rounded-full relative transition-all ${twoStepEnabled ? 'bg-[#00a884]' : 'bg-white/10'}`}
-                  >
-                    <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${twoStepEnabled ? 'right-1' : 'left-1'}`} />
-                  </button>
-                </div>
-                {twoStepEnabled && (
-                  <div className="space-y-3">
-                    <label className="text-[9px] font-black text-white/40 uppercase tracking-widest">6-Digit PIN</label>
-                    <input
-                      type="password"
-                      maxLength={6}
-                      placeholder="••••••"
-                      className="w-full px-4 py-3 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-center text-2xl font-mono tracking-widest outline-none focus:border-[#00a884]"
-                      value={twoStepPin}
-                      onChange={e => setTwoStepPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                    />
-                    <button
-                      onClick={async () => {
-                        if (twoStepPin.length !== 6) { setError('PIN must be exactly 6 digits'); return; }
-                        try {
-                          await apiFetch('/api/two-step', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ pin: twoStepPin, enabled: true }),
-                          });
-                          setShowTwoStepModal(false);
-                        } catch (e: any) { setError(e.message); }
-                      }}
-                      disabled={twoStepPin.length !== 6}
-                      className="w-full py-3 bg-[#00a884] text-black font-black text-xs uppercase tracking-widest rounded-xl disabled:opacity-30 transition-all"
-                    >
-                      Save PIN
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── Batch 3: Notification Settings Modal ── */}
-        {showNotifModal && activeChat && (
-          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowNotifModal(false)}>
-            <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-sm shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-5 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Bell className="w-5 h-5 text-[#00a884]" />
-                  <div>
-                    <h3 className="text-white font-black text-sm">Notification Settings</h3>
-                    <p className="text-white/30 text-[9px] truncate max-w-[160px]">{getDisplayName(activeChat)}</p>
-                  </div>
-                </div>
-                <button onClick={() => setShowNotifModal(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
-              </div>
-              <div className="p-5 space-y-4">
-                {[
-                  { key: 'muted', label: 'Mute Notifications', desc: 'No alerts from this chat', icon: <BellOff className="w-4 h-4" /> },
-                  { key: 'sound', label: 'Sound', desc: 'Play sound for new messages', icon: <Bell className="w-4 h-4" /> },
-                ].map(item => {
-                  const curr = notifSettings[activeChat.id] || { muted: false, sound: true };
-                  return (
-                    <div key={item.key} className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 bg-white/5 rounded-lg text-[#00a884]">{item.icon}</div>
-                        <div>
-                          <p className="text-xs font-bold text-white">{item.label}</p>
-                          <p className="text-[9px] text-white/30">{item.desc}</p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => {
-                          const updated = { ...curr, [item.key]: !curr[item.key as keyof typeof curr] };
-                          setNotifSettings(prev => ({ ...prev, [activeChat.id]: updated }));
-                          localStorage.setItem('wp_notif', JSON.stringify({ ...notifSettings, [activeChat.id]: updated }));
-                        }}
-                        className={`w-10 h-5 rounded-full relative transition-all ${curr[item.key as keyof typeof curr] ? 'bg-[#00a884]' : 'bg-white/10'}`}
-                      >
-                        <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${curr[item.key as keyof typeof curr] ? 'right-1' : 'left-1'}`} />
-                      </button>
-                    </div>
-                  );
-                })}
-                {/* Mute duration */}
-                {(notifSettings[activeChat.id]?.muted) && (
-                  <div className="pt-2 border-t border-white/5">
-                    <p className="text-[9px] font-black text-white/30 uppercase tracking-widest mb-2">Mute Duration</p>
-                    <div className="flex gap-2">
-                      {['8h', '1 week', 'Always'].map(d => (
-                        <button key={d} className="flex-1 py-2 bg-white/5 hover:bg-[#00a884]/10 border border-white/5 hover:border-[#00a884]/30 text-white/50 hover:text-[#00a884] rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all">
-                          {d}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Disappearing Messages Modal */}
+        {/* Disappearing Messages Modal */}
         {showDisappearingModal && activeChat && (
           <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowDisappearingModal(false)}>
             <div className="bg-[#111b21] rounded-2xl border border-white/10 p-6 max-w-sm w-full shadow-2xl" onClick={e => e.stopPropagation()}>
@@ -8331,6 +7966,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             </motion.div>
           </motion.div>
         )}
+      </AnimatePresence>
 
       {/* SETUP LOCK CHATS WIZARD */}
       <AnimatePresence>
