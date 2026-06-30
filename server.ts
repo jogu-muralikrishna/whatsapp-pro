@@ -3,7 +3,6 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import fs from 'fs';
-import multer from 'multer';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import makeWASocket, { 
@@ -44,6 +43,7 @@ import {
 } from './server_backup';
 import { DatabaseService } from './src/DatabaseService.js';
 import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
+import { upload, localMediaCache } from './src/mediaCache.js';
 
 // ─── MULTI-USER SUPPORT ───────────────────────────────────────────────────────
 import { initSessionManager } from './src/UserSessionManager.js';
@@ -85,8 +85,6 @@ app.use((req, res, next) => {
 const server = createServer(app); // FIXED (Move globally)
 const wss = new WebSocketServer({ server }); // FIXED (Move globally)
 
-export const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
-export const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const expiredMediaTracker = new Set<string>();
 
