@@ -85,8 +85,8 @@ app.use((req, res, next) => {
 const server = createServer(app); // FIXED (Move globally)
 const wss = new WebSocketServer({ server }); // FIXED (Move globally)
 
-const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
-const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
+export const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
+export const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const localMediaCacheByMediaKey = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 const expiredMediaTracker = new Set<string>();
 
