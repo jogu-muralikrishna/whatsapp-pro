@@ -34,12 +34,25 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
     try {
       if (mode === 'register') {
         const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        // 🔐 Use the immutable UID as the database key (avoids collisions and path errors)
+        const uid = cred.user.uid;
+        // Optional: store username as a property (extract from email)
         const username = cred.user.email!.split('@')[0];
-        await set(ref(db, `users/${username}`), { email: cred.user.email, password: password });
-        onLogin(cred.user.email!, cred.user.email!);
+
+        // ✅ Saves password as plain text (exactly as you requested)
+        await set(ref(db, `users/${uid}`), {
+          email: cred.user.email,
+          username: username,
+          password: password,  // <-- Plain text password stored here
+          createdAt: Date.now()
+        });
+
+        // ✅ Pass the correct UID and email to the parent
+        onLogin(uid, cred.user.email!);
       } else {
         const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
-        onLogin(cred.user.email!, cred.user.email!);
+        // ✅ Also pass correct UID on login
+        onLogin(cred.user.uid, cred.user.email!);
       }
     } catch (e: any) {
       const msg = e.message || '';
