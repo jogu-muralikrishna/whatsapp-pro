@@ -7,11 +7,68 @@ function setSessionId(uid: string) {
   SESSION_ID = uid;
 }
 
-// ── API fetch wrapper: automatically adds x-session-id to every request ──
+// ── Multi-user Stage 1: routes "core" per-user features through the isolated
+// /api/u/:userId backend (multiUserRouter.ts) instead of the old shared /api
+// routes. Everything not in this list keeps using the old shared backend for
+// now (Stage 2 will migrate the rest). ──
+const CORE_EXACT_ROUTES = new Set([
+  '/api/connection-status',
+  '/api/refresh-qr',
+  '/api/request-pairing-code',
+  '/api/settings',
+  '/api/send-message',
+  '/api/read-chat',
+  '/api/delete-message',
+  '/api/logout',
+  '/api/auto-replies',
+  '/api/status-updates',
+  '/api/post-status',
+  '/api/recycle-bin',
+  '/api/favorites',
+  '/api/favorite-chat',
+  '/api/locked-chats',
+  '/api/lock-chat',
+  '/api/engine-logs',
+  '/api/calls/records',
+  '/api/block-contact',
+  '/api/update-contact',
+  '/api/profile-picture',
+  '/api/scheduled-messages',
+  '/api/schedule-message',
+  '/api/read-all',
+]);
+
+function isCoreMultiUserRoute(pathname: string): boolean {
+  if (CORE_EXACT_ROUTES.has(pathname)) return true;
+  // DELETE /api/auto-replies/:keyword  (but NOT /api/auto-replies/toggle, which
+  // is a different, not-yet-migrated endpoint on the old shared server)
+  if (/^\/api\/auto-replies\/(?!toggle$)[^/]+$/.test(pathname)) return true;
+  // GET /api/group-metadata/:jid
+  if (/^\/api\/group-metadata\/[^/]+$/.test(pathname)) return true;
+  // GET /api/history/:jid  (but NOT /api/history/calls, a separate old endpoint)
+  if (/^\/api\/history\/(?!calls$)[^/]+$/.test(pathname)) return true;
+  return false;
+}
+
+// ── API fetch wrapper: routes core features to the per-user isolated backend
+// and tags every request with the logged-in user's session id ──
 async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers || {});
   headers.set('x-session-id', SESSION_ID);
-  return fetch(url, { ...options, headers });
+  headers.set('x-user-id', SESSION_ID);
+
+  let finalUrl = url;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (SESSION_ID && isCoreMultiUserRoute(parsed.pathname)) {
+      const newPath = parsed.pathname.replace('/api/', `/api/u/${SESSION_ID}/`);
+      finalUrl = newPath + parsed.search;
+    }
+  } catch {
+    // Relative/unparseable URL - fall back to original behavior
+  }
+
+  return fetch(finalUrl, { ...options, headers });
 }
 import {
   Phone,
@@ -2052,9 +2109,17 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     const baseWsUrl = import.meta.env.VITE_BACKEND_WS_URL
       ? import.meta.env.VITE_BACKEND_WS_URL
       : `${protocol}//${window.location.host}`;
-    // Pass session ID so backend routes WebSocket to the right session
-    const socket = new WebSocket(`${baseWsUrl}?sid=${SESSION_ID}`);
+    // Pass session ID so backend routes WebSocket to the right session.
+    // userId= is read by multiUserWS.ts to scope per-user broadcasts; sid= is
+    // kept for backwards compatibility with anything still reading it.
+    const socket = new WebSocket(`${baseWsUrl}?sid=${SESSION_ID}&userId=${SESSION_ID}`);
     ws.current = socket;
+
+    socket.onopen = () => {
+      if (SESSION_ID) {
+        socket.send(JSON.stringify({ type: 'IDENTIFY', userId: SESSION_ID }));
+      }
+    };
 
     socket.onerror = (err) => {
       // FIXED: Log WS errors instead of silently swallowing them
@@ -2074,7 +2139,9 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     };
 
     socket.onmessage = (event) => {
-      const { type, data } = JSON.parse(event.data);
+      const parsedMsg = JSON.parse(event.data);
+      const { type } = parsedMsg;
+      let data = parsedMsg.data;
       switch (type) {
         case "ADMIN_LOGIN_ATTEMPT_ALERT": {
           const customEvent = new CustomEvent("ADMIN_LOGIN_ATTEMPT_ALERT", { detail: data });
@@ -2214,6 +2281,13 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           }
           break;
         }
+        case "CONTACTS_UPDATE":
+          // Per-user engine sends the full contacts map (not a delta array
+          // like CONTACTS_UPSERT), so merge it directly.
+          if (data && typeof data === "object") {
+            setContacts((prev) => ({ ...prev, ...data }));
+          }
+          break;
         case "CONTACTS_UPSERT":
           const contactUpdates = Array.isArray(data) ? data : [data];
           setContacts((prev) => {
@@ -2379,6 +2453,14 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
             setLidToPnMap((prev) => ({ ...prev, [data.lid]: data.pn }));
           }
           break;
+        case "NEW_MESSAGE": {
+          // Translate the per-user engine's single-message event into the
+          // shape the existing MESSAGES_UPSERT logic below expects, then fall
+          // through to the same handling so contacts/active-chat updates stay
+          // in one place.
+          data = { messages: [data] };
+          // fall through intentionally
+        }
         case "MESSAGES_UPSERT":
           const msgData = data.messages?.[0];
           if (!msgData) break;
