@@ -12,7 +12,7 @@
 import { Router, Request, Response } from 'express';
 import { sessionManager } from './UserSessionManager.js';
 import { initUserEngine, logoutUserSession } from './MultiUserEngine.js';
-import { upload, localMediaCache } from '../server.js';
+import { upload, localMediaCache } from './mediaCache.js';
 
 function normalizeJidLocal(jid: string): string {
   if (!jid) return jid;
