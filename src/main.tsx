@@ -75,7 +75,6 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
           <h1 style={{ color: '#fff', fontWeight: 900, fontSize: '24px', textAlign: 'center', marginBottom: '4px' }}>WHATSAPP PRO</h1>
           <p style={{ color: '#00e676', textAlign: 'center', fontSize: '10px', fontWeight: 700, letterSpacing: '3px', textTransform: 'uppercase', marginBottom: '24px' }}>Encrypted Command Engine</p>
 
-          {/* Toggle — hide on forgot mode */}
           {mode !== 'forgot' && (
             <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', background: '#111', padding: '4px', borderRadius: '10px' }}>
               <button onClick={() => { setMode('login'); setError(null); setSuccess(null); }} style={{ flex: 1, padding: '10px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: 900, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '2px', background: mode === 'login' ? '#00e676' : 'transparent', color: mode === 'login' ? '#000' : '#aaa' }}>Login</button>
@@ -83,7 +82,6 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
             </div>
           )}
 
-          {/* Forgot password header */}
           {mode === 'forgot' && (
             <div style={{ marginBottom: '20px', textAlign: 'center' }}>
               <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: '12px', marginBottom: '4px' }}>Enter your registered email.</p>
@@ -91,13 +89,11 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
             </div>
           )}
 
-          {/* Email */}
           <div style={{ marginBottom: '12px' }}>
             <label style={labelStyle}>Email Address</label>
             <input type="email" placeholder="your@email.com" value={email} onChange={e => setEmail(e.target.value)} disabled={loading} style={inputStyle} />
           </div>
 
-          {/* Password — hide on forgot mode */}
           {mode !== 'forgot' && (
             <div style={{ marginBottom: '16px' }}>
               <label style={labelStyle}>Password {mode === 'register' && <span style={{ color: 'rgba(255,255,255,0.2)' }}>(min 6 chars)</span>}</label>
@@ -105,7 +101,6 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
             </div>
           )}
 
-          {/* Forgot password link — only on login mode */}
           {mode === 'login' && (
             <div style={{ textAlign: 'right', marginBottom: '16px', marginTop: '-8px' }}>
               <button onClick={() => { setMode('forgot'); setError(null); setSuccess(null); }} style={{ background: 'none', border: 'none', color: '#00e676', fontSize: '11px', fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' }}>
@@ -114,21 +109,18 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
             </div>
           )}
 
-          {/* Error */}
           {error && (
             <div style={{ padding: '12px 16px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: '10px', color: '#f87171', fontSize: '11px', fontWeight: 700, marginBottom: '16px' }}>
               {error}
             </div>
           )}
 
-          {/* Success */}
           {success && (
             <div style={{ padding: '12px 16px', background: 'rgba(0,230,118,0.1)', border: '1px solid rgba(0,230,118,0.2)', borderRadius: '10px', color: '#00e676', fontSize: '11px', fontWeight: 700, marginBottom: '16px' }}>
               {success}
             </div>
           )}
 
-          {/* Submit */}
           <button
             onClick={handleSubmit}
             disabled={loading || !email.trim() || (mode !== 'forgot' && !password.trim())}
@@ -137,7 +129,6 @@ function AuthScreen({ onLogin }: { onLogin: (uid: string, email: string) => void
             {loading ? 'Processing...' : mode === 'login' ? 'Login 🔐' : mode === 'register' ? 'Create Account 💎' : 'Send Reset Email 📧'}
           </button>
 
-          {/* Back to login from forgot */}
           {mode === 'forgot' && (
             <button onClick={() => { setMode('login'); setError(null); setSuccess(null); }} style={{ width: '100%', marginTop: '12px', padding: '12px', background: 'transparent', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', color: 'rgba(255,255,255,0.4)', fontWeight: 700, fontSize: '11px', cursor: 'pointer' }}>
               ← Back to Login
@@ -198,7 +189,6 @@ createRoot(document.getElementById('root')!).render(<Root />);
     e.preventDefault();
     deferredPrompt = e;
 
-    // Show banner if not already installed
     if (window.matchMedia('(display-mode: standalone)').matches) return;
 
     const banner = document.createElement('div');
