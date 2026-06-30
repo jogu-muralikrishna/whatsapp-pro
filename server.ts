@@ -43,12 +43,11 @@ import {
 } from './server_backup';
 import { DatabaseService } from './src/DatabaseService.js';
 import { adminRouter, adminAuthMiddleware } from './src/adminRouter.js';
-import { upload, localMediaCache } from './src/mediaCache.js';
 
 // ─── MULTI-USER SUPPORT ───────────────────────────────────────────────────────
 import { initSessionManager } from './src/UserSessionManager.js';
 import { initUserEngine } from './src/MultiUserEngine.js';
-import { multiUserRouter } from './src/multiUserRouter.js';
+import { multiUserRouter, upload, localMediaCache } from './src/multiUserRouter.js';
 import { patchWSSForMultiUser } from './src/multiUserWS.js';
 import cors from 'cors';
 
