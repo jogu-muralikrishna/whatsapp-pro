@@ -1,0 +1,15 @@
+/**
+ * mediaCache.ts
+ *
+ * Shared multer upload middleware + in-memory media cache, factored out of
+ * server.ts into its own module so multiUserRouter.ts can import it without
+ * creating a circular import (server.ts -> multiUserRouter.ts -> server.ts),
+ * which previously caused a "Cannot access 'upload' before initialization"
+ * crash on boot.
+ */
+
+import multer from 'multer';
+
+export const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
+
+export const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
