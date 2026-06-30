@@ -631,6 +631,20 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     }
   }, [activeTab]);
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
+
+  // ── Batch 5: AI Translator ──
+  const [translatedMessages, setTranslatedMessages] = useState<Record<string, string>>({});
+  const [translatingMsgId, setTranslatingMsgId] = useState<string | null>(null);
+  const [translateLang, setTranslateLang] = useState(() => localStorage.getItem('wp_translate_lang') || 'English');
+  const [showLangPicker, setShowLangPicker] = useState(false);
+
+  // ── Batch 5: Sentiment Analyzer ──
+  const [messageSentiments, setMessageSentiments] = useState<Record<string, string>>({});
+
+  // ── Batch 5: Chat Summarizer ──
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [chatSummary, setChatSummary] = useState('');
+  const [summarizing, setSummarizing] = useState(false);
   const [contacts, setContacts] = useState<Record<string, any>>({});
   const [lidToPnMap, setLidToPnMap] = useState<Record<string, string>>({});
   const [isAiLoading, setIsAiLoading] = useState(false);
@@ -1660,6 +1674,15 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     }
   }, [messages, activeChat]);
 
+  // ── Batch 5: Auto-analyze sentiment for latest incoming message ──
+  useEffect(() => {
+    if (messages.length === 0) return;
+    const last = messages[messages.length - 1];
+    if (last && !last.fromMe && last.text && !messageSentiments[last.id]) {
+      analyzeSentiment(last.id, last.text);
+    }
+  }, [messages]);
+
   const fetchLogs = async () => {
     try {
       const res = await apiFetch("/api/engine-logs");
@@ -2490,6 +2513,63 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
         }),
       });
     } catch (e) {}
+  };
+
+  // ── Batch 5: Translate Message ──
+  const translateMessage = async (msgId: string, text: string) => {
+    if (!text) return;
+    setTranslatingMsgId(msgId);
+    try {
+      const res = await apiFetch('/api/ai-translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, targetLang: translateLang }),
+      });
+      const data = await res.json();
+      if (data.translation) {
+        setTranslatedMessages(prev => ({ ...prev, [msgId]: data.translation }));
+      }
+    } catch (e) {} finally {
+      setTranslatingMsgId(null);
+    }
+  };
+
+  // ── Batch 5: Sentiment Analysis ──
+  const analyzeSentiment = async (msgId: string, text: string) => {
+    if (!text || messageSentiments[msgId]) return;
+    try {
+      const res = await apiFetch('/api/ai-sentiment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+      if (data.sentiment) {
+        setMessageSentiments(prev => ({ ...prev, [msgId]: data.sentiment }));
+      }
+    } catch (e) {}
+  };
+
+  // ── Batch 5: Chat Summarizer ──
+  const summarizeChat = async () => {
+    if (!activeChat || messages.length === 0) return;
+    setSummarizing(true);
+    setChatSummary('');
+    setShowSummaryModal(true);
+    try {
+      const recentMsgs = messages.slice(-50).map(m => `${m.fromMe ? 'Me' : (m.sender || 'Them')}: ${m.text}`).join('\n');
+      const res = await apiFetch('/api/ai-summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation: recentMsgs }),
+      });
+      const data = await res.json();
+      setChatSummary(data.summary || 'Could not generate summary.');
+    } catch (e: any) {
+      setChatSummary('Failed to generate summary. Please try again.');
+    } finally {
+      setSummarizing(false);
+    }
   };
 
   const getAiSuggestions = async (text: string) => {
@@ -4706,6 +4786,22 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 >
                   <FileText className="w-5 h-5" />
                 </button>
+                {/* Chat Summarizer */}
+                <button
+                  onClick={summarizeChat}
+                  className="hover:text-primary transition-colors p-1"
+                  title="Summarize Chat"
+                >
+                  <span className="text-base">✨</span>
+                </button>
+                {/* Translate Language Picker */}
+                <button
+                  onClick={() => setShowLangPicker(true)}
+                  className="hover:text-primary transition-colors p-1"
+                  title={`Translate to ${translateLang}`}
+                >
+                  <span className="text-base">🌐</span>
+                </button>
                 {/* Global Search */}
                 <button
                   onClick={() => { setShowGlobalSearch(true); setGlobalSearchQuery(''); setGlobalSearchResults([]); }}
@@ -5222,7 +5318,18 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                       className={`text-sm leading-relaxed font-medium ${msg.rawMessage?.documentMessage ? "mt-2" : ""}`}
                     >
                       {renderHighlightedText(msg.text, msgSearchQuery)}
+                      {!msg.fromMe && messageSentiments[msg.id] && (
+                        <span className="ml-1.5 opacity-60" title={`Sentiment: ${messageSentiments[msg.id]}`}>
+                          {messageSentiments[msg.id] === 'positive' ? '😊' : messageSentiments[msg.id] === 'negative' ? '😠' : '😐'}
+                        </span>
+                      )}
                     </p>
+                    {translatedMessages[msg.id] && (
+                      <div className="mt-1.5 pt-1.5 border-t border-white/5 flex items-start gap-1.5">
+                        <span className="text-[10px] opacity-50 shrink-0">🌐</span>
+                        <p className="text-xs italic text-white/60 leading-relaxed">{translatedMessages[msg.id]}</p>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between gap-2 mt-2 pt-1 border-t border-white/5">
                       <div className="flex items-center gap-2">
                         <span className="text-[8px] opacity-40 font-black">
@@ -5331,6 +5438,18 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                           >
                             <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 17l-5-5 5-5M4 12h12a4 4 0 0 1 0 8h-1"/></svg>
                           </button>
+                          {/* Translate button */}
+                          {!msg.fromMe && msg.text && (
+                            <button
+                              onClick={() => translateMessage(msg.id, msg.text)}
+                              className="opacity-0 group-hover:opacity-100 transition-opacity ml-1 text-white/30 hover:text-[#00a884]"
+                              title={`Translate to ${translateLang}`}
+                            >
+                              {translatingMsgId === msg.id
+                                ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                : <span className="text-xs">🌐</span>}
+                            </button>
+                          )}
                         </div>
                       </div>
                       <button
@@ -8279,6 +8398,66 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </div>
         )}
       </AnimatePresence>
+
+      {/* ── Batch 5: Chat Summary Modal ── */}
+      {showSummaryModal && (
+        <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowSummaryModal(false)}>
+          <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-md shadow-2xl overflow-hidden max-h-[70vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-white/5 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <span className="text-xl">✨</span>
+                <div>
+                  <h3 className="text-white font-black text-sm">Chat Summary</h3>
+                  <p className="text-white/30 text-[9px] uppercase tracking-widest">AI-generated overview</p>
+                </div>
+              </div>
+              <button onClick={() => setShowSummaryModal(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto custom-scrollbar p-5">
+              {summarizing ? (
+                <div className="flex flex-col items-center justify-center py-10 gap-3 text-white/30">
+                  <RefreshCw className="w-6 h-6 animate-spin text-[#00a884]" />
+                  <span className="text-xs font-bold uppercase tracking-widest">Analyzing conversation...</span>
+                </div>
+              ) : (
+                <p className="text-sm text-white/70 leading-relaxed whitespace-pre-wrap">{chatSummary}</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch 5: Translate Language Picker ── */}
+      {showLangPicker && (
+        <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowLangPicker(false)}>
+          <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-xs shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-white/5 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <span className="text-xl">🌐</span>
+                <h3 className="text-white font-black text-sm">Translate To</h3>
+              </div>
+              <button onClick={() => setShowLangPicker(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+            </div>
+            <div className="p-3 max-h-80 overflow-y-auto custom-scrollbar">
+              {['English', 'Hindi', 'Telugu', 'Tamil', 'Spanish', 'French', 'German', 'Arabic', 'Chinese', 'Japanese', 'Portuguese', 'Russian'].map(lang => (
+                <button
+                  key={lang}
+                  onClick={() => {
+                    setTranslateLang(lang);
+                    localStorage.setItem('wp_translate_lang', lang);
+                    setTranslatedMessages({}); // clear old translations
+                    setShowLangPicker(false);
+                  }}
+                  className={`w-full text-left px-4 py-3 rounded-xl text-sm font-bold transition-all flex items-center justify-between ${translateLang === lang ? 'bg-[#00a884]/15 text-[#00a884]' : 'text-white/60 hover:bg-white/5'}`}
+                >
+                  {lang}
+                  {translateLang === lang && <Check className="w-4 h-4" />}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Batch 4: Bulk Message Sender Modal ── */}
       {showBulkModal && (
