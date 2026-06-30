@@ -530,6 +530,24 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   const [pinnedMessages, setPinnedMessages] = useState<Record<string, Message[]>>({});
   const [showPinned, setShowPinned] = useState(false);
 
+  // ── Batch 4: Bulk Message Sender ──
+  const [showBulkModal, setShowBulkModal] = useState(false);
+  const [bulkMessage, setBulkMessage] = useState('');
+  const [bulkTargets, setBulkTargets] = useState<string[]>([]);
+  const [bulkDelay, setBulkDelay] = useState(3);
+  const [bulkSending, setBulkSending] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState(0);
+  const [bulkLog, setBulkLog] = useState<{jid: string; status: 'sent'|'failed'}[]>([]);
+
+  // ── Batch 4: Contact Notes ──
+  const [contactNotes, setContactNotes] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem('wp_contact_notes') || '{}'); } catch { return {}; }
+  });
+  const [showNoteEditor, setShowNoteEditor] = useState(false);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [showNotesModal, setShowNotesModal] = useState(false);
+  const [editingNote, setEditingNote] = useState('');
+
   // ── Global Search ──
   const [showGlobalSearch, setShowGlobalSearch] = useState(false);
   const [globalSearchQuery, setGlobalSearchQuery] = useState('');
@@ -2682,6 +2700,43 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   };
 
   // ── Send Poll ──
+  // ── Bulk Message Sender ──
+  const sendBulkMessages = async () => {
+    if (!bulkMessage.trim() || bulkTargets.length === 0) return;
+    setBulkSending(true);
+    setBulkProgress(0);
+    setBulkLog([]);
+    for (let i = 0; i < bulkTargets.length; i++) {
+      const jid = bulkTargets[i];
+      try {
+        const res = await apiFetch('/api/send-message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid, text: bulkMessage }),
+        });
+        setBulkLog(prev => [...prev, { jid, status: res.ok ? 'sent' : 'failed' }]);
+      } catch {
+        setBulkLog(prev => [...prev, { jid, status: 'failed' }]);
+      }
+      setBulkProgress(Math.round(((i + 1) / bulkTargets.length) * 100));
+      if (i < bulkTargets.length - 1) {
+        await new Promise(r => setTimeout(r, bulkDelay * 1000));
+      }
+    }
+    setBulkSending(false);
+  };
+
+  const toggleBulkTarget = (jid: string) => {
+    setBulkTargets(prev => prev.includes(jid) ? prev.filter(j => j !== jid) : [...prev, jid]);
+  };
+
+  // ── Contact Notes ──
+  const saveContactNote = (jid: string, note: string) => {
+    const updated = { ...contactNotes, [jid]: note };
+    setContactNotes(updated);
+    localStorage.setItem('wp_contact_notes', JSON.stringify(updated));
+  };
+
   const sendPoll = async () => {
     if (!activeChat || !pollQuestion.trim() || pollOptions.filter(o => o.trim()).length < 2) return;
     try {
@@ -4635,6 +4690,22 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
                 </div>
               </div>
               <div className="flex items-center gap-5 text-[#aebac1]">
+                {/* Bulk Message Sender */}
+                <button
+                  onClick={() => { setShowBulkModal(true); setBulkTargets([]); setBulkLog([]); setBulkProgress(0); }}
+                  className="hover:text-primary transition-colors p-1"
+                  title="Bulk Message Sender"
+                >
+                  <Send className="w-5 h-5" />
+                </button>
+                {/* Contact Notes */}
+                <button
+                  onClick={() => { setNoteDraft(contactNotes[activeChat.id] || ''); setShowNoteEditor(true); }}
+                  className={`hover:text-primary transition-colors p-1 ${contactNotes[activeChat.id] ? 'text-yellow-400' : ''}`}
+                  title="Contact Notes"
+                >
+                  <FileText className="w-5 h-5" />
+                </button>
                 {/* Global Search */}
                 <button
                   onClick={() => { setShowGlobalSearch(true); setGlobalSearchQuery(''); setGlobalSearchResults([]); }}
@@ -8208,6 +8279,164 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </div>
         )}
       </AnimatePresence>
+
+      {/* ── Batch 4: Bulk Message Sender Modal ── */}
+      {showBulkModal && (
+        <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !bulkSending && setShowBulkModal(false)}>
+          <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-lg shadow-2xl overflow-hidden max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-white/5 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <Send className="w-5 h-5 text-[#00a884]" />
+                <div>
+                  <h3 className="text-white font-black text-sm">Bulk Message Sender</h3>
+                  <p className="text-white/30 text-[9px] uppercase tracking-widest">Send to multiple contacts at once</p>
+                </div>
+              </div>
+              {!bulkSending && (
+                <button onClick={() => setShowBulkModal(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+              )}
+            </div>
+            <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
+              {/* Message */}
+              <div>
+                <label className="text-[9px] font-black text-white/40 uppercase tracking-widest mb-2 block">Message</label>
+                <textarea
+                  rows={3}
+                  placeholder="Type your message..."
+                  className="w-full px-4 py-3 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-sm outline-none focus:border-[#00a884] placeholder:text-white/20 resize-none"
+                  value={bulkMessage}
+                  onChange={e => setBulkMessage(e.target.value)}
+                  disabled={bulkSending}
+                />
+              </div>
+
+              {/* Delay */}
+              <div>
+                <label className="text-[9px] font-black text-white/40 uppercase tracking-widest mb-2 block">Delay Between Messages</label>
+                <div className="flex gap-2">
+                  {[2, 3, 5, 10].map(d => (
+                    <button
+                      key={d}
+                      onClick={() => setBulkDelay(d)}
+                      disabled={bulkSending}
+                      className={`flex-1 py-2 rounded-xl text-xs font-bold border transition-all ${bulkDelay === d ? 'bg-[#00a884]/20 border-[#00a884]/40 text-[#00a884]' : 'bg-white/5 border-white/5 text-white/40'}`}
+                    >
+                      {d}s
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Select Contacts */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-[9px] font-black text-white/40 uppercase tracking-widest">Select Contacts ({bulkTargets.length} selected)</label>
+                  <button
+                    onClick={() => setBulkTargets(bulkTargets.length === chats.filter(c => !c.isGroup).length ? [] : chats.filter(c => !c.isGroup).map(c => c.id))}
+                    disabled={bulkSending}
+                    className="text-[9px] text-[#00a884] font-bold hover:underline"
+                  >
+                    {bulkTargets.length === chats.filter(c => !c.isGroup).length ? 'Deselect All' : 'Select All'}
+                  </button>
+                </div>
+                <div className="max-h-48 overflow-y-auto custom-scrollbar space-y-1 bg-[#1f2c34] rounded-xl p-2">
+                  {chats.filter(c => !c.isGroup).map(c => (
+                    <button
+                      key={c.id}
+                      onClick={() => !bulkSending && toggleBulkTarget(c.id)}
+                      disabled={bulkSending}
+                      className={`w-full flex items-center gap-3 p-2 rounded-lg transition-all ${bulkTargets.includes(c.id) ? 'bg-[#00a884]/15' : 'hover:bg-white/5'}`}
+                    >
+                      <div className={`w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 ${bulkTargets.includes(c.id) ? 'border-[#00a884] bg-[#00a884]' : 'border-white/20'}`}>
+                        {bulkTargets.includes(c.id) && <Check className="w-3 h-3 text-white" />}
+                      </div>
+                      <span className="text-xs text-white/70 truncate">{getDisplayName(c)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Progress */}
+              {bulkSending && (
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[10px] font-bold text-white/40">
+                    <span>Sending...</span>
+                    <span>{bulkProgress}%</span>
+                  </div>
+                  <div className="w-full h-2 bg-white/5 rounded-full overflow-hidden">
+                    <div className="h-full bg-[#00a884] transition-all" style={{ width: `${bulkProgress}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Log */}
+              {bulkLog.length > 0 && (
+                <div className="space-y-1 max-h-32 overflow-y-auto custom-scrollbar">
+                  {bulkLog.map((l, i) => (
+                    <div key={i} className="flex items-center justify-between text-[10px] px-3 py-1.5 bg-white/[0.02] rounded-lg">
+                      <span className="text-white/50 truncate">{l.jid.split('@')[0]}</span>
+                      <span className={l.status === 'sent' ? 'text-[#00a884]' : 'text-red-400'}>{l.status === 'sent' ? '✓ Sent' : '✗ Failed'}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="p-5 border-t border-white/5 shrink-0">
+              <button
+                onClick={sendBulkMessages}
+                disabled={bulkSending || !bulkMessage.trim() || bulkTargets.length === 0}
+                className="w-full py-3 bg-[#00a884] text-black font-black text-xs uppercase tracking-widest rounded-xl disabled:opacity-30 transition-all flex items-center justify-center gap-2"
+              >
+                {bulkSending ? <><RefreshCw className="w-4 h-4 animate-spin" /> Sending {bulkLog.length}/{bulkTargets.length}</> : `Send to ${bulkTargets.length} Contact${bulkTargets.length !== 1 ? 's' : ''}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch 4: Contact Notes Modal ── */}
+      {showNoteEditor && activeChat && (
+        <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowNoteEditor(false)}>
+          <div className="bg-[#111b21] rounded-2xl border border-white/10 w-full max-w-sm shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-white/5 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <FileText className="w-5 h-5 text-yellow-400" />
+                <div>
+                  <h3 className="text-white font-black text-sm">Private Note</h3>
+                  <p className="text-white/30 text-[9px] truncate max-w-[180px]">{getDisplayName(activeChat)} — only visible to you</p>
+                </div>
+              </div>
+              <button onClick={() => setShowNoteEditor(false)} className="text-white/30 hover:text-white"><X className="w-5 h-5" /></button>
+            </div>
+            <div className="p-5 space-y-4">
+              <textarea
+                autoFocus
+                rows={5}
+                placeholder="e.g. Met at conference, client from project X..."
+                className="w-full px-4 py-3 bg-[#1f2c34] border border-white/5 rounded-xl text-white text-sm outline-none focus:border-yellow-400/40 placeholder:text-white/20 resize-none"
+                value={noteDraft}
+                onChange={e => setNoteDraft(e.target.value)}
+              />
+              <div className="flex gap-3">
+                {contactNotes[activeChat.id] && (
+                  <button
+                    onClick={() => { saveContactNote(activeChat.id, ''); setNoteDraft(''); setShowNoteEditor(false); }}
+                    className="px-4 py-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-xl text-xs font-bold border border-red-500/10 transition-all"
+                  >
+                    Delete
+                  </button>
+                )}
+                <button
+                  onClick={() => { saveContactNote(activeChat.id, noteDraft); setShowNoteEditor(false); }}
+                  className="flex-1 py-3 bg-yellow-400/20 hover:bg-yellow-400/30 text-yellow-400 font-black text-xs uppercase tracking-widest rounded-xl border border-yellow-400/20 transition-all"
+                >
+                  Save Note
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Disappearing Messages Modal */}
         {showDisappearingModal && activeChat && (
