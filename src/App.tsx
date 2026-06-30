@@ -36,6 +36,28 @@ const CORE_EXACT_ROUTES = new Set([
   '/api/scheduled-messages',
   '/api/schedule-message',
   '/api/read-all',
+  // Stage 2
+  '/api/send-media',
+  '/api/send-audio',
+  '/api/react-message',
+  '/api/forward-message',
+  '/api/status-viewers',
+  '/api/send-poll',
+  '/api/vote-poll',
+  '/api/group-remove',
+  '/api/group-admin',
+  '/api/group-revoke-invite',
+  '/api/privacy-settings',
+  '/api/two-step',
+  '/api/update-profile-picture',
+  '/api/update-profile',
+  '/api/clear-chat',
+  '/api/restore-chat',
+  '/api/restore-message',
+  '/api/search-messages',
+  '/api/subscribe-presence',
+  '/api/disappearing-messages',
+  '/api/add-call',
 ]);
 
 function isCoreMultiUserRoute(pathname: string): boolean {
@@ -45,8 +67,26 @@ function isCoreMultiUserRoute(pathname: string): boolean {
   if (/^\/api\/auto-replies\/(?!toggle$)[^/]+$/.test(pathname)) return true;
   // GET /api/group-metadata/:jid
   if (/^\/api\/group-metadata\/[^/]+$/.test(pathname)) return true;
+  // GET /api/group-invite/:jid
+  if (/^\/api\/group-invite\/[^/]+$/.test(pathname)) return true;
   // GET /api/history/:jid  (but NOT /api/history/calls, a separate old endpoint)
   if (/^\/api\/history\/(?!calls$)[^/]+$/.test(pathname)) return true;
+  return false;
+}
+
+function requestTargetsFriendAccount(parsed: URL, options: RequestInit): boolean {
+  if (parsed.searchParams.get('account') === 'friend') return true;
+  const body = options.body;
+  if (typeof body === 'string') {
+    try {
+      const parsedBody = JSON.parse(body);
+      if (parsedBody && parsedBody.account === 'friend') return true;
+    } catch {
+      // not JSON, ignore
+    }
+  } else if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    if (body.get('account') === 'friend') return true;
+  }
   return false;
 }
 
@@ -60,7 +100,10 @@ async function apiFetch(url: string, options: RequestInit = {}): Promise<Respons
   let finalUrl = url;
   try {
     const parsed = new URL(url, window.location.origin);
-    if (SESSION_ID && isCoreMultiUserRoute(parsed.pathname)) {
+    // The "Friend" secondary-account feature uses the old shared single-account
+    // backend (sockFriend/proDataFriend) - never reroute those requests to the
+    // per-login multi-user backend, or the Friend account stops working.
+    if (SESSION_ID && isCoreMultiUserRoute(parsed.pathname) && !requestTargetsFriendAccount(parsed, options)) {
       const newPath = parsed.pathname.replace('/api/', `/api/u/${SESSION_ID}/`);
       finalUrl = newPath + parsed.search;
     }
