@@ -10,9 +10,15 @@
  */
 
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
 import { sessionManager } from './UserSessionManager.js';
 import { initUserEngine, logoutUserSession } from './MultiUserEngine.js';
-import { upload, localMediaCache } from './mediaCache.js';
+
+// Defined here (not in server.ts) so server.ts can safely import these from
+// multiUserRouter.ts without a circular import. server.ts already imports
+// multiUserRouter.ts for the router itself, so this direction is clean.
+export const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // Up to 100MB
+export const localMediaCache = new Map<string, { buffer: Buffer; mimetype: string; filename: string }>();
 
 function normalizeJidLocal(jid: string): string {
   if (!jid) return jid;
