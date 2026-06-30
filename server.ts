@@ -2743,6 +2743,67 @@ async function initWASocket() {
         }
     });
 
+    // ── Batch 5: AI Translate ──
+    app.post('/api/ai-translate', async (req: any, res: any) => {
+        const { text, targetLang } = req.body;
+        if (!text || !targetLang) return res.status(400).json({ error: 'text and targetLang required' });
+        try {
+            const key = process.env.GEMINI_API_KEY;
+            if (!key) throw new Error('GEMINI_API_KEY not configured');
+            const ai = new GoogleGenAI({ apiKey: key, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+            const prompt = `Translate the following message to ${targetLang}. Return ONLY the translated text, nothing else, no preamble, no quotes:\n\n"${text}"`;
+            const response = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            });
+            res.json({ translation: (response.text || '').trim() });
+        } catch (e: any) {
+            log('ERROR', `AI Translate failed: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // ── Batch 5: AI Sentiment Analysis ──
+    app.post('/api/ai-sentiment', async (req: any, res: any) => {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ error: 'text required' });
+        try {
+            const key = process.env.GEMINI_API_KEY;
+            if (!key) throw new Error('GEMINI_API_KEY not configured');
+            const ai = new GoogleGenAI({ apiKey: key, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+            const prompt = `Analyze the sentiment/mood of this message. Reply with ONLY one word: "positive", "negative", or "neutral". No explanation.\n\nMessage: "${text}"`;
+            const response = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            });
+            const sentiment = (response.text || 'neutral').trim().toLowerCase().replace(/[^a-z]/g, '');
+            const valid = ['positive', 'negative', 'neutral'].includes(sentiment) ? sentiment : 'neutral';
+            res.json({ sentiment: valid });
+        } catch (e: any) {
+            res.json({ sentiment: 'neutral' }); // fail silently for sentiment, non-critical
+        }
+    });
+
+    // ── Batch 5: AI Chat Summarizer ──
+    app.post('/api/ai-summarize', async (req: any, res: any) => {
+        const { conversation } = req.body;
+        if (!conversation) return res.status(400).json({ error: 'conversation required' });
+        try {
+            const key = process.env.GEMINI_API_KEY;
+            if (!key) throw new Error('GEMINI_API_KEY not configured');
+            const ai = new GoogleGenAI({ apiKey: key, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+            const prompt = `Summarize the following WhatsApp conversation in 3-5 short bullet points. Focus on key topics, decisions, and action items. Be concise.\n\nConversation:\n${conversation}`;
+            const response = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            });
+            res.json({ summary: (response.text || 'No summary available.').trim() });
+        } catch (e: any) {
+            log('ERROR', `AI Summarize failed: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     app.post('/api/post-status', async (req, res) => {
         const { type, content, caption, backgroundColor, font } = req.body;
         if (!sock) return res.status(503).json({ error: 'Socket not connected' });
