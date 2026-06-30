@@ -3927,6 +3927,48 @@ async function initWASocket() {
         }
     });
 
+    // ─── Ghost Mode (by email): link a registered user's email to their connected WhatsApp number ───
+    app.post('/api/link-email-phone', async (req, res) => {
+        try {
+            const { email, phoneNumber } = req.body || {};
+            if (!email || !phoneNumber) {
+                return res.status(400).json({ error: 'email and phoneNumber are required' });
+            }
+            if (!db || !firestoreAvailable) {
+                return res.status(503).json({ error: 'Database not available right now.' });
+            }
+            const cleanPhone = String(phoneNumber).replace(/\D/g, '');
+            const cleanEmail = String(email).trim().toLowerCase();
+            await setDoc(doc(db, 'email_phone_map', cleanEmail), {
+                email: cleanEmail,
+                phoneNumber: cleanPhone,
+                updatedAt: Date.now(),
+            });
+            res.json({ success: true });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message || 'Failed to link email to phone.' });
+        }
+    });
+
+    // ─── Ghost Mode (by email): look up a registered user's WhatsApp number by their email ───
+    app.get('/api/lookup-phone-by-email', async (req, res) => {
+        try {
+            const email = String(req.query.email || '').trim().toLowerCase();
+            if (!email) return res.status(400).json({ error: 'email is required' });
+            if (!db || !firestoreAvailable) {
+                return res.status(503).json({ error: 'Database not available right now.' });
+            }
+            const snap = await getDoc(doc(db, 'email_phone_map', email));
+            if (!snap.exists()) {
+                return res.status(404).json({ error: 'No registered user found with this email. They must open the app and connect their WhatsApp at least once.' });
+            }
+            const data = snap.data() as any;
+            res.json({ phoneNumber: data.phoneNumber });
+        } catch (e: any) {
+            res.status(500).json({ error: e.message || 'Lookup failed.' });
+        }
+    });
+
     app.get('/api/connection-status', (req, res) => {
         try {
             // Filter out system or duplicate LID junk contacts to prevent "many fake numbers will came" // FIXED
