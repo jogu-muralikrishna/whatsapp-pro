@@ -3887,34 +3887,7 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           </div>
         </div>
 
-        {/* Session + Ghost Message Selector */}
-        <div className="flex border-b border-white/5 bg-[#111b21] p-1.5 gap-1.5 backdrop-blur-md">
-          <button
-            onClick={() => {
-              setSelectedAccount("me");
-              setActiveChat(null);
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
-              selectedAccount === "me"
-                ? "bg-[#00a884]/20 text-[#00a884] border border-[#00a884]/30 shadow-[0_0_15px_rgba(0,168,132,0.1)]"
-                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
-            }`}
-          >
-            <User className="w-3.5 h-3.5" />
-            My Session {connectionState === "open" ? "●" : "○"}
-          </button>
-          <button
-            onClick={() => setSelectedAccount("friend")}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-lg text-[10px] font-black tracking-widest uppercase transition-all ${
-              selectedAccount === "friend"
-                ? "bg-purple-500/20 text-purple-400 border border-purple-500/30 shadow-[0_0_15px_rgba(168,85,247,0.1)]"
-                : "bg-white/2 text-[#aebac1] hover:bg-white/5 hover:text-white border border-white/5"
-            }`}
-          >
-            <Shield className="w-3.5 h-3.5" />
-            Ghost Message
-          </button>
-        </div>
+        {/* Session selector removed — single per-login session only now */}
 
         {/* Tab Navigation */}
         <div className="flex border-b border-white/5 bg-[#111b21] h-12">
