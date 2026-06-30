@@ -507,14 +507,14 @@ function ChatStatistics({ chats, messages, activeChat, apiFetch }: { chats: any[
 
 // ── Ghost Message Panel Component ──
 function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: string; apiFetch: Function }) {
-  const [targetPhone, setTargetPhone] = useState('');
+  const [targetEmail, setTargetEmail] = useState('');
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [sentLog, setSentLog] = useState<{ phone: string; msg: string; time: string }[]>([]);
+  const [sentLog, setSentLog] = useState<{ email: string; msg: string; time: string }[]>([]);
 
   const sendGhostMessage = async () => {
-    if (!targetPhone || !message.trim()) return;
+    if (!targetEmail.trim() || !message.trim()) return;
     if (connectionState !== 'open') {
       setStatus({ type: 'error', text: 'Your WhatsApp must be connected first (My Session tab).' });
       return;
@@ -522,7 +522,18 @@ function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: str
     setSending(true);
     setStatus(null);
     try {
-      const jid = `91${targetPhone.replace(/\D/g, '')}@s.whatsapp.net`;
+      // Step 1: find the phone number registered against this email
+      const lookupRes = await apiFetch(`/api/lookup-phone-by-email?email=${encodeURIComponent(targetEmail.trim())}`);
+      if (!lookupRes.ok) {
+        const err = await lookupRes.json();
+        setStatus({ type: 'error', text: err.error || 'No registered user found with this email.' });
+        setSending(false);
+        return;
+      }
+      const { phoneNumber } = await lookupRes.json();
+      const jid = `${phoneNumber}@s.whatsapp.net`;
+
+      // Step 2: send the message to that resolved number
       const res = await apiFetch('/api/send-message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -530,9 +541,9 @@ function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: str
       });
       if (res.ok) {
         setStatus({ type: 'success', text: `Message sent! Recipient sees the server number — your identity is hidden.` });
-        setSentLog(prev => [{ phone: targetPhone, msg: message, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 10));
+        setSentLog(prev => [{ email: targetEmail, msg: message, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 10));
         setMessage('');
-        setTargetPhone('');
+        setTargetEmail('');
       } else {
         const err = await res.json();
         setStatus({ type: 'error', text: err.error || 'Failed to send message.' });
@@ -579,24 +590,20 @@ function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: str
           </div>
         )}
 
-        {/* Target Number */}
+        {/* Target Email */}
         <div>
           <label className="block text-[10px] font-black text-purple-400/60 uppercase tracking-widest mb-2 ml-1">
-            Recipient's WhatsApp Number
+            Recipient's Registered Email
           </label>
-          <div className="flex gap-2">
-            <div className="bg-[#202c33] px-3 py-3.5 rounded-xl border border-white/10 text-xs font-mono text-white/70 select-none">
-              +91
-            </div>
-            <input
-              type="text"
-              placeholder="10-digit mobile number"
-              className="flex-1 px-4 py-3.5 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-purple-500/40 transition-all font-mono text-sm"
-              value={targetPhone}
-              onChange={e => setTargetPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
-              disabled={sending}
-            />
-          </div>
+          <input
+            type="email"
+            placeholder="friend@example.com"
+            className="w-full px-4 py-3.5 bg-[#121214] border border-white/5 rounded-xl text-white placeholder:text-white/20 outline-none focus:border-purple-500/40 transition-all font-mono text-sm"
+            value={targetEmail}
+            onChange={e => setTargetEmail(e.target.value)}
+            disabled={sending}
+          />
+          <p className="text-[9px] text-white/20 font-bold mt-1 ml-1">They must have registered on WhatsApp Pro and connected their WhatsApp at least once.</p>
         </div>
 
         {/* Message */}
@@ -630,7 +637,7 @@ function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: str
         {/* Send Button */}
         <button
           onClick={sendGhostMessage}
-          disabled={sending || !targetPhone || !message.trim() || targetPhone.length !== 10}
+          disabled={sending || !targetEmail.trim() || !message.trim()}
           className="w-full bg-purple-600 hover:bg-purple-500 text-white font-black py-4 rounded-xl disabled:opacity-30 transition-all text-xs uppercase tracking-widest flex items-center justify-center gap-3 shadow-xl shadow-purple-500/20"
         >
           {sending
@@ -645,7 +652,7 @@ function GhostMessagePanel({ connectionState, apiFetch }: { connectionState: str
             {sentLog.map((log, i) => (
               <div key={i} className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <p className="text-[10px] font-black text-purple-400">+91 {log.phone}</p>
+                  <p className="text-[10px] font-black text-purple-400">{log.email}</p>
                   <p className="text-[9px] text-white/40 truncate">{log.msg}</p>
                 </div>
                 <span className="text-[8px] text-white/20 font-mono shrink-0">{log.time}</span>
@@ -674,6 +681,20 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
     "close" | "connecting" | "open"
   >("close");
   const [user, setUser] = useState<any>(null);
+  const linkedEmailRef = useRef<string | null>(null);
+
+  // ── Ghost Mode by email: once your WhatsApp connects, save email -> phone link ──
+  useEffect(() => {
+    const ownNumber = user?.id?.split(':')[0]?.split('@')[0];
+    if (!ownNumber || !userEmail) return;
+    if (linkedEmailRef.current === userEmail) return; // already linked this session
+    linkedEmailRef.current = userEmail;
+    apiFetch('/api/link-email-phone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: userEmail, phoneNumber: ownNumber }),
+    }).catch(() => { linkedEmailRef.current = null; });
+  }, [user, userEmail]);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
