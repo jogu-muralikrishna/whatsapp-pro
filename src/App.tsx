@@ -233,6 +233,74 @@ function ChatStatistics({ chats, messages, activeChat, apiFetch }: { chats: any[
   const maxHour = Math.max(...hourCounts, 1);
   const peakHour = hourCounts.indexOf(Math.max(...hourCounts));
 
+  // ── Batch 6: Word Cloud ──
+  const STOP_WORDS = new Set(['the','a','an','is','are','was','were','to','of','in','on','at','for','and','or','but','i','you','it','this','that','my','your','me','we','us','am','be','will','can','do','did','have','has','had','not','no','yes','ok','okay','so','if','as','with','what','how','when','where','why','who']);
+  const wordFreq: Record<string, number> = {};
+  allMessages.forEach(m => {
+    if (!m.text) return;
+    m.text.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).forEach((w: string) => {
+      if (w.length > 2 && !STOP_WORDS.has(w)) {
+        wordFreq[w] = (wordFreq[w] || 0) + 1;
+      }
+    });
+  });
+  const topWords = Object.entries(wordFreq).sort((a, b) => b[1] - a[1]).slice(0, 15);
+  const maxWordFreq = topWords.length > 0 ? topWords[0][1] : 1;
+
+  // ── Batch 6: Response Time Tracker ──
+  const responseTimes: { mine: number[]; theirs: number[] } = { mine: [], theirs: [] };
+  for (let i = 1; i < allMessages.length; i++) {
+    const prev = allMessages[i - 1];
+    const curr = allMessages[i];
+    if (prev.fromMe !== curr.fromMe) {
+      const diffMin = (curr.timestamp - prev.timestamp) / 60000;
+      if (diffMin > 0 && diffMin < 1440) { // ignore gaps over 24h
+        if (curr.fromMe) responseTimes.mine.push(diffMin);
+        else responseTimes.theirs.push(diffMin);
+      }
+    }
+  }
+  const avgMine = responseTimes.mine.length ? responseTimes.mine.reduce((a, b) => a + b, 0) / responseTimes.mine.length : 0;
+  const avgTheirs = responseTimes.theirs.length ? responseTimes.theirs.reduce((a, b) => a + b, 0) / responseTimes.theirs.length : 0;
+  const formatMin = (m: number) => m < 1 ? '<1 min' : m < 60 ? `${Math.round(m)} min` : `${Math.round(m / 60)}h ${Math.round(m % 60)}m`;
+
+  // ── Batch 6: Message Streak ──
+  const uniqueDays = [...new Set(allMessages.map(m => new Date(m.timestamp).toDateString()))]
+    .map(d => new Date(d).getTime())
+    .sort((a, b) => b - a);
+  let streak = 0;
+  if (uniqueDays.length > 0) {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const oneDayMs = 86400000;
+    let checkDate = today.getTime();
+    // Allow streak to count if today or yesterday has a message (so it doesn't reset at midnight instantly)
+    if (uniqueDays[0] === checkDate || uniqueDays[0] === checkDate - oneDayMs) {
+      streak = 1;
+      checkDate = uniqueDays[0];
+      for (let i = 1; i < uniqueDays.length; i++) {
+        if (uniqueDays[i] === checkDate - oneDayMs) {
+          streak++;
+          checkDate = uniqueDays[i];
+        } else break;
+      }
+    }
+  }
+
+  // ── Batch 6: Chat Health Score ──
+  let healthScore = 50;
+  if (total > 0) {
+    const balance = 1 - Math.abs(sent - received) / total; // 1 = perfectly balanced
+    healthScore += balance * 25;
+    if (avgTheirs > 0 && avgTheirs < 60) healthScore += 15; // they reply within an hour
+    else if (avgTheirs > 0 && avgTheirs < 360) healthScore += 8;
+    if (streak >= 3) healthScore += 10;
+    healthScore = Math.min(100, Math.max(0, Math.round(healthScore)));
+  } else {
+    healthScore = 0;
+  }
+  const healthLabel = healthScore >= 80 ? 'Excellent' : healthScore >= 60 ? 'Good' : healthScore >= 35 ? 'Fair' : healthScore > 0 ? 'Quiet' : 'No Data';
+  const healthColor = healthScore >= 80 ? '#00e676' : healthScore >= 60 ? '#38bdf8' : healthScore >= 35 ? '#f59e0b' : '#6b7280';
+
   const statCard = (label: string, value: string | number, color: string, sub?: string) => (
     <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px', flex: 1, minWidth: '0' }}>
       <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '6px' }}>{label}</p>
@@ -316,7 +384,93 @@ function ChatStatistics({ chats, messages, activeChat, apiFetch }: { chats: any[
         </div>
       )}
 
-      {/* Most active contacts */}
+      {/* ── Batch 6: Chat Health Score + Message Streak ── */}
+      {activeChat && total > 0 && (
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px', flex: 1 }}>
+            <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '10px' }}>Chat Health</p>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div style={{ position: 'relative', width: '48px', height: '48px' }}>
+                <svg width="48" height="48" viewBox="0 0 48 48">
+                  <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="5" />
+                  <circle
+                    cx="24" cy="24" r="20" fill="none" stroke={healthColor} strokeWidth="5"
+                    strokeDasharray={`${(healthScore / 100) * 125.6} 125.6`}
+                    strokeLinecap="round"
+                    transform="rotate(-90 24 24)"
+                    style={{ transition: 'stroke-dasharray 0.6s ease' }}
+                  />
+                </svg>
+                <span style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 900, color: healthColor }}>{healthScore}</span>
+              </div>
+              <div>
+                <p style={{ color: healthColor, fontSize: '13px', fontWeight: 900 }}>{healthLabel}</p>
+                <p style={{ color: 'rgba(255,255,255,0.25)', fontSize: '8px' }}>balance score</p>
+              </div>
+            </div>
+          </div>
+          <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px', flex: 1 }}>
+            <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '10px' }}>Message Streak</p>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '28px' }}>{streak >= 3 ? '🔥' : '📅'}</span>
+              <div>
+                <p style={{ color: streak >= 3 ? '#f59e0b' : '#fff', fontSize: '22px', fontWeight: 900, lineHeight: 1 }}>{streak}</p>
+                <p style={{ color: 'rgba(255,255,255,0.25)', fontSize: '8px' }}>day{streak !== 1 ? 's' : ''} in a row</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch 6: Response Time Tracker ── */}
+      {activeChat && (responseTimes.mine.length > 0 || responseTimes.theirs.length > 0) && (
+        <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
+          <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '12px' }}>Average Response Time</p>
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <div style={{ flex: 1 }}>
+              <p style={{ color: '#00e676', fontSize: '16px', fontWeight: 900 }}>{avgMine > 0 ? formatMin(avgMine) : '—'}</p>
+              <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '9px' }}>Your replies</p>
+            </div>
+            <div style={{ width: '1px', background: 'rgba(255,255,255,0.05)' }} />
+            <div style={{ flex: 1 }}>
+              <p style={{ color: '#38bdf8', fontSize: '16px', fontWeight: 900 }}>{avgTheirs > 0 ? formatMin(avgTheirs) : '—'}</p>
+              <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '9px' }}>Their replies</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch 6: Word Cloud ── */}
+      {activeChat && topWords.length > 0 && (
+        <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
+          <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '12px' }}>Most Used Words</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+            {topWords.map(([word, count], i) => {
+              const ratio = count / maxWordFreq;
+              const fontSize = 10 + ratio * 14; // 10px to 24px
+              const opacity = 0.4 + ratio * 0.6;
+              const colors = ['#00e676', '#38bdf8', '#a78bfa', '#f59e0b', '#f87171'];
+              return (
+                <span
+                  key={word}
+                  title={`${count} times`}
+                  style={{
+                    fontSize: `${fontSize}px`,
+                    fontWeight: 800,
+                    color: colors[i % colors.length],
+                    opacity,
+                    cursor: 'default',
+                  }}
+                >
+                  {word}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+
       <div style={{ background: '#111b21', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '14px' }}>
         <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '8px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '2px', marginBottom: '12px' }}>Most Recent Contacts</p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
