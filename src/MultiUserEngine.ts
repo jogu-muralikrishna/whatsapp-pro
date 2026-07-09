@@ -22,6 +22,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 
 import { UserSession, sessionManager } from './UserSessionManager.js';
+import { DatabaseService } from './DatabaseService.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -326,6 +327,19 @@ export async function initUserEngine(session: UserSession) {
       session.consecutiveBadSessions = 0;
       session.consecutiveStreamErrors = 0;
       startSessionHealthCheck(session);
+
+      // Record this user's connected WhatsApp number in the global username
+      // registry, so other users can reach them via @username without ever
+      // seeing this number.
+      try {
+        const rawId: string = session.sock.user?.id || '';
+        const number = rawId.split('@')[0].split(':')[0];
+        if (number) {
+          DatabaseService.setUserWhatsappNumber(session.userId, number);
+        }
+      } catch (e: any) {
+        sessionManager.log(session, 'WARN', `Could not register WhatsApp number for username routing: ${e.message}`);
+      }
     }
 
     if (connection === 'close') {
@@ -446,7 +460,14 @@ export async function initUserEngine(session: UserSession) {
     const messages = m.messages || [];
     for (const msg of messages) {
       if (!msg.key?.remoteJid) continue;
-      const jid = normalizeJid(msg.key.remoteJid, session);
+      const realJid = normalizeJid(msg.key.remoteJid, session);
+
+      // If this contact is behind a username mask, file the message under
+      // their masked id instead of their real number.
+      const maskedEntry = Object.entries(session.proData.usernameContacts || {})
+        .find(([, v]: [string, any]) => v.realJid === realJid);
+      const jid = maskedEntry ? maskedEntry[0] : realJid;
+      const outgoingMsg = maskedEntry ? { ...msg, key: { ...msg.key, remoteJid: jid } } : msg;
 
       if (!session.proData.messageHistory[jid]) {
         session.proData.messageHistory[jid] = [];
@@ -454,13 +475,13 @@ export async function initUserEngine(session: UserSession) {
 
       const antiDelete = session.proData.settings.antiDelete;
       if (antiDelete && msg.message) {
-        session.proData.messageHistory[jid].push(msg);
+        session.proData.messageHistory[jid].push(outgoingMsg);
         if (session.proData.messageHistory[jid].length > 1000) {
           session.proData.messageHistory[jid].splice(0, 100);
         }
       }
 
-      sessionManager.broadcast(session, { type: 'NEW_MESSAGE', data: msg, userId: session.userId });
+      sessionManager.broadcast(session, { type: 'NEW_MESSAGE', data: outgoingMsg, userId: session.userId });
     }
     sessionManager.saveProData(session);
   });
@@ -468,7 +489,11 @@ export async function initUserEngine(session: UserSession) {
   // ── chats.upsert ──────────────────────────────────────────────────────────
   session.sock.ev.on('chats.upsert', (chats: any[]) => {
     if (socketInstance !== session.sock) return;
+    const maskedRealJids = new Set(
+      Object.values(session.proData.usernameContacts || {}).map((v: any) => v.realJid)
+    );
     for (const chat of chats) {
+      if (maskedRealJids.has(chat.id)) continue; // keep this contact hidden behind its @username
       const existing = session.realChats.find((c: any) => c.id === chat.id);
       if (existing) {
         Object.assign(existing, chat);
@@ -484,10 +509,12 @@ export async function initUserEngine(session: UserSession) {
   // ── contacts.upsert ───────────────────────────────────────────────────────
   session.sock.ev.on('contacts.upsert', (contacts: any[]) => {
     if (socketInstance !== session.sock) return;
+    const maskedRealJids = new Set(
+      Object.values(session.proData.usernameContacts || {}).map((v: any) => v.realJid)
+    );
     for (const contact of contacts) {
-      if (contact.id) {
-        session.proData.contacts[contact.id] = { ...session.proData.contacts[contact.id], ...contact };
-      }
+      if (!contact.id || maskedRealJids.has(contact.id)) continue; // keep hidden behind its @username
+      session.proData.contacts[contact.id] = { ...session.proData.contacts[contact.id], ...contact };
     }
     sessionManager.saveProData(session);
     sessionManager.broadcast(session, { type: 'CONTACTS_UPDATE', data: session.proData.contacts, userId: session.userId });
