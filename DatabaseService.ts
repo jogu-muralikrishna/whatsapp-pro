@@ -2,64 +2,353 @@ import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
 
-const BASE_DATA_DIR = process.env.DATA_DIR || process.cwd();
+const filePath = path.join(process.env.DATA_DIR || process.cwd(), 'pro_data.db.json');
 
-function getCleanPhone(phone: string): string {
-  return phone.replace(/[^0-9]/g, '') || 'default';
-}
-
-function getUserDataDir(phone: string): string {
-  return path.join(BASE_DATA_DIR, 'users', getCleanPhone(phone));
-}
-
-function getDBPath(phone: string): string {
-  return path.join(getUserDataDir(phone), 'pro_data.db.json');
-}
-
-function ensureUserDir(phone: string) {
-  const dir = getUserDataDir(phone);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function readDB(phone: string): any {
-  ensureUserDir(phone);
-  const filePath = getDBPath(phone);
+function readDB(): any {
   if (!fs.existsSync(filePath)) {
-    const defaultDB = {
-      users: {}, chats: {}, messages: {}, calls: {}, statuses: {},
-      admins: {}, admin_audit_log: [], user_notifications: {},
-      settings: { ghostMode: false, antiDelete: true, theme: "dark" }
+    return {
+      users: {},
+      chats: {},
+      messages: {},
+      calls: {},
+      statuses: {},
+      admins: {},
+      admin_audit_log: [],
+      user_notifications: {},
+      usernames: {},
+      userProfiles: {}
     };
-    fs.writeFileSync(filePath, JSON.stringify(defaultDB, null, 2));
-    return defaultDB;
   }
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!parsed.usernames) parsed.usernames = {};
+    if (!parsed.userProfiles) parsed.userProfiles = {};
+    return parsed;
   } catch (e) {
-    return { users: {}, chats: {}, messages: {}, calls: {}, statuses: {}, admins: {}, admin_audit_log: [], user_notifications: {}, settings: {} };
+    return {
+      users: {},
+      chats: {},
+      messages: {},
+      calls: {},
+      statuses: {},
+      admins: {},
+      admin_audit_log: [],
+      user_notifications: {},
+      usernames: {},
+      userProfiles: {}
+    };
   }
 }
 
-function writeDB(phone: string, data: any) {
-  ensureUserDir(phone);
-  const filePath = getDBPath(phone);
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+function writeDB(data: any) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('Failed to write JSON DB file:', e);
+  }
 }
 
-// Export all needed functions
-export async function initDatabase(phone: string = 'default') {
-  readDB(phone); // create if not exists
+export async function initDatabase(): Promise<void> {
+  const db = readDB();
+  writeDB(db);
+  await seedDefaultAdmin();
 }
 
-export async function getAdminByEmail(phone: string, email: string) {
-  const db = readDB(phone);
+export async function seedDefaultAdmin(): Promise<void> {
+  const salt = await bcrypt.genSalt(10);
+  const passwordHash = await bcrypt.hash('ADMIN#123', salt);
+  const db = readDB();
+  db.admins['admin@pro.com'] = {
+    email: 'admin@pro.com',
+    password: passwordHash,
+    password_hash: passwordHash,
+    role: 'Super Admin',
+    createdAt: db.admins['admin@pro.com']?.createdAt || Date.now()
+  };
+  writeDB(db);
+}
+
+export async function insertUser(user: any): Promise<any> {
+  const db = readDB();
+  const id = user.id || user.phone || user.email || Math.random().toString(36).substring(7);
+  db.users[id] = { id, ...user };
+  writeDB(db);
+  return db.users[id];
+}
+
+export async function getUser(idOrEmailOrPhone: string): Promise<any> {
+  const db = readDB();
+  if (db.users[idOrEmailOrPhone]) {
+    return db.users[idOrEmailOrPhone];
+  }
+  const found = Object.values(db.users).find((u: any) => 
+    u.id === idOrEmailOrPhone || 
+    u.phone === idOrEmailOrPhone || 
+    u.email === idOrEmailOrPhone
+  );
+  return found || null;
+}
+
+export async function insertMessage(message: any): Promise<any> {
+  const db = readDB();
+  const msgId = message.id || message.key?.id || Math.random().toString(36).substring(7);
+  
+  const processedMessage = { ...message };
+  if (processedMessage.video) {
+    if (typeof processedMessage.video === 'object' && Buffer.isBuffer(processedMessage.video)) {
+      processedMessage.video_as_text = '/media/video_' + msgId + '.mp4';
+      delete processedMessage.video;
+    } else if (typeof processedMessage.video === 'string') {
+      processedMessage.video_as_text = processedMessage.video;
+    }
+  }
+  
+  db.messages[msgId] = { id: msgId, ...processedMessage };
+  writeDB(db);
+  return db.messages[msgId];
+}
+
+export async function getMessages(chatIdOrConditions?: any): Promise<any[]> {
+  const db = readDB();
+  const allMsgs = Object.values(db.messages);
+  if (!chatIdOrConditions) {
+    return allMsgs;
+  }
+  if (typeof chatIdOrConditions === 'string') {
+    return allMsgs.filter((m: any) => m.chatId === chatIdOrConditions || m.chat_id === chatIdOrConditions || m.jid === chatIdOrConditions);
+  }
+  if (typeof chatIdOrConditions === 'object') {
+    return allMsgs.filter((m: any) => {
+      for (const [key, val] of Object.entries(chatIdOrConditions)) {
+        if (m[key] !== val) return false;
+      }
+      return true;
+    });
+  }
+  return allMsgs;
+}
+
+export async function insertStatus(status: any): Promise<any> {
+  const db = readDB();
+  const id = status.id || Math.random().toString(36).substring(7);
+  db.statuses[id] = { id, ...status, timestamp: status.timestamp || Date.now() };
+  writeDB(db);
+  return db.statuses[id];
+}
+
+export async function getStatuses(): Promise<any[]> {
+  const db = readDB();
+  return Object.values(db.statuses).sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
+}
+
+export async function insertCall(call: any): Promise<any> {
+  const db = readDB();
+  const id = call.id || Math.random().toString(36).substring(7);
+  db.calls[id] = { id, ...call, timestamp: call.timestamp || Date.now() };
+  writeDB(db);
+  return db.calls[id];
+}
+
+export async function updateSettings(settings: any): Promise<any> {
+  const db = readDB();
+  db.settings = { ...(db.settings || {}), ...settings };
+  writeDB(db);
+  return db.settings;
+}
+
+export async function backupToFile(filePathToSave: string): Promise<void> {
+  const db = readDB();
+  fs.writeFileSync(filePathToSave, JSON.stringify(db, null, 2), 'utf-8');
+}
+
+export async function insertChat(chat: any): Promise<any> {
+  const db = readDB();
+  const id = chat.id || chat.jid || Math.random().toString(36).substring(7);
+  db.chats[id] = { id, ...chat };
+  writeDB(db);
+  return db.chats[id];
+}
+
+export async function getChat(chatId: string): Promise<any> {
+  const db = readDB();
+  return db.chats[chatId] || null;
+}
+
+export async function getAllChats(): Promise<any[]> {
+  const db = readDB();
+  return Object.values(db.chats);
+}
+
+export async function createAdmin(email: string, passwordHashOrPlain: string, role: string = 'admin'): Promise<any> {
+  const db = readDB();
+  db.admins[email] = {
+    email,
+    password: passwordHashOrPlain,
+    password_hash: passwordHashOrPlain, // Support both named properties for absolute compatibility with route handlers
+    role,
+    createdAt: Date.now()
+  };
+  writeDB(db);
+  return db.admins[email];
+}
+
+export async function getAdminByEmail(email: string): Promise<any> {
+  const db = readDB();
   return db.admins[email] || null;
+}
+
+export async function getAllAdmins(): Promise<any[]> {
+  const db = readDB();
+  return Object.values(db.admins || {});
+}
+
+export async function deleteAdmin(email: string): Promise<boolean> {
+  const db = readDB();
+  if (db.admins && db.admins[email]) {
+    delete db.admins[email];
+    writeDB(db);
+    return true;
+  }
+  return false;
+}
+
+export async function insertAuditLog(log: any): Promise<any> {
+  const db = readDB();
+  const entry = {
+    id: Math.random().toString(36).substring(7),
+    timestamp: Date.now(),
+    ...log
+  };
+  db.admin_audit_log.push(entry);
+  writeDB(db);
+  return entry;
+}
+
+export async function getAuditLogs(): Promise<any[]> {
+  const db = readDB();
+  return db.admin_audit_log;
+}
+
+export async function insertNotification(notification: any): Promise<any> {
+  const db = readDB();
+  const id = notification.id || Math.random().toString(36).substring(7);
+  db.user_notifications[id] = {
+    id,
+    userId: notification.userId || notification.phone || 'all',
+    read: false,
+    timestamp: Date.now(),
+    ...notification
+  };
+  writeDB(db);
+  return db.user_notifications[id];
+}
+
+export async function getUserNotifications(userIdOrPhone: string): Promise<any[]> {
+  const db = readDB();
+  return Object.values(db.user_notifications).filter((n: any) => 
+    n.userId === userIdOrPhone || n.phone === userIdOrPhone || n.userId === 'all'
+  );
+}
+
+export async function markNotificationsRead(userIdOrPhone: string): Promise<void> {
+  const db = readDB();
+  for (const key of Object.keys(db.user_notifications)) {
+    const n = db.user_notifications[key];
+    if (n.userId === userIdOrPhone || n.phone === userIdOrPhone || n.userId === 'all') {
+      n.read = true;
+    }
+  }
+  writeDB(db);
+}
+
+// ─── Username Messaging (Privacy Feature) ─────────────────────────────────────
+// Global, cross-user registry so any logged-in user can be reached by a
+// public @username instead of their real WhatsApp mobile number.
+
+export async function registerUsername(userId: string, rawUsername: string): Promise<{ username: string }> {
+  const username = (rawUsername || '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,20}$/.test(username)) {
+    throw new Error('Username must be 3-20 characters: letters, numbers, and underscore only.');
+  }
+
+  const db = readDB();
+
+  const existingOwner = db.usernames[username];
+  if (existingOwner && existingOwner !== userId) {
+    throw new Error('That username is already taken.');
+  }
+
+  // Release any previous username this user held, so one user = one username.
+  const previousUsername = db.userProfiles[userId]?.username;
+  if (previousUsername && previousUsername !== username && db.usernames[previousUsername] === userId) {
+    delete db.usernames[previousUsername];
+  }
+
+  db.usernames[username] = userId;
+  db.userProfiles[userId] = { ...(db.userProfiles[userId] || {}), username };
+  writeDB(db);
+  return { username };
+}
+
+export async function isUsernameAvailable(rawUsername: string): Promise<boolean> {
+  const username = (rawUsername || '').trim().toLowerCase();
+  if (!username) return false;
+  const db = readDB();
+  return !db.usernames[username];
+}
+
+export async function getUsernameForUser(userId: string): Promise<string | null> {
+  const db = readDB();
+  return db.userProfiles[userId]?.username || null;
+}
+
+/** Look up which real userId + connected WhatsApp number owns a username. */
+export async function resolveUsername(rawUsername: string): Promise<{ userId: string; whatsappNumber: string | null } | null> {
+  const username = (rawUsername || '').trim().toLowerCase();
+  const db = readDB();
+  const userId = db.usernames[username];
+  if (!userId) return null;
+  const whatsappNumber = db.userProfiles[userId]?.whatsappNumber || null;
+  return { userId, whatsappNumber };
+}
+
+/** Called whenever a user's WhatsApp socket connects, so username lookups can route messages. */
+export async function setUserWhatsappNumber(userId: string, number: string): Promise<void> {
+  if (!number) return;
+  const db = readDB();
+  db.userProfiles[userId] = { ...(db.userProfiles[userId] || {}), whatsappNumber: number };
+  writeDB(db);
 }
 
 export const DatabaseService = {
   initDatabase,
+  insertUser,
+  getUser,
+  insertMessage,
+  getMessages,
+  insertStatus,
+  getStatuses,
+  insertCall,
+  updateSettings,
+  backupToFile,
+  insertChat,
+  getChat,
+  getAllChats,
+  createAdmin,
   getAdminByEmail,
-  // Add more as needed by frontend
+  getAllAdmins,
+  deleteAdmin,
+  insertAuditLog,
+  getAuditLogs,
+  insertNotification,
+  getUserNotifications,
+  markNotificationsRead,
+  registerUsername,
+  isUsernameAvailable,
+  getUsernameForUser,
+  resolveUsername,
+  setUserWhatsappNumber
 };
 
 export default DatabaseService;
