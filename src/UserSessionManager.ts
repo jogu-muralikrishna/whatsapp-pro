@@ -32,6 +32,12 @@ export function createDefaultProData() {
     cachedChats: [] as any[],
     contacts: {} as Record<string, any>,
     lidToPnMap: {} as Record<string, string>,
+    // Username Messaging (privacy feature): maps a masked chat id (e.g.
+    // "masked_ammu") to the real WhatsApp jid it's actually sent to. This
+    // masked id is what's stored in cachedChats / messageHistory / contacts
+    // for that conversation, so the other person's real mobile number is
+    // never sent back down to the frontend.
+    usernameContacts: {} as Record<string, { realJid: string; username: string }>,
     logs: [] as any[],
     settings: {
       autoTranslate: false,
