@@ -58,6 +58,14 @@ const CORE_EXACT_ROUTES = new Set([
   '/api/subscribe-presence',
   '/api/disappearing-messages',
   '/api/add-call',
+  // Push notifications
+  '/api/push/vapid-public-key',
+  '/api/push/subscribe',
+  '/api/push/unsubscribe',
+  // Username messaging
+  '/api/username/me',
+  '/api/username/register',
+  '/api/send-by-username',
 ]);
 
 function isCoreMultiUserRoute(pathname: string): boolean {
@@ -71,6 +79,8 @@ function isCoreMultiUserRoute(pathname: string): boolean {
   if (/^\/api\/group-invite\/[^/]+$/.test(pathname)) return true;
   // GET /api/history/:jid  (but NOT /api/history/calls, a separate old endpoint)
   if (/^\/api\/history\/(?!calls$)[^/]+$/.test(pathname)) return true;
+  // GET /api/username/check/:username
+  if (/^\/api\/username\/check\/[^/]+$/.test(pathname)) return true;
   return false;
 }
 
@@ -88,6 +98,18 @@ function requestTargetsFriendAccount(parsed: URL, options: RequestInit): boolean
     if (body.get('account') === 'friend') return true;
   }
   return false;
+}
+
+// ── Convert a base64 VAPID public key into the Uint8Array PushManager wants ──
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
 }
 
 // ── API fetch wrapper: routes core features to the per-user isolated backend
@@ -782,6 +804,44 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
   >("close");
   const [user, setUser] = useState<any>(null);
   const linkedEmailRef = useRef<string | null>(null);
+
+  // ── Background push notifications: works even when the app/tab is fully
+  // closed, since the service worker is what actually shows the notification. ──
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+
+    (async () => {
+      try {
+        if (Notification.permission === "denied") return;
+        if (Notification.permission === "default") {
+          const permission = await Notification.requestPermission();
+          if (permission !== "granted") return;
+        }
+
+        const registration = await navigator.serviceWorker.ready;
+        let subscription = await registration.pushManager.getSubscription();
+
+        if (!subscription) {
+          const keyRes = await apiFetch("/api/push/vapid-public-key");
+          const { publicKey } = await keyRes.json();
+          if (!publicKey) return; // backend has no VAPID keys configured yet
+
+          subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(publicKey),
+          });
+        }
+
+        await apiFetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subscription: subscription.toJSON() }),
+        });
+      } catch (e) {
+        console.warn("[Push] Could not register for background notifications:", e);
+      }
+    })();
+  }, [userId]);
 
   // ── Ghost Mode by email: once your WhatsApp connects, save email -> phone link ──
   useEffect(() => {
@@ -2552,7 +2612,44 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
           if (activeJid.endsWith("@c.us"))
             activeJid = activeJid.replace("@c.us", "@s.whatsapp.net");
 
-          if (incomingJid === activeJid) {
+          const isActiveChat = incomingJid === activeJid;
+
+          // Keep the chat list itself live: update last-message preview,
+          // bump the timestamp, move the chat to the top, and bump the
+          // unread badge if this chat isn't the one currently open.
+          setChats((prev) => {
+            const msgTimestamp = (msgData.messageTimestamp || Math.floor(Date.now() / 1000)) * 1000;
+            const existingIndex = prev.findIndex((c) => c.id === incomingJid);
+            let nextChats: Chat[];
+            if (existingIndex !== -1) {
+              const existingChat = prev[existingIndex];
+              const updatedChat: Chat = {
+                ...existingChat,
+                lastMessage: msgData,
+                timestamp: msgTimestamp,
+                unreadCount: !msgData.key.fromMe && !isActiveChat
+                  ? (existingChat.unreadCount || 0) + 1
+                  : existingChat.unreadCount || 0,
+              };
+              nextChats = [...prev];
+              nextChats.splice(existingIndex, 1);
+              nextChats.unshift(updatedChat);
+            } else {
+              nextChats = [
+                {
+                  id: incomingJid,
+                  name: getDisplayName(incomingJid),
+                  lastMessage: msgData,
+                  timestamp: msgTimestamp,
+                  unreadCount: !msgData.key.fromMe && !isActiveChat ? 1 : 0,
+                } as Chat,
+                ...prev,
+              ];
+            }
+            return nextChats;
+          });
+
+          if (isActiveChat) {
             const newMsg: Message = {
               id: msgData.key.id,
               sender:
@@ -3379,15 +3476,17 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
         };
       });
 
-      // Deduplicate formatted messages by ID to prevent duplicate React keys errors
-      const uniqueFormatted: any[] = [];
-      const seenIds = new Set();
+      // Sort oldest → newest so new messages land at the bottom with a
+      // correct date/time, and keep only the LATEST version of any message
+      // id (a message can arrive more than once, e.g. edits/status updates —
+      // we always want the freshest copy, not whichever came first).
+      const byId = new Map<string, any>();
       formatted.forEach((msg: any) => {
-        if (!seenIds.has(msg.id)) {
-          seenIds.add(msg.id);
-          uniqueFormatted.push(msg);
-        }
+        byId.set(msg.id, msg); // later entries overwrite earlier ones
       });
+      const uniqueFormatted = Array.from(byId.values()).sort(
+        (a: any, b: any) => (a.timestamp || 0) - (b.timestamp || 0)
+      );
 
       if (selectedAccount === "friend") {
         setMessagesFriend(uniqueFormatted);
