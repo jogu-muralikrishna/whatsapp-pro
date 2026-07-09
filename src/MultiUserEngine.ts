@@ -23,6 +23,7 @@ import pino from 'pino';
 
 import { UserSession, sessionManager } from './UserSessionManager.js';
 import { DatabaseService } from './DatabaseService.js';
+import { notifyUser } from './pushService.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -38,6 +39,22 @@ async function getBaileysVersion(): Promise<number[] | undefined> {
   } catch {
     return undefined; // Baileys uses built-in default
   }
+}
+
+function extractPlainText(message: any): string {
+  if (!message) return '';
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    (message.imageMessage && '📷 Photo') ||
+    (message.videoMessage && '🎥 Video') ||
+    (message.audioMessage && '🎤 Audio') ||
+    (message.documentMessage && `📄 ${message.documentMessage?.fileName || 'Document'}`) ||
+    (message.stickerMessage && '💫 Sticker') ||
+    ''
+  );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -482,6 +499,24 @@ export async function initUserEngine(session: UserSession) {
       }
 
       sessionManager.broadcast(session, { type: 'NEW_MESSAGE', data: outgoingMsg, userId: session.userId });
+
+      // Background push notification (works even if the app/tab is fully closed).
+      if (!msg.key.fromMe) {
+        const senderName =
+          maskedEntry ? `@${(maskedEntry[1] as any).username}` :
+          msg.pushName || session.proData.contacts?.[jid]?.name || jid.split('@')[0];
+        const bodyText = extractPlainText(msg.message) || 'New message';
+        notifyUser(
+          session.proData.pushSubscriptions || [],
+          { title: senderName, body: bodyText, tag: jid, url: '/' },
+          (expiredEndpoint: string) => {
+            session.proData.pushSubscriptions = (session.proData.pushSubscriptions || []).filter(
+              (s: any) => s.endpoint !== expiredEndpoint
+            );
+            sessionManager.saveProData(session);
+          }
+        ).catch(() => {});
+      }
     }
     sessionManager.saveProData(session);
   });
