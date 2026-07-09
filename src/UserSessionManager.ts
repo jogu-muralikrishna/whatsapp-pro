@@ -38,6 +38,8 @@ export function createDefaultProData() {
     // for that conversation, so the other person's real mobile number is
     // never sent back down to the frontend.
     usernameContacts: {} as Record<string, { realJid: string; username: string }>,
+    // Web Push subscriptions (one per browser/device the user granted notification permission on)
+    pushSubscriptions: [] as { endpoint: string; keys: { p256dh: string; auth: string } }[],
     logs: [] as any[],
     settings: {
       autoTranslate: false,
