@@ -13,6 +13,7 @@ import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import { sessionManager } from './UserSessionManager.js';
 import { initUserEngine, logoutUserSession } from './MultiUserEngine.js';
+import { DatabaseService } from './DatabaseService.js';
 
 // Defined here (not in server.ts) so server.ts can safely import these from
 // multiUserRouter.ts without a circular import. server.ts already imports
@@ -31,6 +32,22 @@ function normalizeJidLocal(jid: string): string {
   }
   if (jid.endsWith('@c.us')) jid = jid.replace('@c.us', '@s.whatsapp.net');
   return jid;
+}
+
+// ─── Username Messaging helpers ───────────────────────────────────────────────
+// A "masked id" (e.g. "masked_ammu") stands in for a real WhatsApp jid
+// whenever a chat was started via @username instead of a phone number.
+// Everything that touches the frontend (chat list, contacts, message
+// history, broadcasts) uses the masked id. Only the actual Baileys socket
+// call needs the real jid, resolved here at the last possible moment.
+
+function maskedIdFor(username: string): string {
+  return `masked_${username.trim().toLowerCase()}`;
+}
+
+function resolveSocketJid(session: any, jid: string): string {
+  const entry = session.proData.usernameContacts?.[jid];
+  return entry ? entry.realJid : jid;
 }
 
 const router = Router({ mergeParams: true });
@@ -87,6 +104,96 @@ router.get('/connection-status', (req: Request, res: Response) => {
     latency: '14ms',
     uptimes: process.uptime(),
   });
+});
+
+// ─── Username Messaging (Privacy Feature) ─────────────────────────────────────
+// Lets a user message someone else by their @username instead of their phone
+// number. The sender never sees the recipient's real number, and the
+// recipient never sees the sender's real number either - only the username.
+
+router.get('/username/me', async (req: Request, res: Response) => {
+  const session = (req as any).userSession;
+  try {
+    const username = await DatabaseService.getUsernameForUser(session.userId);
+    res.json({ username });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/username/check/:username', async (req: Request, res: Response) => {
+  try {
+    const available = await DatabaseService.isUsernameAvailable(req.params.username);
+    res.json({ available });
+  } catch (e: any) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/username/register', async (req: Request, res: Response) => {
+  const session = (req as any).userSession;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'Missing username' });
+  try {
+    const result = await DatabaseService.registerUsername(session.userId, username);
+    res.json(result);
+  } catch (e: any) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/send-by-username', async (req: Request, res: Response) => {
+  const session = (req as any).userSession;
+  const { username, text } = req.body;
+  if (!username || !text) return res.status(400).json({ error: 'Missing username or text' });
+  if (!session.sock) {
+    return res.status(503).json({ error: 'WhatsApp not connected. Please scan QR first.' });
+  }
+
+  try {
+    const target = await DatabaseService.resolveUsername(username);
+    if (!target) return res.status(404).json({ error: 'No user found with that username.' });
+    if (!target.whatsappNumber) {
+      return res.status(400).json({ error: 'That user has not connected their WhatsApp yet.' });
+    }
+    if (target.userId === session.userId) {
+      return res.status(400).json({ error: "You can't message yourself by username." });
+    }
+
+    const cleanUsername = username.trim().toLowerCase();
+    const realJid = `${target.whatsappNumber}@s.whatsapp.net`;
+    const maskedId = maskedIdFor(cleanUsername);
+
+    if (!session.proData.usernameContacts) session.proData.usernameContacts = {};
+    session.proData.usernameContacts[maskedId] = { realJid, username: cleanUsername };
+
+    session.proData.contacts[maskedId] = {
+      id: maskedId,
+      name: `@${cleanUsername}`,
+      isUsernameContact: true,
+    };
+    if (!session.realChats.find((c: any) => c.id === maskedId)) {
+      session.realChats.push({ id: maskedId, name: `@${cleanUsername}`, timestamp: Math.floor(Date.now() / 1000) });
+      session.proData.cachedChats = session.realChats;
+    }
+
+    const sent = await session.sock.sendMessage(realJid, { text });
+
+    const mockMsg = {
+      key: { remoteJid: maskedId, fromMe: true, id: sent?.key?.id || 'sim_' + Math.random().toString(36).substr(2, 9) },
+      message: { conversation: text },
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      status: 'sent',
+    };
+
+    if (!session.proData.messageHistory[maskedId]) session.proData.messageHistory[maskedId] = [];
+    session.proData.messageHistory[maskedId].push(mockMsg);
+    sessionManager.saveProData(session);
+    sessionManager.broadcast(session, { type: 'MESSAGE_SENT', data: mockMsg, userId: session.userId });
+    res.json({ ...sent, maskedId });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── GET /refresh-qr ─────────────────────────────────────────────────────────
@@ -159,7 +266,8 @@ router.post('/send-message', async (req: Request, res: Response) => {
   try {
     const opts: any = {};
     if (quoted) opts.quoted = quoted;
-    const sent = await session.sock.sendMessage(jid, { text }, opts);
+    const targetJid = resolveSocketJid(session, jid);
+    const sent = await session.sock.sendMessage(targetJid, { text }, opts);
 
     const mockMsg = {
       key: { remoteJid: jid, fromMe: true, id: sent?.key?.id || 'sim_' + Math.random().toString(36).substr(2, 9) },
@@ -191,7 +299,9 @@ router.post('/read-chat', async (req: Request, res: Response) => {
   }
 
   try {
-    await session.sock.readMessages(keys);
+    const realJid = resolveSocketJid(session, jid);
+    const realKeys = (keys || []).map((k: any) => ({ ...k, remoteJid: realJid }));
+    await session.sock.readMessages(realKeys);
     res.json({ status: 'Read' });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
@@ -219,7 +329,10 @@ router.post('/delete-message', async (req: Request, res: Response) => {
   if (msgIndex !== -1) {
     const msg = history[msgIndex];
     if (revoke && session.sock) {
-      try { await session.sock.sendMessage(chatId, { delete: msg.key }); } catch {}
+      try {
+        const realJid = resolveSocketJid(session, chatId);
+        await session.sock.sendMessage(realJid, { delete: { ...msg.key, remoteJid: realJid } });
+      } catch {}
     }
     if (!session.proData.recycleBin) session.proData.recycleBin = { messages: [], chats: [] };
     session.proData.recycleBin.messages.push({ ...msg, deletedAt: Date.now() });
@@ -518,7 +631,8 @@ router.post('/send-media', upload.single('file'), async (req: any, res: Response
         } else {
           waPayload = { document: file.buffer, mimetype: file.mimetype, fileName: file.originalname };
         }
-        const sent = await session.sock.sendMessage(targetJid, waPayload);
+        const realJid = resolveSocketJid(session, targetJid);
+        const sent = await session.sock.sendMessage(realJid, waPayload);
         return res.json(sent);
       } catch (e: any) {
         sessionManager.log(session, 'ERROR', `Failed to send media: ${e?.message}`);
@@ -540,7 +654,8 @@ router.post('/send-audio', async (req: Request, res: Response) => {
   const targetJid = normalizeJidLocal(jid);
   try {
     const buffer = Buffer.from(audio.split(',')[1], 'base64');
-    const sent = await session.sock.sendMessage(targetJid, {
+    const realJid = resolveSocketJid(session, targetJid);
+    const sent = await session.sock.sendMessage(realJid, {
       audio: buffer,
       mimetype: 'audio/mp4',
       ptt: ptt !== undefined ? ptt : true,
