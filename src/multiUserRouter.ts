@@ -14,6 +14,7 @@ import multer from 'multer';
 import { sessionManager } from './UserSessionManager.js';
 import { initUserEngine, logoutUserSession } from './MultiUserEngine.js';
 import { DatabaseService } from './DatabaseService.js';
+import { getVapidPublicKey } from './pushService.js';
 
 // Defined here (not in server.ts) so server.ts can safely import these from
 // multiUserRouter.ts without a circular import. server.ts already imports
@@ -104,6 +105,43 @@ router.get('/connection-status', (req: Request, res: Response) => {
     latency: '14ms',
     uptimes: process.uptime(),
   });
+});
+
+// ─── Web Push (background notifications, even when the app is closed) ────────
+
+router.get('/push/vapid-public-key', (req: Request, res: Response) => {
+  res.json({ publicKey: getVapidPublicKey() });
+});
+
+router.post('/push/subscribe', (req: Request, res: Response) => {
+  const session = (req as any).userSession;
+  const subscription = req.body?.subscription;
+  if (!subscription?.endpoint || !subscription?.keys) {
+    return res.status(400).json({ error: 'Invalid subscription payload' });
+  }
+
+  if (!session.proData.pushSubscriptions) session.proData.pushSubscriptions = [];
+  const exists = session.proData.pushSubscriptions.some((s: any) => s.endpoint === subscription.endpoint);
+  if (!exists) {
+    session.proData.pushSubscriptions.push({
+      endpoint: subscription.endpoint,
+      keys: subscription.keys,
+    });
+    sessionManager.saveProData(session);
+  }
+  res.json({ status: 'subscribed' });
+});
+
+router.post('/push/unsubscribe', (req: Request, res: Response) => {
+  const session = (req as any).userSession;
+  const endpoint = req.body?.endpoint;
+  if (!endpoint) return res.status(400).json({ error: 'Missing endpoint' });
+
+  session.proData.pushSubscriptions = (session.proData.pushSubscriptions || []).filter(
+    (s: any) => s.endpoint !== endpoint
+  );
+  sessionManager.saveProData(session);
+  res.json({ status: 'unsubscribed' });
 });
 
 // ─── Username Messaging (Privacy Feature) ─────────────────────────────────────
