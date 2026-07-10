@@ -58,6 +58,32 @@ export function createDefaultProData() {
   };
 }
 
+/**
+ * Wipes everything that belongs to the *previously linked WhatsApp number*
+ * (chats, contacts, message history, statuses, call logs, username-mask
+ * mappings...) while keeping user-level preferences (theme, AI settings,
+ * push subscriptions) intact. Call this on logout, right before the user
+ * scans a fresh QR — otherwise the old number's chats stay mixed in with
+ * whatever number gets linked next.
+ */
+export function resetWhatsAppAccountData(proData: ReturnType<typeof createDefaultProData>) {
+  proData.messageHistory = {};
+  proData.callHistory = [];
+  proData.callRecords = [];
+  proData.statusUpdates = [];
+  proData.deletedStatuses = [];
+  proData.recycleBin = { messages: [], chats: [] };
+  proData.favorites = [];
+  proData.lockedChats = [];
+  proData.cachedChats = [];
+  proData.contacts = {};
+  proData.lidToPnMap = {};
+  proData.usernameContacts = {};
+  proData.scheduledMessages = [];
+  // Intentionally kept: settings, autoReplies, logs, pushSubscriptions —
+  // these are the user's own preferences, not tied to a specific WhatsApp number.
+}
+
 // ─── Session shape ────────────────────────────────────────────────────────────
 
 export interface UserSession {
