@@ -21,7 +21,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 
-import { UserSession, sessionManager } from './UserSessionManager.js';
+import { UserSession, sessionManager, resetWhatsAppAccountData } from './UserSessionManager.js';
 import { DatabaseService } from './DatabaseService.js';
 import { notifyUser } from './pushService.js';
 
@@ -573,6 +573,13 @@ export async function logoutUserSession(session: UserSession) {
   session.qrCode = null;
   session.connectionState = 'close';
   cleanAuthDir(session.authDir);
+
+  // Clear the previous WhatsApp account's chats/contacts/messages so that
+  // whichever number gets scanned next starts completely clean, instead of
+  // showing chats left over from the old number.
+  resetWhatsAppAccountData(session.proData);
+  session.realChats = [];
+
   sessionManager.saveProDataSync(session);
   sessionManager.broadcast(session, {
     type: 'LOGOUT',
