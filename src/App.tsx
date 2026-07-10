@@ -2187,13 +2187,17 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
       });
       if (selectedAccount === "friend") {
         setUserFriend(null);
-        // Keep chatsFriend permanently intact to preserve retrieved history offline
+        setChatsFriend([]);
         setActiveChatFriend(null);
         setQrCodeFriend(null);
         setPairingCodeFriend("");
       } else {
         setUser(null);
-        // Keep chats permanently intact to preserve retrieved history offline
+        setChats([]);
+        setContacts({});
+        setMessages([]);
+        setCallHistory([]);
+        setStatusUpdates([]);
         setActiveChat(null);
         setQrCode(null);
         setPairingCode("");
@@ -2279,6 +2283,10 @@ export default function App({ userId, userEmail, onLogout }: AppProps) {
         case "LOGOUT":
           setUser(null);
           setChats([]);
+          setContacts({});
+          setMessages([]);
+          setCallHistory([]);
+          setStatusUpdates([]);
           setActiveChat(null);
           setQrCode(null);
           setPairingCode("");
