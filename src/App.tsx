@@ -122,15 +122,23 @@ async function apiFetch(url: string, options: RequestInit = {}): Promise<Respons
   let finalUrl = url;
   try {
     const parsed = new URL(url, window.location.origin);
-    // The "Friend" secondary-account feature uses the old shared single-account
-    // backend (sockFriend/proDataFriend) - never reroute those requests to the
-    // per-login multi-user backend, or the Friend account stops working.
-    if (SESSION_ID && isCoreMultiUserRoute(parsed.pathname) && !requestTargetsFriendAccount(parsed, options)) {
+    const targetsFriend = requestTargetsFriendAccount(parsed, options);
+
+    if (isCoreMultiUserRoute(parsed.pathname) && !targetsFriend) {
+      if (!SESSION_ID) {
+        // This is a core, per-user route, but we don't yet know who's
+        // logged in. Silently falling through to the old shared legacy
+        // backend here is exactly how one user's data could end up mixed
+        // with another's — refuse instead, and let the caller retry once
+        // the user's session id is actually available.
+        throw new Error('Not logged in yet — request blocked to avoid using the shared legacy session.');
+      }
       const newPath = parsed.pathname.replace('/api/', `/api/u/${SESSION_ID}/`);
       finalUrl = newPath + parsed.search;
     }
-  } catch {
-    // Relative/unparseable URL - fall back to original behavior
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('Not logged in yet')) throw e;
+    // Otherwise: relative/unparseable URL - fall back to original behavior
   }
 
   return fetch(finalUrl, { ...options, headers });
