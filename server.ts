@@ -554,6 +554,21 @@ async function saveCallToFirebase(call: any) {
     }
 }
 
+async function clearFirestoreBackupForPrefix(prefix: string) {
+    if (!db || !prefix) return;
+    try {
+        const collections = ['contacts', 'chats', 'scheduled', 'autoreplies', 'calls'];
+        for (const col of collections) {
+            const snapshot = await getDocs(collection(db, 'whatsapp_pro_users', prefix, col));
+            await Promise.all(snapshot.docs.map((d) => deleteDoc(d.ref).catch(() => {})));
+        }
+        await deleteDoc(doc(db, 'whatsapp_pro_users', prefix, 'config', 'settings')).catch(() => {});
+        console.log(`[Firebase] Cleared stale backup bucket for "${prefix}" (old WhatsApp number logged out).`);
+    } catch (error: any) {
+        console.error(`[Firebase] Failed to clear backup bucket for "${prefix}":`, error?.message || error);
+    }
+}
+
 async function loadProDataFromFirestore() {
     if (!db || !isSyncPermitted()) return;
     try {
@@ -1992,8 +2007,17 @@ async function initWASocket() {
         });
     }
 
-    await initWASocket();
-    await initWASocketFriend();
+    // NOTE (disabled): This app has moved to the per-user multi-user engine
+    // (MultiUserEngine.ts / multiUserRouter.ts). These two legacy single-
+    // account sockets ("Me" and "Friend") are no longer used by the current
+    // frontend, but were still being started automatically on every boot —
+    // running 3 WhatsApp connections at once on a single-CPU instance was
+    // starving the real per-user connection of CPU, making its QR code take
+    // too long to render and expire before it could be scanned.
+    // If you still need the old single-account routes for something, you
+    // can uncomment these — just know they'll compete for resources again.
+    // await initWASocket();
+    // await initWASocketFriend();
 
     // Scheduling Loop (every minute)
     cron.schedule('* * * * *', async () => {
@@ -3676,6 +3700,7 @@ async function initWASocket() {
         log('INFO', `Hard Logout Requested for account: ${account || 'me'}`);
         
         if (account === 'friend') {
+            const oldPrefixFriend = (sockFriend?.user?.id?.split(':')[0]?.split('@')[0] || '').replace(/[^a-zA-Z0-9_\-+]/g, '_');
             try {
                 if (sockFriend) {
                     sockFriend.ev.removeAllListeners('connection.update');
@@ -3690,15 +3715,30 @@ async function initWASocket() {
             cleanAuthDir(authDirFriend);
 
             qrCodeFriend = null;
-            // Keep friend's realChats and cachedChats permanently intact
+            // Wipe this account's chats/contacts/messages so a different
+            // WhatsApp number scanned next doesn't inherit old chats.
+            realChatsFriend = [];
+            proDataFriend.cachedChats = [];
+            proDataFriend.contacts = {};
+            proDataFriend.messageHistory = {};
+            proDataFriend.callHistory = [];
+            proDataFriend.callRecords = [];
+            proDataFriend.statusUpdates = [];
+            proDataFriend.deletedStatuses = [];
+            proDataFriend.lidToPnMap = {};
             connectionStateFriend = 'close';
             broadcast({ type: 'LOGOUT_FRIEND', data: { message: 'Friend Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            if (oldPrefixFriend) {
+                clearFirestoreBackupForPrefix(oldPrefixFriend).catch(() => {});
+            }
 
             setTimeout(async () => {
                  initWASocketFriend();
                  res.json({ status: 'Logged out Friend successfully' });
             }, 3000);
         } else {
+            const oldPrefix = (sock?.user?.id?.split(':')[0]?.split('@')[0] || '').replace(/[^a-zA-Z0-9_\-+]/g, '_');
             try {
                 if (sock) {
                     sock.ev.removeAllListeners('connection.update');
@@ -3713,10 +3753,29 @@ async function initWASocket() {
             cleanAuthDir(authDir);
 
             qrCode = null;
-            // Keep main user's realChats and cachedChats permanently intact to respect the "permanent offline data" request
+            // Wipe this account's chats/contacts/messages so a different
+            // WhatsApp number scanned next doesn't inherit old chats.
+            realChats = [];
+            proData.cachedChats = [];
+            proData.contacts = {};
+            proData.messageHistory = {};
+            proData.callHistory = [];
+            proData.callRecords = [];
+            proData.statusUpdates = [];
+            proData.deletedStatuses = [];
+            proData.lidToPnMap = {};
             saveProDataSync();
             connectionState = 'close';
             broadcast({ type: 'LOGOUT', data: { message: 'Engine Wipe Complete. Re-initializing...', fatal: true } });
+
+            if (oldPrefix) {
+                clearFirestoreBackupForPrefix(oldPrefix).catch(() => {});
+            }
+            // Also clear the 'default_user' fallback bucket — this is what
+            // loadProDataFromFirestore() reads at boot before a socket is
+            // connected, and is the reason old data can come back after a
+            // redeploy even when the local files were cleared correctly.
+            clearFirestoreBackupForPrefix('default_user').catch(() => {});
 
             setTimeout(async () => {
                  scheduleInit(0);
