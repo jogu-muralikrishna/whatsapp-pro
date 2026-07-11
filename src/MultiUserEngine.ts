@@ -340,6 +340,32 @@ export async function initUserEngine(session: UserSession) {
     }
 
     if (connection === 'open') {
+      // ── Safety net: if a DIFFERENT phone number just connected than the
+      // one previously linked to this account, wipe the old number's chats/
+      // contacts/messages BEFORE anything syncs in. This catches the case
+      // where the account got reconnected without going through the app's
+      // Logout button (e.g. after clearing Firebase data directly, or a
+      // server restart) — so old and new data never end up mixed together.
+      try {
+        const rawId: string = session.sock.user?.id || '';
+        const newNumber = rawId.split('@')[0].split(':')[0];
+        const previousNumber = session.proData.settings.phoneNumber;
+        if (newNumber && previousNumber && previousNumber !== newNumber) {
+          sessionManager.log(
+            session,
+            'WARN',
+            `Different WhatsApp number detected (was ${previousNumber}, now ${newNumber}). Clearing old chats/contacts before sync.`
+          );
+          resetWhatsAppAccountData(session.proData);
+          session.realChats = [];
+        }
+        if (newNumber) {
+          session.proData.settings.phoneNumber = newNumber;
+        }
+      } catch (e: any) {
+        sessionManager.log(session, 'WARN', `Could not check for number change: ${e.message}`);
+      }
+
       sessionManager.log(session, 'SUCCESS', 'WhatsApp CONNECTED and SYNCED');
       session.consecutiveBadSessions = 0;
       session.consecutiveStreamErrors = 0;
