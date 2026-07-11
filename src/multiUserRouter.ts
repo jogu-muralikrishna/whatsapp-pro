@@ -59,9 +59,16 @@ function resolveSession(req: Request, res: Response, next: Function) {
   const userId =
     (req.params as any).userId ||
     (req.headers['x-user-id'] as string) ||
-    req.query.userId as string ||
-    req.body?.userId ||
-    'default';
+    (req.query.userId as string) ||
+    req.body?.userId;
+
+  // No silent shared fallback. A request with no identifiable user must be
+  // rejected outright — a fallback to a single shared "default" session was
+  // exactly how one user's data could end up mixed with another's.
+  if (!userId || typeof userId !== 'string' || !userId.trim()) {
+    console.warn(`[multiUserRouter] Rejected request with no userId: ${req.method} ${req.originalUrl}`);
+    return res.status(401).json({ error: 'Missing user session. Please log in again.' });
+  }
 
   const session = sessionManager.getOrCreate(userId);
   (req as any).userSession = session;
